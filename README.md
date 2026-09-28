@@ -19,6 +19,11 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | Implemented | Metric | Image extra |
 |---|---|---|
 | `swebench-verified` | pass@1[avg-of-3] resolve rate | `swebench` |
+| `tau3-bench` | pass@1 (avg of 3): mean pass^1 over airline, retail, telecom | `tau` |
+| `tau3-airline` | pass@1 (pass^1 over 4 trials) | `tau` |
+| `tau3-retail` | pass@1 (pass^1 over 4 trials) | `tau` |
+| `tau3-telecom` | pass@1 (pass^1 over 4 trials) | `tau` |
+| `tau3-banking-knowledge` | pass@1 (pass^1 over 4 trials, BM25 + grep retrieval) | `tau` |
 
 ## Layout
 
