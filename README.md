@@ -19,6 +19,7 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | Implemented | Metric | Image extra |
 |---|---|---|
 | `swebench-verified` | pass@1[avg-of-3] resolve rate | `swebench` |
+| `terminal-bench-2.1` | pass@1[avg-of-8] resolve rate | `tbench` |
 
 ## Layout
 

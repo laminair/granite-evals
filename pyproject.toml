@@ -22,6 +22,11 @@ swebench = [
     "mini-swe-agent==2.4.6",
     "swebench==5.0.2",
 ]
+# Terminal-Bench 2.x: Harbor (terminus-2 agent, oracle, verifier). Harbor needs
+# Python >= 3.12 (the image's); on 3.11 the extra is empty and tbench is unavailable.
+tbench = [
+    "harbor==0.23.0; python_version >= '3.12'",
+]
 # The inference server. Kept out of the base install so the CLI, tests and the
 # result tooling run on a laptop without CUDA.
 serve = [

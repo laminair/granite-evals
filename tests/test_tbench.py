@@ -1,0 +1,256 @@
+"""Terminal-Bench adapter tests with fake trials and a host-shell sandbox
+(no containers, no model)."""
+
+import asyncio
+import json
+import logging
+import shlex
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+pytest.importorskip("harbor.environments.base")
+
+from sage2_evals.benchmarks import tbench as tb  # noqa: E402
+from sage2_evals.registry import RunConfig  # noqa: E402
+from sage2_evals.sandbox import Sandbox  # noqa: E402
+from sage2_evals.sandbox import harbor_env  # noqa: E402
+
+TASK_TOML = """version = "1.0"
+[agent]
+timeout_sec = 900.0
+[verifier]
+timeout_sec = 900.0
+[environment]
+docker_image = "alexgshaw/{name}:20251031"
+"""
+
+
+def make_dataset(root: Path, names: list[str]) -> Path:
+    for n in names:
+        d = root / "tasks" / n
+        (d / "environment").mkdir(parents=True)
+        (d / "tests").mkdir()
+        (d / "solution").mkdir()
+        (d / "task.toml").write_text(TASK_TOML.format(name=n))
+        (d / "instruction.md").write_text(f"do {n}\n")
+        (d / "environment" / "Dockerfile").write_text("FROM ubuntu\nWORKDIR /app\n")
+        (d / "tests" / "test.sh").write_text("exit 0\n")
+        (d / "solution" / "solve.sh").write_text("true\n")
+    registry = [{"name": "terminal-bench-2.1", "version": "2.1.0", "tasks": [{"name": n, "path": f"tasks/{n}"} for n in names]}]
+    (root / "registry.json").write_text(json.dumps(registry))
+    return root
+
+
+def fake_result(reward=1.0, exc=None):
+    return SimpleNamespace(
+        verifier_result=SimpleNamespace(rewards={"reward": reward}) if reward is not None else None,
+        exception_info=SimpleNamespace(exception_type=exc, exception_message="boom") if exc else None,
+        agent_result=SimpleNamespace(n_input_tokens=10, n_output_tokens=5),
+    )
+
+
+def bench(tmp_path, names, **options):
+    ds = make_dataset(tmp_path / "ds", names)
+    cfg = RunConfig(model="org/m", output_dir=tmp_path / "out", dataset=str(ds), options={"sandbox": "podman", **options})
+    return tb.TerminalBench21(cfg)
+
+
+def test_metadata():
+    cls = tb.TerminalBench21
+    assert cls.metric == "pass@1[avg-of-8] resolve rate" and cls.default_repeats == 8
+    assert len(cls.dataset_revision) == 40
+    assert tb.HOST_PORT_TASKS.isdisjoint(tb.EXCLUDED)
+
+
+def test_oracle_needs_no_server(tmp_path):
+    assert not bench(tmp_path, ["a"], agent="oracle").needs_server()
+    assert bench(tmp_path / "x", ["a"]).needs_server()
+    with pytest.raises(SystemExit):
+        bench(tmp_path / "y", ["a"], agent="claude-code").needs_server()
+
+
+def test_run_scores_resumes_and_records(tmp_path, monkeypatch):
+    b = bench(tmp_path, ["c-task", "a-task", "b-task"], agent="oracle")
+    b.repeats = 2
+    calls = []
+
+    async def run_trial(self, task, k, agent, repeat_dir):
+        calls.append((task["name"], k))
+        assert agent == {"name": "oracle"}
+        (repeat_dir / task["name"]).mkdir(parents=True, exist_ok=True)
+        if task["name"] == "b-task":
+            return fake_result(0.0, "AgentTimeoutError")
+        return fake_result(1.0)
+
+    monkeypatch.setattr(tb.TerminalBench21, "_run_trial", run_trial)
+    out = b.run("", "")
+    assert out["n"] == 3 and out["n_total"] == 3 and out["excluded"] == {}
+    assert out["value"] == pytest.approx(2 / 3)
+    assert out["per_repeat"][0]["statuses"] == {"graded": 2, "AgentTimeoutError": 1}
+    assert out["per_task_resolved"] == {"a-task": 2, "b-task": 0, "c-task": 2}
+    assert out["tasks_digest"] is None  # dataset override: no pin to check
+    assert len(calls) == 6
+    assert json.loads((tmp_path / "out" / "repeat-1" / "a-task" / "sage2.json").read_text())["resolved"]
+
+    calls.clear()
+    assert b.run("", "")["value"] == pytest.approx(2 / 3)
+    assert calls == []  # everything resumed
+
+
+def test_limit_exclusions_and_task_filter(tmp_path, monkeypatch):
+    b = bench(tmp_path, ["d", "c", "b", "a"], agent="oracle", exclude="a", tasks="^[a-c]$")
+    b.config.limit = 1
+    b.repeats = 1
+
+    async def run_trial(self, task, k, agent, repeat_dir):
+        return fake_result(1.0)
+
+    monkeypatch.setattr(tb.TerminalBench21, "_run_trial", run_trial)
+    out = b.run("", "")
+    assert out["tasks"] == ["b"] and out["excluded"] == {"a": "excluded by --option exclude"}
+
+
+def test_infra_errors_retry_and_are_not_persisted(tmp_path, monkeypatch, caplog):
+    b = bench(tmp_path, ["a", "b"], agent="oracle", max_retries="2")
+    b.repeats = 1
+    attempts = {"a": 0, "b": 0}
+
+    async def run_trial(self, task, k, agent, repeat_dir):
+        attempts[task["name"]] += 1
+        (repeat_dir / task["name"]).mkdir(parents=True, exist_ok=True)
+        if task["name"] == "a":
+            raise RuntimeError("sandbox died")
+        if attempts["b"] == 1:
+            return fake_result(None, "DownloadVerifierDirError")
+        return fake_result(1.0)
+
+    monkeypatch.setattr(tb.TerminalBench21, "_run_trial", run_trial)
+    with caplog.at_level(logging.CRITICAL):
+        out = b.run("", "")
+    assert attempts == {"a": 3, "b": 2}
+    assert out["per_repeat"][0]["statuses"] == {"error:RuntimeError": 1, "graded": 1}
+    assert out["value"] == 0.5
+    assert not (tmp_path / "out" / "repeat-0" / "a" / "sage2.json").exists()
+    assert (tmp_path / "out" / "repeat-0" / ".attempts").is_dir()  # earlier attempts kept
+
+
+def test_pinned_dataset_digest_is_checked(tmp_path, monkeypatch):
+    root = make_dataset(tmp_path / "ds", ["a"])
+    monkeypatch.setattr(tb, "load_tasks", lambda s, r: (root, [{"name": "a", "path": "tasks/a"}]))
+    b = tb.TerminalBench21(RunConfig(model="m", output_dir=tmp_path / "out", options={"agent": "oracle"}))
+    with pytest.raises(SystemExit, match="digests"):
+        b.run("", "")
+
+
+def test_task_digests_are_harbor_content_hashes(tmp_path):
+    root = make_dataset(tmp_path / "ds", ["a", "b"])
+    d1 = tb.task_digests(root / "tasks", ["a", "b"])
+    (root / "tasks" / "a" / "instruction.md").write_text("changed\n")
+    assert tb.task_digests(root / "tasks", ["b", "a"]) != d1
+
+
+def test_terminus_config(tmp_path, monkeypatch):
+    b = bench(tmp_path, ["a"], temperature="0.6", max_tokens="512")
+    monkeypatch.setattr(tb.TerminalBench21, "_max_model_len", lambda self, url, served: 131072)
+    agent = b._agent_config("http://h:8000/v1", "granite-4.2-3b")
+    assert agent["name"] == "terminus-2" and agent["model_name"] == "hosted_vllm/granite-4.2-3b"
+    kw = agent["kwargs"]
+    assert kw["temperature"] == 0.6 and kw["api_base"] == "http://h:8000/v1"
+    assert kw["llm_call_kwargs"] == {"api_key": "EMPTY", "max_tokens": 512}
+    assert kw["model_info"]["max_input_tokens"] == 131072
+    assert b.sampling() == {"temperature": 0.6, "max_tokens": 512}
+    # Unset sampling options are not sent (generation_config defaults apply).
+    plain = bench(tmp_path / "p", ["a"])
+    monkeypatch.setattr(tb.TerminalBench21, "_max_model_len", lambda self, url, served: 4096)
+    assert plain._agent_config("u", "s")["kwargs"]["temperature"] is None
+
+
+# -- harbor environment -------------------------------------------------------
+
+
+class HostSandbox(Sandbox):
+    """Runs commands on the host shell: exercises exec/timeout/file transfer."""
+
+    def start(self):
+        pass
+
+    def _exec_argv(self, command, cwd, env):
+        exports = "".join(f"export {k}={shlex.quote(v)}; " for k, v in env.items())
+        return ["bash", "-c", f"{exports}cd {shlex.quote(cwd)} && {command}"]
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def env(tmp_path):
+    from harbor.models.task.config import EnvironmentConfig
+    from harbor.models.trial.paths import TrialPaths
+
+    edir = tmp_path / "environment"
+    edir.mkdir()
+    (edir / "Dockerfile").write_text("FROM x\nWORKDIR /somewhere\nWORKDIR /app\n")
+    e = harbor_env.SandboxEnvironment(
+        environment_dir=edir,
+        environment_name="t",
+        session_id="t__env",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(docker_image="alexgshaw/t:1", cpus=1, memory_mb=2048),
+        backend="podman",
+    )
+    e._sandbox = HostSandbox("x")
+    e._scratch = tmp_path / "scratch"
+    e._scratch.mkdir()
+    return e
+
+
+def test_env_workdir_from_dockerfile(env):
+    assert env._workdir == "/app"
+
+
+def test_env_exec_output_env_and_timeout(env, tmp_path):
+    r = asyncio.run(env.exec("echo out; echo err >&2; echo $FOO; exit 3", cwd=str(tmp_path), env={"FOO": "bar"}))
+    assert (r.return_code, r.stdout, r.stderr) == (3, "out\nbar\n", "err\n")
+    r = asyncio.run(env.exec("echo started; sleep 30", cwd="/", timeout_sec=1))
+    assert r.return_code == harbor_env.TIMEOUT_RC and r.stdout == "started\n"
+
+
+def test_env_exec_returns_while_background_process_holds_output(env):
+    r = asyncio.run(asyncio.wait_for(env.exec("(sleep 20 &) ; echo done", cwd="/"), 10))
+    assert r.return_code == 0 and r.stdout == "done\n"
+
+
+def test_env_non_root_user_goes_through_su(env, monkeypatch):
+    seen = []
+
+    async def run(command, **kw):
+        seen.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(env, "_run", run)
+    asyncio.run(env.exec("whoami", user="agent"))
+    asyncio.run(env.exec("whoami", user="root"))
+    assert seen == ["su agent -s /bin/bash -c whoami", "whoami"]
+
+
+def test_env_file_roundtrip(env, tmp_path):
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "a.txt").write_text("A")
+    (src / "sub" / "b.sh").write_text("#!/bin/sh\n")
+    box = tmp_path / "box"
+    asyncio.run(env.upload_dir(src, str(box / "tests")))
+    assert (box / "tests" / "sub" / "b.sh").read_text() == "#!/bin/sh\n"
+    asyncio.run(env.upload_file(src / "a.txt", str(box / "deep" / "x.txt")))
+    assert (box / "deep" / "x.txt").read_text() == "A"
+
+    back = tmp_path / "back"
+    asyncio.run(env.download_dir(str(box / "tests"), back))
+    assert (back / "a.txt").read_text() == "A" and (back / "sub" / "b.sh").exists()
+    asyncio.run(env.download_file(str(box / "deep" / "x.txt"), back / "f" / "x.txt"))
+    assert (back / "f" / "x.txt").read_text() == "A"
+    with pytest.raises(RuntimeError):
+        asyncio.run(env.download_file(str(box / "missing"), back / "m.txt"))
+    assert not (back / "m.txt").exists()
