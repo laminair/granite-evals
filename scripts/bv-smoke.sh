@@ -7,17 +7,20 @@
 #   bsub -G <group> -q <queue> -J sage2-gold -o %J.out -e %J.err \
 #        -n 16 -R "span[hosts=1]" -M 64G bv-smoke.sh
 #   MODEL=/path/to/hf/model bsub ... -gpu num=1 bv-smoke.sh   # model run
+# IMAGE is required; BENCHMARK, LIMIT, OPTIONS (space-separated k=v), EXTRA_ARGS optional.
+# SWE-bench gold run (no model): MODEL=none OPTIONS=patch=gold.
 set -euo pipefail
 
-IMAGE="${IMAGE:-icr.io/tir-hew-sage2-evals/sage2-evals-swebench:2dc0819}"
+IMAGE="${IMAGE:?set IMAGE=icr.io/tir-hew-sage2-evals/sage2-evals-<family>:<sha>}"
 BENCHMARK="${BENCHMARK:-swebench-verified}"
 MODEL="${MODEL:-none}"
 LIMIT="${LIMIT:-2}"
 REPEATS="${REPEATS:-1}"
 WORKERS="${WORKERS:-2}"
-DATASET="${DATASET:-SWE-bench/SWE-bench_Verified}"
-[ "$MODEL" = none ] && OPTIONS="${OPTIONS:-patch=gold}"
+# Empty = the dataset the benchmark pins.
+DATASET="${DATASET:-}"
 OPTIONS="${OPTIONS:-}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"  # further `sage2-evals run` arguments, e.g. --max-model-len 32768
 ROOT="${ROOT:-/proj/data-eng/hew/sage2}"
 RUN="${RUN:-$ROOT/runs/smoke-${LSB_JOBID:-$$}}"
 
@@ -120,7 +123,7 @@ enroot start --rw "${MOUNTS[@]}" \
         enroot version
         sage2-evals run $BENCHMARK --model $MODEL --output-dir $RUN \
             --limit $LIMIT --repeats $REPEATS --workers $WORKERS \
-            --dataset $DATASET $OPTS 2>&1 | tee $RUN/sage2.log
+            ${DATASET:+--dataset $DATASET} $OPTS $EXTRA_ARGS 2>&1 | tee $RUN/sage2.log
     "
 echo "=== results: $RUN/results.json ==="
 cat "$RUN/results.json"
