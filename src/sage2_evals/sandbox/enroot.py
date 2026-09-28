@@ -4,11 +4,16 @@ Images are imported once into a squashfs cache (``SAGE2_ENROOT_CACHE``, a
 shared filesystem on BlueVela so every job reuses them) and each sandbox is a
 throwaway ``enroot create`` of that squashfs. Commands run with
 ``enroot start --root --rw``: SWE-bench images expect to be root in /testbed.
+
+Imports use the rootless helpers in :mod:`sage2_evals.sandbox.ovlfs`, because
+enroot's own need capabilities BlueVela's compute nodes don't grant. Set
+``SAGE2_ENROOT_ROOTLESS=0`` to use enroot's.
 """
 
 from __future__ import annotations
 
 import fcntl
+import functools
 import logging
 import os
 import re
@@ -16,7 +21,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from sage2_evals.sandbox import Sandbox
+from sage2_evals.sandbox import Sandbox, ovlfs
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +45,13 @@ def cache_dir() -> Path:
     return d
 
 
+@functools.cache
+def _import_env() -> dict[str, str] | None:
+    if os.environ.get("SAGE2_ENROOT_ROOTLESS", "1") == "0":
+        return None
+    return {**os.environ, "PATH": f"{ovlfs.helper_dir()}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+
 def ensure_squashfs(image: str) -> Path:
     """Import ``image`` into the cache unless present. Safe under concurrency:
     one importer per image, the rest wait on the lock."""
@@ -53,7 +65,7 @@ def ensure_squashfs(image: str) -> Path:
             tmp = sqsh.with_suffix(".sqsh.partial")
             tmp.unlink(missing_ok=True)
             log.info("enroot import %s", image)
-            subprocess.run([ENROOT, "import", "-o", str(tmp), enroot_uri(image)], check=True)
+            subprocess.run([ENROOT, "import", "-o", str(tmp), enroot_uri(image)], check=True, env=_import_env())
             tmp.rename(sqsh)
     return sqsh
 
