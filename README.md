@@ -19,6 +19,8 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | Implemented | Metric | Image extra |
 |---|---|---|
 | `swebench-verified` | pass@1[avg-of-3] resolve rate | `swebench` |
+| `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000); `details.elo_is_approximation` | `judged` |
+| `profbench` | overall (ProfBench report generation, lite, LLM-judged rubrics) | `judged` |
 
 ## Layout
 
