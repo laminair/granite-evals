@@ -7,7 +7,7 @@ from sage2_evals.registry import Benchmark, RunConfig
 from sage2_evals.results import write_results
 from sage2_evals.sandbox import enroot
 from sage2_evals.sandbox.enroot import enroot_uri
-from sage2_evals.serving import ServerConfig, VLLMServer
+from sage2_evals.serving import ServerConfig, VLLMServer, server_env
 
 
 @pytest.mark.parametrize(
@@ -110,6 +110,13 @@ def test_vllm_command_parsers_explicit_and_undetected(tmp_path):
     (tmp_path / "plain" / "tokenizer_config.json").write_text('{"chat_template": "{{ messages }}"}')
     cmd = VLLMServer(ServerConfig(model=str(tmp_path / "plain"), served_model_name="g"), tmp_path / "log").command()
     assert "--tool-call-parser" not in cmd and "--reasoning-parser" not in cmd
+
+
+def test_vllm_env_avoids_jit_sampler(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_FLASHINFER_SAMPLER", raising=False)
+    assert server_env()["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "1")
+    assert server_env()["VLLM_USE_FLASHINFER_SAMPLER"] == "1"
 
 
 def test_cli_list(capsys):

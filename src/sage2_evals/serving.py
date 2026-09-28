@@ -90,6 +90,14 @@ def detect_reasoning_plugin(d: Path) -> tuple[str, Path] | None:
     return None
 
 
+def server_env() -> dict[str, str]:
+    """vLLM's environment. The image has no CUDA toolkit, so nothing may JIT
+    CUDA code: FlashInfer's top-k/top-p sampler does on first use (it needs
+    nvcc), vLLM's PyTorch sampler doesn't. Set in code, not as image ENV,
+    which granite.build's BlueVela provider can drop."""
+    return {"VLLM_USE_FLASHINFER_SAMPLER": "0", **os.environ}
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -137,7 +145,7 @@ class VLLMServer:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         logfile = self.log_path.open("ab")
         self._proc = subprocess.Popen(
-            cmd, stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True
+            cmd, stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True, env=server_env()
         )
         self._wait_ready()
         return self
