@@ -22,6 +22,13 @@ DATASET="${DATASET:-}"
 OPTIONS="${OPTIONS:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"  # further `sage2-evals run` arguments, e.g. --max-model-len 32768
 ROOT="${ROOT:-/proj/data-eng/hew/sage2}"
+# Judge / user-simulator key: an env file the user keeps in their home (mode 600),
+# e.g. SAGE2_JUDGE_API_KEY=...; passed into the container by name, never printed.
+# ROOT is world-writable, so keys never go there.
+JUDGE_ENV="${JUDGE_ENV:-$HOME/.config/sage2/judge.env}"
+if [ -r "$JUDGE_ENV" ]; then set -a; . "$JUDGE_ENV"; set +a; echo "judge env: loaded $JUDGE_ENV"; fi
+ENV_ARGS=()
+for v in SAGE2_JUDGE_API_KEY SAGE2_USER_API_KEY; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
 RUN="${RUN:-$ROOT/runs/smoke-${LSB_JOBID:-$$}}"
 
 echo "=== $(hostname) job=${LSB_JOBID:-local} image=$IMAGE model=$MODEL ==="
@@ -110,6 +117,7 @@ enroot start --rw "${MOUNTS[@]}" \
     --env NVIDIA_VISIBLE_DEVICES=all \
     --env NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     --env SAGE2_SANDBOX=enroot \
+    ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
     --env SAGE2_ENROOT_CACHE="$ROOT/enroot-cache" \
     --env ENROOT_DATA_PATH=/scratch/data \
     --env ENROOT_CACHE_PATH=/scratch/cache \
