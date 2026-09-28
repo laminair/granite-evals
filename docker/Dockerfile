@@ -18,6 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /usr/local/bin/uv
 
+# Family-specific system setup (docker/extras/README.md).
+COPY docker/extras /tmp/extras
+RUN if [ -f "/tmp/extras/${EXTRA}.sh" ]; then bash -euxo pipefail "/tmp/extras/${EXTRA}.sh"; fi \
+    && rm -rf /tmp/extras /var/lib/apt/lists/*
+
 WORKDIR /opt/sage2-evals
 ENV UV_PROJECT_ENVIRONMENT=/opt/sage2-evals/.venv \
     UV_COMPILE_BYTECODE=1 \
