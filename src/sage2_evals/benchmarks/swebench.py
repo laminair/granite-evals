@@ -64,8 +64,15 @@ class SWEBench(Benchmark):
         (every instance should resolve)."""
         return self.opt("patch", "model") == "gold"
 
+    @property
+    def check(self) -> bool:
+        """``--option check=data`` runs no agent and no tests: it checks that
+        every selected instance can be graded (test spec, log parser, reference
+        patch, task files) and that its image exists in its registry."""
+        return self.opt("check", "") == "data"
+
     def needs_server(self) -> bool:
-        return not self.gold
+        return not (self.gold or self.check)
 
     def dataset_config(self) -> str | None:
         """HF config name of the dataset (None = its default)."""
@@ -73,6 +80,9 @@ class SWEBench(Benchmark):
 
     def _gold_patch(self, instance: dict) -> str:
         return instance["patch"]
+
+    def _image(self, instance: dict) -> str:
+        return instance["image"]
 
     # -- entry point -------------------------------------------------------
 
@@ -82,6 +92,8 @@ class SWEBench(Benchmark):
         if pattern := self.opt("instances", ""):
             rows = [r for r in rows if re.search(pattern, r["instance_id"])]
         instances = data.take(rows, self.config.limit, key="instance_id")
+        if self.check:
+            return {"dataset": source, "dataset_revision": revision, **self._check_data(instances)}
         log.info("%s: %d instances x %d repeats", self.id, len(instances), self.repeats)
 
         per_repeat = []
@@ -229,6 +241,112 @@ class SWEBench(Benchmark):
             include_tests_status=True,
         )[iid]
         return {**base, "resolved": bool(report["resolved"]), "status": "graded", "report": report}
+
+    # -- check=data --------------------------------------------------------
+
+    def _check_instance(self, instance: dict) -> list[str]:
+        """What would stop this instance from being graded (empty = nothing)."""
+        from swebench.harness.log_parsers import PARSER_REGISTRY
+        from swebench.harness.utils import make_test_spec
+
+        problems = []
+        if instance.get("image_assets"):
+            problems.append("image_assets staging is not supported")
+        spec = make_test_spec(instance)
+        if spec.log_parser not in PARSER_REGISTRY:
+            problems.append(f"unknown log_parser {spec.log_parser!r}")
+        if not self._gold_patch(instance).strip():
+            problems.append("empty reference patch")
+        return problems
+
+    def _check_data(self, instances: list[dict]) -> dict[str, Any]:
+        def one(instance: dict) -> dict:
+            out: dict[str, Any] = {"instance_id": instance["instance_id"], "image": self._image(instance)}
+            try:
+                problems = self._check_instance(instance)
+            except Exception as e:
+                problems = [f"{type(e).__name__}: {e}"]
+            try:
+                out["manifest"] = probe_image(out["image"])
+                if out["manifest"]["status"] != 200:
+                    problems.append(f"image manifest: HTTP {out['manifest']['status']}")
+            except Exception as e:
+                problems.append(f"image manifest: {type(e).__name__}: {e}")
+            return {**out, "ok": not problems, "problems": problems}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
+            results = list(pool.map(one, instances))
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.config.output_dir / "check.json").write_text(json.dumps(results, indent=2))
+        ok = sum(r["ok"] for r in results)
+        for r in results:
+            if not r["ok"]:
+                log.warning("%s check: %s %s", self.id, r["instance_id"], "; ".join(r["problems"]))
+        log.info("%s check: %d/%d instances ok", self.id, ok, len(results))
+        return {
+            # Not a score: the fraction of instances whose data and image check out.
+            "value": ok / len(results) if results else 0.0,
+            "n": len(results),
+            "mode": "check=data",
+            "ok": ok,
+            "failures": [r for r in results if not r["ok"]],
+            "instances": [r["instance_id"] for r in results],
+        }
+
+
+MANIFEST_ACCEPT = ", ".join(
+    (
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    )
+)
+
+
+def parse_image_ref(ref: str) -> tuple[str, str, str]:
+    """``(registry host, repository, tag)`` of a docker image reference."""
+    first, _, rest = ref.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        registry, path = first, rest
+    else:
+        registry, path = "docker.io", ref if "/" in ref else f"library/{ref}"
+    if registry == "docker.io":
+        registry = "registry-1.docker.io"
+    tag = "latest"
+    if ":" in path.rsplit("/", 1)[-1]:
+        path, _, tag = path.rpartition(":")
+    return registry, path, tag
+
+
+def probe_image(ref: str, *, client=None) -> dict[str, Any]:
+    """HEAD the image's manifest with an anonymous pull token, as ``enroot
+    import`` would fetch it. Docker Hub does not count HEADs against its pull
+    rate limit."""
+    import httpx
+
+    registry, repo, tag = parse_image_ref(ref)
+    url = f"https://{registry}/v2/{repo}/manifests/{tag}"
+    headers = {"Accept": MANIFEST_ACCEPT}
+    own = client is None
+    client = client or httpx.Client(timeout=30, follow_redirects=True)
+    try:
+        for attempt in range(4):
+            r = client.head(url, headers=headers)
+            if r.status_code == 401 and "Authorization" not in headers:
+                challenge = dict(re.findall(r'(\w+)="([^"]*)"', r.headers.get("www-authenticate", "")))
+                params = {"service": challenge.get("service", registry), "scope": f"repository:{repo}:pull"}
+                t = client.get(challenge["realm"], params=params)
+                t.raise_for_status()
+                headers["Authorization"] = "Bearer " + (t.json().get("token") or t.json()["access_token"])
+                r = client.head(url, headers=headers)
+            if r.status_code not in (429, 500, 502, 503, 504) or attempt == 3:
+                break
+            time.sleep(5 * 2**attempt)
+        return {"status": r.status_code, "digest": r.headers.get("docker-content-digest")}
+    finally:
+        if own:
+            client.close()
 
 
 def _count(values) -> dict[str, int]:
@@ -410,6 +528,22 @@ class SWEBenchPro(SWEBench):
         # What Harbor's oracle agent applies.
         return self.tasks.task_file(instance["instance_id"], "solution/gold_patch.diff")
 
+    def _image(self, instance: dict) -> str:
+        return instance["docker_image"]
+
+    def _check_instance(self, instance: dict) -> list[str]:
+        # Every file the run reads, fetched and checked against SHA256SUMS.
+        iid = instance["instance_id"]
+        self.tasks.file(PRO_AGENT_CONFIG)
+        problems = []
+        if not self.tasks.task_file(iid, "instruction.md").strip():
+            problems.append("empty instruction.md")
+        if not self._gold_patch(instance).strip():
+            problems.append("empty solution/gold_patch.diff")
+        tests = self.tasks.tests(iid)
+        problems += [f"no tests/{name}" for name in ("run_script.sh", "parser.py") if name not in tests]
+        return problems
+
     def _agent_config(self, base_url: str, served: str, k: int) -> dict:
         import yaml
         from minisweagent.config import builtin_config_dir, get_config_from_spec
@@ -454,7 +588,7 @@ class SWEBenchPro(SWEBench):
         # Harbor runs mini-swe-agent's LocalEnvironment inside the container:
         # its default 30 s command timeout, in the image's repo directory.
         env_config.setdefault("timeout", 30)
-        env = SandboxEnvironment(image=instance["docker_image"], backend=self.opt("sandbox", ""), **env_config)
+        env = SandboxEnvironment(image=self._image(instance), backend=self.opt("sandbox", ""), **env_config)
         try:
             env.config.cwd = _last_line(env.sandbox.execute(PRO_WORKDIR).output) or "/app"
             # mini.yaml puts the platform into the prompt; LocalEnvironment in
@@ -486,7 +620,7 @@ class SWEBenchPro(SWEBench):
             return {**base, "status": "empty_patch"}
         tests = self.tasks.tests(iid)
 
-        with make_sandbox(instance["docker_image"], backend=self.opt("sandbox", "")) as sb:
+        with make_sandbox(self._image(instance), backend=self.opt("sandbox", "")) as sb:
             workdir = _last_line(sb.execute(PRO_WORKDIR).output) or "/app"
             sb.write_file("/tmp/replay.patch", patch)
             applied = sb.execute(PRO_APPLY, cwd=workdir, timeout=300)

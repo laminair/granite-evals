@@ -129,6 +129,7 @@ ML_INSTANCE = {
     "PASS_TO_PASS": '["time::test_kept"]',
     "log_parser": "parse_log_cargo",
     "eval_script": "cd /testbed\ncargo test",
+    "patch": "gold-diff\n",
 }
 
 CARGO_LOG = """>>>>> Start Test Output
@@ -397,3 +398,71 @@ def test_pro_gold_run_uses_the_task_reference_patch(pro, tmp_path, monkeypatch):
     assert out["value"] == 1.0 and out["subset"] == "default"
     assert out["verifier"]["commit"] == sb_mod.PRO_COMMIT
     assert fake.files["/tmp/replay.patch"] == "gold-diff\n"
+
+
+# -- check=data ----------------------------------------------------------------
+
+
+def test_parse_image_ref():
+    assert sb_mod.parse_image_ref("swebench/sweb.eval.x86_64.a_1776_b-1:latest") == (
+        "registry-1.docker.io",
+        "swebench/sweb.eval.x86_64.a_1776_b-1",
+        "latest",
+    )
+    assert sb_mod.parse_image_ref(f"ghcr.io/scaleapi/swe-bench_pro-v2:{PRO_IID}") == (
+        "ghcr.io",
+        "scaleapi/swe-bench_pro-v2",
+        PRO_IID,
+    )
+    assert sb_mod.parse_image_ref("ubuntu") == ("registry-1.docker.io", "library/ubuntu", "latest")
+
+
+def test_probe_image_gets_an_anonymous_token():
+    import httpx
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, str(request.url), request.headers.get("authorization")))
+        if request.url.path == "/token":
+            return httpx.Response(200, json={"token": "t0k"})
+        if request.headers.get("authorization") != "Bearer t0k":
+            return httpx.Response(401, headers={"www-authenticate": 'Bearer realm="https://ghcr.io/token",service="ghcr.io"'})
+        if request.url.path.endswith("/missing"):
+            return httpx.Response(404)
+        return httpx.Response(200, headers={"docker-content-digest": "sha256:abc"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert sb_mod.probe_image("ghcr.io/o/r:tag", client=client) == {"status": 200, "digest": "sha256:abc"}
+    assert seen[1] == ("GET", "https://ghcr.io/token?service=ghcr.io&scope=repository%3Ao%2Fr%3Apull", None)
+    assert seen[2][0] == "HEAD" and seen[2][2] == "Bearer t0k"
+    assert sb_mod.probe_image("ghcr.io/o/r:missing", client=client)["status"] == 404
+
+
+def test_check_mode_needs_no_model_and_reports_failures(tmp_path, monkeypatch):
+    bench = sb_mod.SWEBenchMultilingual(
+        RunConfig(model="none", output_dir=tmp_path, workers=2, options={"check": "data"})
+    )
+    assert bench.needs_server() is False
+    bad = {**ML_INSTANCE, "instance_id": "bad-2", "log_parser": "parse_log_nope", "image": "x/missing:latest"}
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [ML_INSTANCE, bad])
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: pytest.fail("check mode runs no sandbox"))
+    monkeypatch.setattr(sb_mod, "probe_image", lambda ref: {"status": 404 if "missing" in ref else 200, "digest": None})
+    out = bench.run("", "none")
+    assert out["mode"] == "check=data" and out["n"] == 2 and out["ok"] == 1 and out["value"] == 0.5
+    (failure,) = out["failures"]
+    assert failure["instance_id"] == "bad-2"
+    assert any("parse_log_nope" in p for p in failure["problems"])
+    assert "image manifest: HTTP 404" in failure["problems"]
+    assert (tmp_path / "check.json").exists()
+
+
+def test_pro_check_mode_verifies_every_task_file(pro, tmp_path, monkeypatch):
+    pro.config.options["check"] = "data"
+    missing = {**PRO_INSTANCE, "instance_id": "instance_gone"}
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [PRO_INSTANCE, missing])
+    monkeypatch.setattr(sb_mod, "probe_image", lambda ref: {"status": 200, "digest": "d"})
+    out = pro.run("", "none")
+    assert out["ok"] == 1 and out["subset"] == "default"
+    assert out["failures"][0]["instance_id"] == "instance_gone"
+    assert "KeyError" in out["failures"][0]["problems"][0]
