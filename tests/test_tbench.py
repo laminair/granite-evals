@@ -254,3 +254,20 @@ def test_env_file_roundtrip(env, tmp_path):
     with pytest.raises(RuntimeError):
         asyncio.run(env.download_file(str(box / "missing"), back / "m.txt"))
     assert not (back / "m.txt").exists()
+
+
+def test_env_enroot_passes_no_harness_secrets(env, monkeypatch):
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "secret")
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setenv("ENROOT_DATA_PATH", "/scratch/data")
+    got = env._enroot_env()
+    assert "SAGE2_JUDGE_API_KEY" not in got and "HF_TOKEN" not in got
+    assert got["ENROOT_DATA_PATH"] == "/scratch/data" and got["NVIDIA_VISIBLE_DEVICES"] == "void"
+
+
+def test_no_paid_endpoints(tmp_path, monkeypatch):
+    """Terminus 2 talks only to the served model: nothing to meter."""
+    b = bench(tmp_path, ["a"])
+    monkeypatch.setattr(tb.TerminalBench21, "_max_model_len", lambda self, url, served: 4096)
+    kw = b._agent_config("http://127.0.0.1:8000/v1", "m")["kwargs"]
+    assert kw["api_base"] == "http://127.0.0.1:8000/v1" and kw["llm_call_kwargs"]["api_key"] == "EMPTY"

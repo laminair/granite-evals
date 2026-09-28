@@ -174,17 +174,12 @@ class SandboxEnvironment(BaseEnvironment):
         sb = self._sandbox
         self._nsenter = shutil.which("nsenter") or "nsenter"
         argv = sb._exec_argv(KEEPER_CMD, "/", {MARKER: sb.name})
-        # The container's base environment (read back from its PID 1 for every
-        # command) is the image's plus this: none of the harness's variables.
-        keep = ("PATH", "HOME", "USER", "LANG", "TERM", "TMPDIR")
-        env = {k: v for k, v in sb._run_env().items() if k.startswith("ENROOT_") or k in keep}
-        env["NVIDIA_VISIBLE_DEVICES"] = "void"
         self._keeper = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            env=env,
+            env=self._enroot_env(),
             start_new_session=True,
         )
         for _ in range(300):
@@ -235,7 +230,18 @@ class SandboxEnvironment(BaseEnvironment):
             argv = [self._nsenter, "-t", str(self._ns_pid), "-U", "-m", "-p", "-r", "-w", "--preserve-credentials",
                     "--", "bash", "-c", f"cd {shlex.quote(cwd)} && {command}"]  # fmt: skip
             return argv, {**self._ns_env, **env}
+        if self._backend == "enroot":
+            return sb._exec_argv(command, cwd, env), self._enroot_env()
         return sb._exec_argv(command, cwd, env), sb._run_env()
+
+    def _enroot_env(self) -> dict[str, str]:
+        """Local env of ``enroot start``, which passes it into the container: only
+        what enroot needs, so no harness variable (API keys, tokens) reaches the
+        agent's container."""
+        keep = ("PATH", "HOME", "USER", "LANG", "TERM", "TMPDIR")
+        env = {k: v for k, v in os.environ.items() if k.startswith("ENROOT_") or k in keep}
+        env["NVIDIA_VISIBLE_DEVICES"] = "void"
+        return env
 
     async def _run(
         self,
