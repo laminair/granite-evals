@@ -29,6 +29,7 @@ add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, meter
 official GPT-4.1 judge, and without style control; results record both judges.
 | `swebench-pro` | pass@1[avg-of-3] resolve rate | `swebench` |
 | `swebench-multilingual` | pass@1[avg-of-3] resolve rate | `swebench` |
+| `terminal-bench-2.1` | pass@1[avg-of-8] resolve rate | `tbench` |
 
 ## Layout
 

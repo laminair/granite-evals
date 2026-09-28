@@ -52,6 +52,10 @@ ifbench = [
 # lm-evaluation-harness, against the served model's OpenAI API (mmlu-prox-lite).
 lmeval = [
     "lm-eval[api]==0.4.13",
+# Terminal-Bench 2.x: Harbor (terminus-2 agent, oracle, verifier). Harbor needs
+# Python >= 3.12 (the image's); on 3.11 the extra is empty and tbench is unavailable.
+tbench = [
+    "harbor==0.23.0; python_version >= '3.12'",
 ]
 # The inference server. Kept out of the base install so the CLI, tests and the
 # result tooling run on a laptop without CUDA.
