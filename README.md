@@ -20,6 +20,8 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 |---|---|---|
 | `swebench-verified` | pass@1[avg-of-3] resolve rate | `swebench` |
 | `aime25`, `hmmt-feb25`, `gpqa` (Diamond), `mmlu-pro`, `arena-hard-v2` | NeMo-Skills metrics (see suite) | `nemoskills` |
+| `mmlu-prox-lite` (lm-eval, 11 Granite languages) | exact match (custom-extract) | `lmeval` |
+| `ifbench` (NeMo-Skills + IFBench verifiers) | pass@1[avg-of-2] loose accuracy | `ifbench` |
 
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
