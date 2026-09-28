@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -238,7 +239,9 @@ def test_airline_end_to_end_metered_and_resumable(tmp_path, fake_llm, monkeypatc
         out = b.run(fake_llm, "granite")
         spend = meters.summary()
     rec = out["domains"]["airline"]
-    assert rec["n_simulations"] == 1 and rec["statuses"] == {"fail": 1}
+    # graded by the harness on the final DB; the fake agent changes nothing
+    assert rec["n_simulations"] == 1 and sum(rec["statuses"].values()) == 1
+    assert set(rec["statuses"]) <= {"success", "fail"}
     assert rec["termination_reasons"] == {"user_stop": 1}
     # the user simulator went through the meter, with its key; the agent did not
     user_calls = [c for c in _FakeLLM.calls if c["model"] == "aws/claude-sonnet-5"]
@@ -254,7 +257,7 @@ def test_airline_end_to_end_metered_and_resumable(tmp_path, fake_llm, monkeypatc
     # resume: nothing is simulated again
     n = len(_FakeLLM.calls)
     b2 = _bench("tau3-airline", tmp_path / "run", limit=1, repeats=1, dataset=str(_data_dir()), options=dict(opts))
-    assert b2.run(fake_llm, "granite")["domains"]["airline"]["pass_hat_1"] == 0.0
+    assert b2.run(fake_llm, "granite")["domains"]["airline"]["pass_hat_1"] == rec["pass_hat_1"]
     assert len(_FakeLLM.calls) == n
 
 
@@ -264,8 +267,14 @@ def test_retail_nl_assertions_use_the_configured_judge(tmp_path, fake_llm, monke
     monkeypatch.setenv("SAGE2_USER_API_KEY", "user-key")
     opts = {"user_base_url": fake_llm, "user_model": "user-model", "judge_base_url": fake_llm,
             "judge_model": "judge-model", "max_retries": "0"}
+    # the judge runs only for tasks graded on NL assertions: pick the first one
+    everything = _bench("tau3-retail", tmp_path, dataset=str(_data_dir()), options=dict(opts)).load_tasks()[0]
+    task = next(t for t in everything["retail"]
+                if "NL_ASSERTION" in tau._basis(t) and t.evaluation_criteria.nl_assertions)
+    opts["tasks"] = "^" + re.escape(task.id) + "$"
     b = _bench("tau3-retail", tmp_path, limit=1, repeats=1, dataset=str(_data_dir()), options=opts)
     out = b.run(fake_llm, "granite")
+    assert out["tasks"] == {"retail": [task.id]}
     judge_calls = [c for c in _FakeLLM.calls if c["model"] == "judge-model"]
     assert len(judge_calls) == 1 and judge_calls[0]["auth"] == "Bearer judge-key"
     assert out["judge_usage"]["calls"] == 1 and not out["judge_is_self"]
