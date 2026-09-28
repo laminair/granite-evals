@@ -19,6 +19,8 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | Implemented | Metric | Image extra |
 |---|---|---|
 | `swebench-verified` | pass@1[avg-of-3] resolve rate | `swebench` |
+| `bfcl-v4` | overall_accuracy accuracy (web search via IBM search MCP, not SerpAPI) | `bfcl` |
+| `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
 
 ## Layout
 

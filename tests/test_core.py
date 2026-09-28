@@ -130,4 +130,4 @@ def test_cli_list(capsys):
     assert cli.main(["list", "--suite", "granite42"]) == 0
     out = capsys.readouterr().out
     assert "[x] swebench-verified" in out
-    assert "[ ] birdbench" in out
+    assert "[x] birdbench" in out
