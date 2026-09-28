@@ -30,6 +30,11 @@ official GPT-4.1 judge, and without style control; results record both judges.
 | `swebench-pro` | pass@1[avg-of-3] resolve rate | `swebench` |
 | `swebench-multilingual` | pass@1[avg-of-3] resolve rate | `swebench` |
 | `terminal-bench-2.1` | pass@1[avg-of-8] resolve rate | `tbench` |
+| `tau3-bench` | pass@1 (avg of 3): mean pass^1 over airline, retail, telecom | `tau` |
+| `tau3-airline` | pass@1 (pass^1 over 4 trials) | `tau` |
+| `tau3-retail` | pass@1 (pass^1 over 4 trials) | `tau` |
+| `tau3-telecom` | pass@1 (pass^1 over 4 trials) | `tau` |
+| `tau3-banking-knowledge` | pass@1 (pass^1 over 4 trials, BM25 + grep retrieval) | `tau` |
 
 ## Layout
 
