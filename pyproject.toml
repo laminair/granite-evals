@@ -52,15 +52,18 @@ ifbench = [
 # lm-evaluation-harness, against the served model's OpenAI API (mmlu-prox-lite).
 lmeval = [
     "lm-eval[api]==0.4.13",
+]
 # Terminal-Bench 2.x: Harbor (terminus-2 agent, oracle, verifier). Harbor needs
 # Python >= 3.12 (the image's); on 3.11 the extra is empty and tbench is unavailable.
 tbench = [
     "harbor==0.23.0; python_version >= '3.12'",
+]
 # tau3-bench (sierra-research/tau2-bench v1.0.1). Task data is not in the wheel;
 # benchmarks/tau.py reads data/tau2 from the same pinned commit. Python 3.12 only:
 # tau2 imports the stdlib audioop, which 3.13 removed (the image is 3.12).
 tau = [
     "tau2[knowledge] @ git+https://github.com/sierra-research/tau2-bench@fc0055dc4e0a316c3f83133267fbd6faaa770992 ; python_full_version == '3.12.*'",
+]
 # BFCL v4 (gorilla). Its benchmark data ships inside the package, so this pin
 # is also the dataset pin. soundfile: imported by bfcl_eval, undeclared.
 bfcl = [
@@ -72,6 +75,7 @@ bfcl = [
 # extraction). Same commit as the nemoskills extra.
 bird = [
     "nemo-skills @ git+https://github.com/NVIDIA-NeMo/Skills@bcf059af55c20a89f797724598f9908d126153e6",
+]
 # LLM-judged general benchmarks (profbench, gdpval): the GDPval agent harness
 # (Stirrup, as in Artificial Analysis' GDPval-AA), the judge client, ProfBench's
 # scorer dependencies and the office-file readers that render deliverables for
@@ -106,42 +110,46 @@ requires = ["uv_build>=0.12.1,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv]
-# tau2 pins litellm<1.82.7; mini-swe-agent resolves a newer one. Each image
-# installs one family's extra, so keep their resolutions apart.
+override-dependencies = [
+    # bfcl-eval pins numpy==1.26.4 (a blanket "pin what is installed" upstream, not a
+    # numpy-2 incompatibility; granite.build's bfcl-eval step runs it on numpy 2), while
+    # vllm==0.27.1, in every image, needs numpy>=2. Every image resolves numpy 2 anyway.
+    "numpy>=2",
+    # NeMo-Skills (nemoskills, ifbench, bird) declares its cluster orchestration
+    # (NeMo-Run, nemo-evaluator-launcher) as hard dependencies. sage2-evals runs only
+    # its local prepare / generate / evaluate / metrics modules, which never import
+    # them, and NeMo-Run's leptonai pins (httpx==0.27.2,
+    # prometheus-fastapi-instrumentator==7) cannot co-install with vLLM. A marker
+    # outside requires-python drops them from the resolution.
+    "nemo-run ; python_version < '3'",
+    "nemo-evaluator-launcher ; python_version < '3'",
+]
+# Each image installs one family's extra (plus serve), so families whose pins
+# clash resolve apart. vllm pins torch, so every fork shares the serve layer.
 conflicts = [
+    # tau2 pins litellm<1.82.7; mini-swe-agent resolves a newer one.
     [{ extra = "swebench" }, { extra = "tau" }],
+    # bfcl-eval pins filelock==3.20.0 and more; keep it from downgrading other images.
+    [{ extra = "bfcl" }, { extra = "swebench" }],
+    # tree-sitter: bfcl-eval pins 0.21.3, NeMo-Skills' compute-eval needs >=0.25.2.
+    [{ extra = "bfcl" }, { extra = "bird" }],
+    [{ extra = "bfcl" }, { extra = "nemoskills" }],
+    [{ extra = "bfcl" }, { extra = "ifbench" }],
+    # NeMo-Skills pins litellm==1.84.10 and mcp<2; keep swebench's and tau's resolutions apart.
+    [{ extra = "bird" }, { extra = "swebench" }],
+    [{ extra = "nemoskills" }, { extra = "swebench" }],
+    [{ extra = "ifbench" }, { extra = "swebench" }],
+    [{ extra = "bird" }, { extra = "tau" }],
+    [{ extra = "nemoskills" }, { extra = "tau" }],
+    [{ extra = "ifbench" }, { extra = "tau" }],
+    # harbor pins filelock>=3.29.4 (bfcl-eval: ==3.20.0) and newer litellm / mcp than
+    # tau2 and NeMo-Skills allow.
+    [{ extra = "bfcl" }, { extra = "tbench" }],
+    [{ extra = "tau" }, { extra = "tbench" }],
+    [{ extra = "bird" }, { extra = "tbench" }],
+    [{ extra = "ifbench" }, { extra = "tbench" }],
+    [{ extra = "nemoskills" }, { extra = "tbench" }],
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[tool.uv]
-# NeMo-Skills declares its cluster orchestration (NeMo-Run, nemo-evaluator-launcher)
-# as hard dependencies. sage2-evals runs only its local prepare / generate / evaluate
-# / metrics modules, which never import them, and NeMo-Run's leptonai pins
-# (httpx==0.27.2, prometheus-fastapi-instrumentator==7) cannot co-install with vLLM.
-# A marker outside requires-python drops them from the resolution.
-override-dependencies = [
-    "nemo-run ; python_version < '3'",
-    "nemo-evaluator-launcher ; python_version < '3'",
-]
-# bfcl-eval pins numpy==1.26.4 (a blanket "pin what is installed" upstream, not a
-# numpy-2 incompatibility; granite.build's bfcl-eval step runs it on numpy 2), while
-# vllm==0.27.1, in every image, needs numpy>=2. Every image resolves numpy 2 anyway.
-override-dependencies = [
-    "numpy>=2",
-    # NeMo-Skills (bird) declares its cluster orchestration as hard dependencies;
-    # sage2-evals never imports them and they can't co-install with vLLM (same as
-    # the nemoskills extra). A marker outside requires-python drops them.
-    "nemo-run ; python_version < '3'",
-    "nemo-evaluator-launcher ; python_version < '3'",
-]
-# bfcl-eval also pins filelock==3.20.0 and more; resolve it apart so it doesn't
-# downgrade other families' images.
-conflicts = [
-    [{ extra = "bfcl" }, { extra = "swebench" }],
-    # tree-sitter: bfcl-eval pins 0.21.3, NeMo-Skills' compute-eval needs >=0.25.2.
-    [{ extra = "bfcl" }, { extra = "bird" }],
-    # NeMo-Skills pins litellm==1.84.10 and mcp<2; keep swebench's resolution apart.
-    [{ extra = "bird" }, { extra = "swebench" }],
-]

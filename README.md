@@ -23,10 +23,6 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `livecodebench-v6`, `scicode`, `ruler-128k`, `ruler-64k` | NeMo-Skills metrics (see suite) | `nemoskills` |
 | `mmlu-prox-lite` (lm-eval, 11 Granite languages) | exact match (custom-extract) | `lmeval` |
 | `ifbench` (NeMo-Skills + IFBench verifiers) | pass@1[avg-of-2] loose accuracy | `ifbench` |
-
-NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
-add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
-official GPT-4.1 judge, and without style control; results record both judges.
 | `swebench-pro` | pass@1[avg-of-3] resolve rate | `swebench` |
 | `swebench-multilingual` | pass@1[avg-of-3] resolve rate | `swebench` |
 | `terminal-bench-2.1` | pass@1[avg-of-8] resolve rate | `tbench` |
@@ -39,6 +35,10 @@ official GPT-4.1 judge, and without style control; results record both judges.
 | `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
 | `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000); `details.elo_is_approximation` | `judged` |
 | `profbench` | overall (ProfBench report generation, lite, LLM-judged rubrics) | `judged` |
+
+NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
+add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
+official GPT-4.1 judge, and without style control; results record both judges.
 
 ## Layout
 
