@@ -27,7 +27,7 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `cli.py` | `run` / `list` |
 | `registry.py` | `Benchmark` base class, `RunConfig`, `@register` |
 | `serving.py` | vLLM server lifecycle (`--tool-call-parser auto --reasoning-parser auto`) |
-| `data.py` | dataset loading from the private mirrors `<SAGE2_HF_ORG>/sage2-<id>` |
+| `data.py` | dataset loading (upstream HF datasets, pinned by commit) |
 | `results.py` | `results.json` schema (value, n, smoke flag, versions, details) |
 | `sandbox/` | per-task containers: enroot (BlueVela), podman/docker (local) |
 | `benchmarks/` | one module per benchmark family |
@@ -49,17 +49,16 @@ see the same examples. `results.json` records `smoke: true` for such runs.
 
 | Variable | Purpose |
 |---|---|
-| `SAGE2_HF_ORG` | org that holds the private dataset mirrors |
-| `HF_TOKEN` | read access to the mirrors |
+| `HF_TOKEN` | read access to gated upstream datasets |
 | `SAGE2_SANDBOX` | `enroot` (default), `podman`, `docker` |
 | `SAGE2_ENROOT_CACHE` | shared squashfs cache for sandbox images |
 
 ## Datasets
 
-Every benchmark reads a private HF dataset `<org>/sage2-<id>` in the `gbspace-public`
-resource group, snapshotted from upstream by `scripts/mirror_dataset.py`. Each mirror
-contains `SAGE2_SOURCE.json`, which records the upstream repo and commit.
-`--dataset <hub id>` bypasses the mirror.
+Each benchmark class pins its upstream HF dataset and commit (`dataset`,
+`dataset_revision`) and reads it directly. Public data is not mirrored.
+`results.json` records the dataset and revision it was computed on.
+`--dataset <hub id or path>` (plus `--dataset-revision`) overrides the pin.
 
 ## Images
 
@@ -73,8 +72,9 @@ Tags are the git short SHA. Pin that tag in the granite.build recipe.
 
 ## Adding a benchmark
 
-1. Add `benchmarks/<family>.py` with a `@register`ed `Benchmark` subclass. Add the
-   module to `registry._BENCHMARK_MODULES` and its harness to an optional extra.
-2. Mirror the dataset: `scripts/mirror_dataset.py <id> <upstream> --org … --resource-group-id …`.
+1. Add `benchmarks/<family>.py` with a `@register`ed `Benchmark` subclass (every
+   module there is registered automatically). Import the harness inside methods,
+   and add it to an optional extra of its own.
+2. Pin the upstream dataset on the class: `dataset` and `dataset_revision`.
 3. Copy `steps/sage2-swebench-verified` in granite.build to `steps/sage2-<id>`. Change
    the name, `BENCHMARK` and the defaults, then add a target to the suite recipes.

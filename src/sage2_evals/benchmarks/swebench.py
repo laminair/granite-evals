@@ -38,7 +38,7 @@ class SWEBench(Benchmark):
     metric = "pass@1[avg-of-3] resolve rate"
     default_repeats = 3
     extra = "swebench"
-    upstream_dataset: ClassVar[str]
+    harness_packages = ("mini-swe-agent", "swebench")
     split: ClassVar[str] = "test"
 
     # -- options -----------------------------------------------------------
@@ -61,9 +61,8 @@ class SWEBench(Benchmark):
     # -- entry point -------------------------------------------------------
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
-        rows, source = data.load_split(
-            self.id, dataset=self.config.dataset, revision=self.config.dataset_revision, split=self.split
-        )
+        source, revision = self.dataset_source()
+        rows = data.load_split(source, revision=revision, split=self.split)
         if pattern := self.opt("instances", ""):
             rows = [r for r in rows if re.search(pattern, r["instance_id"])]
         instances = data.take(rows, self.config.limit, key="instance_id")
@@ -95,6 +94,7 @@ class SWEBench(Benchmark):
             "value": sum(r["resolve_rate"] for r in per_repeat) / len(per_repeat),
             "n": len(instances),
             "dataset": source,
+            "dataset_revision": revision,
             "per_repeat": per_repeat,
             "instances": [i["instance_id"] for i in instances],
         }
@@ -225,4 +225,5 @@ def _count(values) -> dict[str, int]:
 @register
 class SWEBenchVerified(SWEBench):
     id = "swebench-verified"
-    upstream_dataset = "SWE-bench/SWE-bench_Verified"
+    dataset = "SWE-bench/SWE-bench_Verified"
+    dataset_revision = "78f471bf655a3137b2e8a75af1501690ec009ec3"

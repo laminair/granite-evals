@@ -44,12 +44,19 @@ def test_take_is_stable_and_limited():
     assert len(data.take(rows, None, key="id")) == 3
 
 
-def test_mirror_repo_needs_org(monkeypatch):
-    monkeypatch.delenv(data.HF_ORG_ENV, raising=False)
-    with pytest.raises(SystemExit):
-        data.mirror_repo("swebench-verified")
-    monkeypatch.setenv(data.HF_ORG_ENV, "some-org")
-    assert data.mirror_repo("swebench-verified") == "some-org/sage2-swebench-verified"
+def test_dataset_source_pin_and_override(tmp_path):
+    cls = registry.get("swebench-verified")
+    pinned = cls(RunConfig(model="m", output_dir=tmp_path))
+    assert pinned.dataset_source() == (cls.dataset, cls.dataset_revision)
+    assert len(cls.dataset_revision) == 40
+    other = cls(RunConfig(model="m", output_dir=tmp_path, dataset="/local/ds"))
+    assert other.dataset_source() == ("/local/ds", None)
+
+
+def test_every_benchmark_pins_its_dataset():
+    for bid, cls in registry.all_benchmarks().items():
+        assert cls.dataset, bid
+        assert cls.dataset_revision or cls.dataset.startswith(("http", "git+")), bid
 
 
 def test_suites_reference_unique_ids():

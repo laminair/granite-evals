@@ -85,7 +85,7 @@ def test_patch_that_never_applies(bench, tmp_path, monkeypatch):
 
 def test_run_aggregates_repeats_and_resumes(tmp_path, monkeypatch):
     bench = sb_mod.SWEBenchVerified(RunConfig(model="m", output_dir=tmp_path, repeats=2, limit=1, workers=1))
-    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: ([INSTANCE, {**INSTANCE, "instance_id": "z"}], "src"))
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [INSTANCE, {**INSTANCE, "instance_id": "z"}])
     calls = []
     monkeypatch.setattr(bench, "_generate", lambda inst, idir, url, served, k: calls.append(k) or ("diff\n" if k == 0 else ""))
     monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: FakeSandbox())
@@ -110,7 +110,7 @@ def test_gold_mode_grades_reference_patch_without_a_model(tmp_path, monkeypatch)
         RunConfig(model="m", output_dir=tmp_path, repeats=1, workers=1, options={"patch": "gold"})
     )
     assert bench.needs_server() is False
-    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: ([{**INSTANCE, "patch": "gold-diff\n"}], "src"))
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [{**INSTANCE, "patch": "gold-diff\n"}])
     monkeypatch.setattr(bench, "_generate", lambda *a: pytest.fail("gold mode must not call the agent"))
     fake = FakeSandbox()
     monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)

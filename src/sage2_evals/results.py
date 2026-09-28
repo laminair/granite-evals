@@ -57,7 +57,7 @@ def write_results(
         "versions": {
             "sage2-evals": __version__,
             "python": platform.python_version(),
-            **_package_versions(["vllm", "mini-swe-agent", "swebench", "datasets"]),
+            **_package_versions(["vllm", "datasets", *benchmark.harness_packages]),
         },
         "details": outcome,
     }

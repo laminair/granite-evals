@@ -45,7 +45,7 @@ def _add_run(sub) -> None:
     p.add_argument("--repeats", type=int, default=None, help="override pass@1[avg-of-k] repeats")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--dataset", default="", help="hub id or local path overriding the sage2 mirror")
+    p.add_argument("--dataset", default="", help="hub id or local path overriding the benchmark's pinned dataset")
     p.add_argument("--dataset-revision", default=None)
     p.add_argument("--option", action="append", default=[], metavar="K=V", help="benchmark-specific option")
     g = p.add_argument_group("vLLM")
