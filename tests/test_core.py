@@ -80,11 +80,36 @@ def test_results_schema(tmp_path):
     assert record["smoke"] is True and record["details"] == {"extra": 1}
 
 
-def test_vllm_command_has_granite_parsers(tmp_path):
-    cmd = VLLMServer(ServerConfig(model="/m", served_model_name="g"), tmp_path / "log").command()
-    assert cmd[:3] == ["vllm", "serve", "/m"]
+def _granite42(d):
+    # Excerpts of ibm-granite/granite-4.2-3b's chat_template.jinja and plugin.
+    d.mkdir()
+    (d / "chat_template.jinja").write_text("<tool_call>\n<function={{ tool_call.name }}>\n<parameter=")
+    (d / "granite_thinking_parser.py").write_text(
+        '@ReasoningParserManager.register_module("granite_thinking_parser")\nclass GraniteThinkingParser: ...'
+    )
+    return d
+
+
+def test_vllm_command_resolves_granite42_parsers(tmp_path):
+    m = _granite42(tmp_path / "m")
+    cmd = VLLMServer(ServerConfig(model=str(m), served_model_name="g"), tmp_path / "log").command()
+    assert cmd[:3] == ["vllm", "serve", str(m)]
     assert "--enable-auto-tool-choice" in cmd
-    assert cmd[cmd.index("--tool-call-parser") + 1] == "auto"
+    assert cmd[cmd.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert cmd[cmd.index("--reasoning-parser") + 1] == "granite_thinking_parser"
+    assert cmd[cmd.index("--reasoning-parser-plugin") + 1] == str(m / "granite_thinking_parser.py")
+
+
+def test_vllm_command_parsers_explicit_and_undetected(tmp_path):
+    m = _granite42(tmp_path / "m")
+    cfg = ServerConfig(model=str(m), served_model_name="g", tool_call_parser="hermes", reasoning_parser="")
+    cmd = VLLMServer(cfg, tmp_path / "log").command()
+    assert cmd[cmd.index("--tool-call-parser") + 1] == "hermes"
+    assert "--reasoning-parser" not in cmd
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "plain" / "tokenizer_config.json").write_text('{"chat_template": "{{ messages }}"}')
+    cmd = VLLMServer(ServerConfig(model=str(tmp_path / "plain"), served_model_name="g"), tmp_path / "log").command()
+    assert "--tool-call-parser" not in cmd and "--reasoning-parser" not in cmd
 
 
 def test_cli_list(capsys):

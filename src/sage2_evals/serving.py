@@ -3,12 +3,20 @@
 Same shape as granite.build's run-bfcl.sh: the step owns its server, waits for
 ``/v1/models`` to answer, and tears the whole process group down on exit, so
 a crashed eval never leaves GPUs held on the node.
+
+Parsers set to ``auto`` are resolved from the checkpoint's own files, since
+vLLM has no "auto": the tool-call parser from the chat template's tool-call
+format, the reasoning parser from a ``*_parser.py`` vLLM plugin shipped with
+the model (Granite 4.2 ships ``granite_thinking_parser.py``). That keeps
+distilled checkpoints, which carry the teacher's template, on the same parsers.
 """
 
 from __future__ import annotations
 
 import logging
+import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -29,14 +37,57 @@ class ServerConfig:
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.9
     max_model_len: int | None = None
-    # Granite 4.2 resolves both to its own parsers (qwen3_coder / nemotron_3);
-    # see the model card's "Serving with vLLM" section.
+    # "auto" resolves from the checkpoint (module docstring); "" disables. Granite
+    # 4.2 resolves to qwen3_coder + its granite_thinking_parser plugin, as in the
+    # model card's "Serving with vLLM" section.
     tool_call_parser: str = "auto"
     reasoning_parser: str = "auto"
     extra_args: list[str] = field(default_factory=list)
     port: int = 0
     """0 picks a free port."""
     startup_timeout_s: int = 1800
+
+
+def model_dir(model: str) -> Path | None:
+    """The checkpoint's directory: ``model`` itself, or the hub snapshot of its
+    small files (vLLM downloads the weights into the same cache)."""
+    if Path(model).is_dir():
+        return Path(model)
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(snapshot_download(model, allow_patterns=["*.json", "*.jinja", "*.py"]))
+    except Exception as e:  # noqa: BLE001 - no metadata just means no parsers
+        log.warning("cannot fetch %s metadata for parser detection: %s", model, e)
+        return None
+
+
+def _chat_template(d: Path) -> str:
+    if (d / "chat_template.jinja").is_file():
+        return (d / "chat_template.jinja").read_text()
+    try:
+        t = json.loads((d / "tokenizer_config.json").read_text()).get("chat_template") or ""
+    except (OSError, ValueError):
+        return ""
+    return t if isinstance(t, str) else " ".join(x.get("template", "") for x in t)
+
+
+def detect_tool_call_parser(d: Path) -> str:
+    template = _chat_template(d)
+    if "<function=" in template:  # <tool_call><function=f><parameter=p>...: Qwen3-Coder XML
+        return "qwen3_coder"
+    if "<tool_call>" in template:  # <tool_call>{"name": ..., "arguments": ...}
+        return "hermes"
+    return ""
+
+
+def detect_reasoning_plugin(d: Path) -> tuple[str, Path] | None:
+    """(parser name, plugin file) of a reasoning parser the checkpoint ships."""
+    for f in sorted(d.glob("*_parser.py")):
+        m = re.search(r"ReasoningParserManager\.register_module\(\s*[\"']([^\"']+)", f.read_text())
+        if m:
+            return m.group(1), f
+    return None
 
 
 def _free_port() -> int:
@@ -66,10 +117,18 @@ class VLLMServer:
         ]  # fmt: skip
         if c.max_model_len:
             cmd += ["--max-model-len", str(c.max_model_len)]
-        if c.tool_call_parser:
-            cmd += ["--enable-auto-tool-choice", "--tool-call-parser", c.tool_call_parser]
-        if c.reasoning_parser:
-            cmd += ["--reasoning-parser", c.reasoning_parser]
+        tool, reasoning, plugin = c.tool_call_parser, c.reasoning_parser, None
+        d = model_dir(c.model) if "auto" in (tool, reasoning) else None
+        if tool == "auto":
+            tool = detect_tool_call_parser(d) if d else ""
+        if reasoning == "auto":
+            reasoning, plugin = (detect_reasoning_plugin(d) if d else None) or ("", None)
+        if tool:
+            cmd += ["--enable-auto-tool-choice", "--tool-call-parser", tool]
+        if reasoning:
+            cmd += ["--reasoning-parser", reasoning]
+        if plugin:
+            cmd += ["--reasoning-parser-plugin", str(plugin)]
         return cmd + c.extra_args
 
     def __enter__(self) -> VLLMServer:
