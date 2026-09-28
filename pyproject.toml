@@ -1,0 +1,44 @@
+[project]
+name = "sage2-evals"
+version = "0.1.0"
+description = "Runtime for the Sage2 LLM evaluation suites (Granite 4.2 / Granite 5), packaged for granite.build steps"
+readme = "README.md"
+authors = [
+    { name = "Herbert", email = "herbert@woisetschlaeger.fyi" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.0",
+    "httpx>=0.27",
+    "huggingface-hub>=0.30",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# One extra per benchmark family. Upstream harnesses stay external and pinned
+# here; each step image installs only the extra it needs, because the harnesses'
+# own dependencies conflict with one another.
+swebench = [
+    "mini-swe-agent==2.4.6",
+    "swebench==5.0.2",
+]
+# The inference server. Kept out of the base install so the CLI, tests and the
+# result tooling run on a laptop without CUDA.
+serve = [
+    "vllm==0.27.1",
+]
+
+[project.scripts]
+sage2-evals = "sage2_evals.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
