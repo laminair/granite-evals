@@ -350,7 +350,8 @@ class SandboxEnvironment(BaseEnvironment):
             raise FileNotFoundError(source)
         archive = Path(tempfile.mkstemp(dir=self._scratch, suffix=".tar")[1])
         try:
-            with tarfile.open(archive, "w") as tar:
+            # Dereference: task files in an HF snapshot are symlinks into its blob store.
+            with tarfile.open(archive, "w", dereference=True) as tar:
                 for item in sorted(source.iterdir()):
                     tar.add(item, arcname=item.name)
             await self._tar_in(archive, target_dir)

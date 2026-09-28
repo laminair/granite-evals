@@ -240,9 +240,13 @@ def test_env_file_roundtrip(env, tmp_path):
     (src / "sub").mkdir(parents=True)
     (src / "a.txt").write_text("A")
     (src / "sub" / "b.sh").write_text("#!/bin/sh\n")
+    (tmp_path / "blob").write_text("B")
+    (src / "linked.txt").symlink_to(tmp_path / "blob")  # HF snapshot layout
     box = tmp_path / "box"
     asyncio.run(env.upload_dir(src, str(box / "tests")))
     assert (box / "tests" / "sub" / "b.sh").read_text() == "#!/bin/sh\n"
+    assert not (box / "tests" / "linked.txt").is_symlink()
+    assert (box / "tests" / "linked.txt").read_text() == "B"
     asyncio.run(env.upload_file(src / "a.txt", str(box / "deep" / "x.txt")))
     assert (box / "deep" / "x.txt").read_text() == "A"
 
