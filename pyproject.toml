@@ -34,6 +34,25 @@ nemoskills = [
     "wonderwords",
     "nltk",
 ]
+# IFBench through NeMo-Skills (the `nemoskills` extra) plus the requirements of
+# allenai/IFBench's run_eval.py, which ns's ifbench evaluator runs from
+# /opt/benchmarks/IFBench (docker/extras/ifbench.sh), as ns's own image does.
+ifbench = [
+    "sage2-evals[nemoskills]",
+    "absl-py==2.5.0",
+    "langdetect==1.0.9",
+    "nltk==3.10.3",
+    "immutabledict==4.3.1",
+    "spacy==3.8.16",
+    "emoji==2.16.0",
+    "syllapy==0.7.2",
+    "unicodedata2==18.0.0",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+# lm-evaluation-harness, against the served model's OpenAI API (mmlu-prox-lite).
+lmeval = [
+    "lm-eval[api]==0.4.13",
+]
 # The inference server. Kept out of the base install so the CLI, tests and the
 # result tooling run on a laptop without CUDA.
 serve = [
