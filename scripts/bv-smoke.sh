@@ -9,7 +9,7 @@
 #   MODEL=/path/to/hf/model bsub ... -gpu num=1 bv-smoke.sh   # model run
 set -euo pipefail
 
-IMAGE="${IMAGE:-icr.io/tir-hew-sage2-evals/sage2-evals-swebench:9419469}"
+IMAGE="${IMAGE:-icr.io/tir-hew-sage2-evals/sage2-evals-swebench:2dc0819}"
 BENCHMARK="${BENCHMARK:-swebench-verified}"
 MODEL="${MODEL:-none}"
 LIMIT="${LIMIT:-2}"
@@ -27,7 +27,11 @@ LOCAL=/opt/nvme/enroot-$USER/sage2-${LSB_JOBID:-$$}
 NAME=sage2-${LSB_JOBID:-$$}
 mkdir -p "$ROOT/images" "$ROOT/enroot-cache" "$ROOT/hf-home" "$RUN" \
     "$LOCAL/data" "$LOCAL/cache" "$LOCAL/runtime" "$LOCAL/temp" "$LOCAL/inner"
-trap 'enroot remove -f "$NAME" >/dev/null 2>&1 || true; fusermount3 -u "$LOCAL/flat/merged" "$LOCAL/flat/layers" 2>/dev/null; rm -rf "$LOCAL"' EXIT
+# Every step may fail harmlessly (nothing to unmount on a cached image); under set -e
+# a failing step would otherwise end the trap and become the job's exit status.
+trap 'enroot remove -f "$NAME" >/dev/null 2>&1 || true
+      for m in "$LOCAL/flat/merged" "$LOCAL/flat/layers"; do fusermount3 -u "$m" 2>/dev/null || true; done
+      rm -rf "$LOCAL" || true' EXIT
 # Layer downloads are kept on /proj so a rerun doesn't fetch them again.
 export ENROOT_DATA_PATH=$LOCAL/data ENROOT_CACHE_PATH=$ROOT/enroot-layers \
     ENROOT_RUNTIME_PATH=$LOCAL/runtime ENROOT_TEMP_PATH=$LOCAL/temp \
