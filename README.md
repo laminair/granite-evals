@@ -27,6 +27,8 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
 official GPT-4.1 judge, and without style control; results record both judges.
+| `swebench-pro` | pass@1[avg-of-3] resolve rate | `swebench` |
+| `swebench-multilingual` | pass@1[avg-of-3] resolve rate | `swebench` |
 
 ## Layout
 

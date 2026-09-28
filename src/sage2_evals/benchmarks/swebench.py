@@ -3,6 +3,11 @@
 Metric: pass@1[avg-of-3] resolve rate, i.e. the resolve rate of each of
 ``repeats`` independent agent runs, averaged.
 
+Verified and Multilingual share one pipeline: their HF datasets carry each
+instance's image, eval_script and log_parser, from which swebench's harness
+builds the test spec and the grade. SWE-bench Pro (V2) ships its own images
+and verifier; :class:`SWEBenchPro` swaps both phases for Scale's protocol.
+
 Two phases per instance and repeat, both inside a per-instance sandbox built
 from the instance's SWE-bench image:
 
@@ -18,9 +23,13 @@ finished instance is skipped on restart, so granite.build retries resume.
 from __future__ import annotations
 
 import concurrent.futures
+import functools
+import hashlib
 import json
 import logging
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -55,17 +64,36 @@ class SWEBench(Benchmark):
         (every instance should resolve)."""
         return self.opt("patch", "model") == "gold"
 
+    @property
+    def check(self) -> bool:
+        """``--option check=data`` runs no agent and no tests: it checks that
+        every selected instance can be graded (test spec, log parser, reference
+        patch, task files) and that its image exists in its registry."""
+        return self.opt("check", "") == "data"
+
     def needs_server(self) -> bool:
-        return not self.gold
+        return not (self.gold or self.check)
+
+    def dataset_config(self) -> str | None:
+        """HF config name of the dataset (None = its default)."""
+        return None
+
+    def _gold_patch(self, instance: dict) -> str:
+        return instance["patch"]
+
+    def _image(self, instance: dict) -> str:
+        return instance["image"]
 
     # -- entry point -------------------------------------------------------
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         source, revision = self.dataset_source()
-        rows = data.load_split(source, revision=revision, split=self.split)
+        rows = data.load_split(source, revision=revision, split=self.split, name=self.dataset_config())
         if pattern := self.opt("instances", ""):
             rows = [r for r in rows if re.search(pattern, r["instance_id"])]
         instances = data.take(rows, self.config.limit, key="instance_id")
+        if self.check:
+            return {"dataset": source, "dataset_revision": revision, **self._check_data(instances)}
         log.info("%s: %d instances x %d repeats", self.id, len(instances), self.repeats)
 
         per_repeat = []
@@ -113,7 +141,7 @@ class SWEBench(Benchmark):
             patch_path = idir / "patch.diff"
             if not patch_path.exists():
                 if self.gold:
-                    patch_path.write_text(instance["patch"])
+                    patch_path.write_text(self._gold_patch(instance))
                 else:
                     patch_path.write_text(self._generate(instance, idir, base_url, served, k))
             report = self._grade(instance, patch_path.read_text(), idir)
@@ -214,6 +242,112 @@ class SWEBench(Benchmark):
         )[iid]
         return {**base, "resolved": bool(report["resolved"]), "status": "graded", "report": report}
 
+    # -- check=data --------------------------------------------------------
+
+    def _check_instance(self, instance: dict) -> list[str]:
+        """What would stop this instance from being graded (empty = nothing)."""
+        from swebench.harness.log_parsers import PARSER_REGISTRY
+        from swebench.harness.utils import make_test_spec
+
+        problems = []
+        if instance.get("image_assets"):
+            problems.append("image_assets staging is not supported")
+        spec = make_test_spec(instance)
+        if spec.log_parser not in PARSER_REGISTRY:
+            problems.append(f"unknown log_parser {spec.log_parser!r}")
+        if not self._gold_patch(instance).strip():
+            problems.append("empty reference patch")
+        return problems
+
+    def _check_data(self, instances: list[dict]) -> dict[str, Any]:
+        def one(instance: dict) -> dict:
+            out: dict[str, Any] = {"instance_id": instance["instance_id"], "image": self._image(instance)}
+            try:
+                problems = self._check_instance(instance)
+            except Exception as e:
+                problems = [f"{type(e).__name__}: {e}"]
+            try:
+                out["manifest"] = probe_image(out["image"])
+                if out["manifest"]["status"] != 200:
+                    problems.append(f"image manifest: HTTP {out['manifest']['status']}")
+            except Exception as e:
+                problems.append(f"image manifest: {type(e).__name__}: {e}")
+            return {**out, "ok": not problems, "problems": problems}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
+            results = list(pool.map(one, instances))
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.config.output_dir / "check.json").write_text(json.dumps(results, indent=2))
+        ok = sum(r["ok"] for r in results)
+        for r in results:
+            if not r["ok"]:
+                log.warning("%s check: %s %s", self.id, r["instance_id"], "; ".join(r["problems"]))
+        log.info("%s check: %d/%d instances ok", self.id, ok, len(results))
+        return {
+            # Not a score: the fraction of instances whose data and image check out.
+            "value": ok / len(results) if results else 0.0,
+            "n": len(results),
+            "mode": "check=data",
+            "ok": ok,
+            "failures": [r for r in results if not r["ok"]],
+            "instances": [r["instance_id"] for r in results],
+        }
+
+
+MANIFEST_ACCEPT = ", ".join(
+    (
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    )
+)
+
+
+def parse_image_ref(ref: str) -> tuple[str, str, str]:
+    """``(registry host, repository, tag)`` of a docker image reference."""
+    first, _, rest = ref.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        registry, path = first, rest
+    else:
+        registry, path = "docker.io", ref if "/" in ref else f"library/{ref}"
+    if registry == "docker.io":
+        registry = "registry-1.docker.io"
+    tag = "latest"
+    if ":" in path.rsplit("/", 1)[-1]:
+        path, _, tag = path.rpartition(":")
+    return registry, path, tag
+
+
+def probe_image(ref: str, *, client=None) -> dict[str, Any]:
+    """HEAD the image's manifest with an anonymous pull token, as ``enroot
+    import`` would fetch it. Docker Hub does not count HEADs against its pull
+    rate limit."""
+    import httpx
+
+    registry, repo, tag = parse_image_ref(ref)
+    url = f"https://{registry}/v2/{repo}/manifests/{tag}"
+    headers = {"Accept": MANIFEST_ACCEPT}
+    own = client is None
+    client = client or httpx.Client(timeout=30, follow_redirects=True)
+    try:
+        for attempt in range(4):
+            r = client.head(url, headers=headers)
+            if r.status_code == 401 and "Authorization" not in headers:
+                challenge = dict(re.findall(r'(\w+)="([^"]*)"', r.headers.get("www-authenticate", "")))
+                params = {"service": challenge.get("service", registry), "scope": f"repository:{repo}:pull"}
+                t = client.get(challenge["realm"], params=params)
+                t.raise_for_status()
+                headers["Authorization"] = "Bearer " + (t.json().get("token") or t.json()["access_token"])
+                r = client.head(url, headers=headers)
+            if r.status_code not in (429, 500, 502, 503, 504) or attempt == 3:
+                break
+            time.sleep(5 * 2**attempt)
+        return {"status": r.status_code, "digest": r.headers.get("docker-content-digest")}
+    finally:
+        if own:
+            client.close()
+
 
 def _count(values) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -227,3 +361,289 @@ class SWEBenchVerified(SWEBench):
     id = "swebench-verified"
     dataset = "SWE-bench/SWE-bench_Verified"
     dataset_revision = "78f471bf655a3137b2e8a75af1501690ec009ec3"
+
+
+@register
+class SWEBenchMultilingual(SWEBench):
+    """300 instances in 9 languages (C/C++, Go, Java, JS/TS, PHP, Ruby, Rust).
+    Same agent config as Verified (mini-swe-agent runs its ``multilingual``
+    subset with swebench.yaml); swebench's per-language log parsers grade it."""
+
+    id = "swebench-multilingual"
+    dataset = "SWE-bench/SWE-bench_Multilingual"
+    dataset_revision = "846e647b9f33c0b51b739d005d13d85493c9af09"
+
+
+# -- SWE-bench Pro -------------------------------------------------------------
+
+PRO_REPO = "scaleapi/SWE-bench_Pro-os"
+PRO_COMMIT = "66f92766bba642462d4bbe5479e83f91f9211862"  # tag v2.0.0
+PRO_SHA256SUMS_SHA256 = "9d84f8507c89241d42d8b3ef911600a1ec75dbbb32687ce9b45b93318502c0bd"
+"""sha256 of ``v2/SHA256SUMS`` at PRO_COMMIT; that file hashes every file under v2/."""
+PRO_AGENT_CONFIG = "tooling/configs/mini_toolcall.yaml"
+PRO_VERIFIER_TIMEOUT_S = 3000  # task.toml [verifier] timeout_sec
+PRO_AGENT_BUDGET_S = 3000 - 60  # task.toml [agent] timeout_sec, less locked_mini_swe's margin
+# locked_mini_swe.py's _CAPTURE: the agent's work is its staged `git diff`,
+# whatever it submitted and however it stopped.
+PRO_CAPTURE = (
+    "repo=$(git -C /app rev-parse --show-toplevel 2>/dev/null "
+    "|| git -C /testbed rev-parse --show-toplevel 2>/dev/null || echo /app); "
+    'cd "$repo" && git add -A 2>/dev/null; git diff --cached > /tmp/model.patch 2>/dev/null; '
+    "git reset -q 2>/dev/null; true"
+)
+# patch_replay.py's apply chain. It grades whatever applied, even if every step failed.
+PRO_APPLY = (
+    "git apply --verbose /tmp/replay.patch || git apply --3way /tmp/replay.patch "
+    "|| patch --fuzz=3 -p1 -i /tmp/replay.patch"
+)
+# The repo is at /app (a few tasks use /testbed), as every V2 script assumes.
+PRO_WORKDIR = "if [ -d /app ]; then echo /app; else echo /testbed; fi"
+
+
+class ProTasks:
+    """The V2 Harbor task directories (``v2/tasks/<instance_id>/``) of the
+    SWE-bench_Pro-os repo at PRO_COMMIT: instruction, reference patch and the
+    verifier (test.sh, run_script.sh, parser.py, config.json, test_patch.patch).
+    Files are fetched one by one, checked against the pinned SHA256SUMS and
+    cached under ``root``."""
+
+    def __init__(self, root: Path, *, commit: str = PRO_COMMIT, fetch=None):
+        self.root, self.commit = root / commit, commit
+        self._fetch = fetch or self._http_get
+        self._lock = threading.Lock()
+        self._sums: dict[str, str] | None = None
+
+    def _http_get(self, path: str) -> bytes:
+        import httpx
+
+        url = f"https://raw.githubusercontent.com/{PRO_REPO}/{self.commit}/v2/{path}"
+        for attempt in range(5):
+            try:
+                r = httpx.get(url, timeout=60, follow_redirects=True)
+                r.raise_for_status()
+                return r.content
+            except httpx.HTTPError:
+                if attempt == 4:
+                    raise
+                time.sleep(2**attempt)
+        raise AssertionError("unreachable")
+
+    def _get(self, path: str, sha256: str | None) -> bytes:
+        cached = self.root / path
+        if cached.exists():
+            content = cached.read_bytes()
+            if sha256 is None or hashlib.sha256(content).hexdigest() == sha256:
+                return content
+        content = self._fetch(path)
+        digest = hashlib.sha256(content).hexdigest()
+        if sha256 is not None and digest != sha256:
+            raise RuntimeError(f"{PRO_REPO}@{self.commit} v2/{path}: sha256 {digest}, expected {sha256}")
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cached.with_name(f"{cached.name}.{threading.get_ident()}.partial")
+        tmp.write_bytes(content)
+        tmp.replace(cached)
+        return content
+
+    def sums(self) -> dict[str, str]:
+        with self._lock:
+            if self._sums is None:
+                expected = PRO_SHA256SUMS_SHA256 if self.commit == PRO_COMMIT else None
+                sums = {}
+                for line in self._get("SHA256SUMS", expected).decode().splitlines():
+                    digest, _, path = line.strip().partition("  ")
+                    if path:
+                        sums[path] = digest
+                self._sums = sums
+            return self._sums
+
+    def file(self, path: str) -> str:
+        """``v2/<path>``, verified."""
+        sums = self.sums()
+        if path not in sums:
+            raise KeyError(f"{path} is not in {PRO_REPO}@{self.commit} v2/SHA256SUMS")
+        return self._get(path, sums[path]).decode("utf-8")
+
+    def task_file(self, iid: str, rel: str) -> str:
+        return self.file(f"tasks/{iid}/{rel}")
+
+    def tests(self, iid: str) -> dict[str, str]:
+        """The verifier files, keyed by their path under /tests."""
+        prefix = f"tasks/{iid}/tests/"
+        names = sorted(p[len(prefix) :] for p in self.sums() if p.startswith(prefix))
+        if "test.sh" not in names:
+            raise KeyError(f"no verifier for {iid} in {PRO_REPO}@{self.commit}")
+        return {name: self.file(prefix + name) for name in names}
+
+
+def _last_line(output: str) -> str:
+    lines = output.strip().splitlines()
+    return lines[-1].strip() if lines else ""
+
+
+@register
+class SWEBenchPro(SWEBench):
+    """SWE-bench Pro V2 (the public set, 642 tasks), graded by Scale's verifier.
+
+    Follows the locked protocol of ``v2/README.md`` at PRO_COMMIT, as its
+    ``locked_mini_swe`` and ``patch_replay`` agents run it under Harbor:
+
+    - generate: mini-swe-agent with the builtin ``mini`` config overlaid by
+      ``v2/tooling/configs/mini_toolcall.yaml`` (tool calling) solves the
+      task's ``instruction.md`` in the task's image (``docker_image``) within
+      a 50-minute budget. Its work is its staged ``git diff``, captured
+      whatever it submitted and however it stopped.
+    - grade: a *fresh* sandbox from the same image applies that diff with
+      patch_replay's apply chain, gets the task's ``tests/`` at /tests and runs
+      ``/tests/test.sh``, which writes ``/logs/verifier/reward.txt``. Reward 1
+      means resolved.
+
+    ``--option subset=hard`` runs the HARD-51 subset (HF config ``hard``).
+    """
+
+    id = "swebench-pro"
+    dataset = "ScaleAI/SWE-bench_Pro"
+    dataset_revision = "2d52cb3df914a3fcf80c7f66738b3a88ae37fc50"
+    harness_packages = ("mini-swe-agent",)
+
+    def dataset_config(self) -> str | None:
+        subset = self.opt("subset", "default")
+        if subset not in ("default", "hard"):
+            raise SystemExit(
+                f"swebench-pro: subset={subset!r} is not supported (default = V2, hard = HARD-51); "
+                "v1 needs Scale's retired v1 pipeline"
+            )
+        return subset
+
+    @functools.cached_property
+    def tasks(self) -> ProTasks:
+        return ProTasks(self.config.output_dir / "swebench-pro-tasks")
+
+    def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
+        out = super().run(base_url, served_model_name)
+        out["subset"] = self.dataset_config()
+        out["verifier"] = {"repo": PRO_REPO, "commit": PRO_COMMIT, "sha256sums": PRO_SHA256SUMS_SHA256}
+        return out
+
+    def _gold_patch(self, instance: dict) -> str:
+        # What Harbor's oracle agent applies.
+        return self.tasks.task_file(instance["instance_id"], "solution/gold_patch.diff")
+
+    def _image(self, instance: dict) -> str:
+        return instance["docker_image"]
+
+    def _check_instance(self, instance: dict) -> list[str]:
+        # Every file the run reads, fetched and checked against SHA256SUMS.
+        iid = instance["instance_id"]
+        self.tasks.file(PRO_AGENT_CONFIG)
+        problems = []
+        if not self.tasks.task_file(iid, "instruction.md").strip():
+            problems.append("empty instruction.md")
+        if not self._gold_patch(instance).strip():
+            problems.append("empty solution/gold_patch.diff")
+        tests = self.tasks.tests(iid)
+        problems += [f"no tests/{name}" for name in ("run_script.sh", "parser.py") if name not in tests]
+        return problems
+
+    def _agent_config(self, base_url: str, served: str, k: int) -> dict:
+        import yaml
+        from minisweagent.config import builtin_config_dir, get_config_from_spec
+        from minisweagent.utils.serialize import recursive_merge
+
+        # Harbor's MiniSweAgent passes `-c mini -c <config_file>`: the builtin
+        # mini.yaml with the protocol's file layered on top.
+        base = recursive_merge(
+            get_config_from_spec(builtin_config_dir / "mini.yaml"),
+            yaml.safe_load(self.tasks.file(PRO_AGENT_CONFIG)),
+        )
+        model_kwargs = {"api_base": base_url, "api_key": "EMPTY", "seed": self.config.seed + k}
+        for key, cast in (("temperature", float), ("top_p", float), ("max_tokens", int)):
+            if key in self.config.options:
+                model_kwargs[key] = cast(self.config.options[key])
+        return recursive_merge(
+            base,
+            {
+                "agent": {
+                    "step_limit": self.opt("step_limit", int(base["agent"].get("step_limit", 0))),
+                    "cost_limit": 0,  # local model: no cost, bound by the time budget
+                    "wall_time_limit_seconds": self.opt("agent_timeout", PRO_AGENT_BUDGET_S),
+                },
+                "model": {
+                    "model_name": f"hosted_vllm/{served}",
+                    "cost_tracking": "ignore_errors",
+                    "model_kwargs": model_kwargs,
+                },
+            },
+        )
+
+    def _generate(self, instance: dict, idir: Path, base_url: str, served: str, k: int) -> str:
+        from minisweagent.agents.default import DefaultAgent
+        from minisweagent.models import get_model
+
+        from sage2_evals.sandbox.minisweagent_env import SandboxEnvironment
+
+        iid = instance["instance_id"]
+        instruction = self.tasks.task_file(iid, "instruction.md")
+        config = self._agent_config(base_url, served, k)
+        env_config = {key: v for key, v in config.get("environment", {}).items() if key != "environment_class"}
+        # Harbor runs mini-swe-agent's LocalEnvironment inside the container:
+        # its default 30 s command timeout, in the image's repo directory.
+        env_config.setdefault("timeout", 30)
+        env = SandboxEnvironment(image=self._image(instance), backend=self.opt("sandbox", ""), **env_config)
+        try:
+            env.config.cwd = _last_line(env.sandbox.execute(PRO_WORKDIR).output) or "/app"
+            # mini.yaml puts the platform into the prompt; LocalEnvironment in
+            # the container reports the container's uname, so ask the sandbox.
+            uname = env.sandbox.execute("uname -s; uname -r; uname -v; uname -m").output.strip().splitlines()
+            platform_vars = dict(zip(("system", "release", "version", "machine"), uname[-4:]))
+            agent = DefaultAgent(get_model(config=config["model"]), env, **config["agent"])
+            exit_status = "unknown"
+            try:
+                info = agent.run(instruction, **platform_vars)
+                exit_status = info.get("exit_status")
+            finally:
+                agent.save(idir / "traj.json", {"info": {"exit_status": exit_status}, "instance_id": iid})
+                capture = env.sandbox.execute(PRO_CAPTURE, cwd=env.config.cwd, timeout=300)
+                (idir / "capture.txt").write_text(f"exit {capture.returncode}\n{capture.output}")
+            patch = env.sandbox.execute("cat /tmp/model.patch", timeout=300)
+            if patch.returncode != 0:
+                raise RuntimeError(f"{iid}: reading the captured patch failed: {patch.output[-500:]}")
+            return patch.output
+        finally:
+            env.cleanup()
+
+    def _grade(self, instance: dict, patch: str, idir: Path) -> dict:
+        iid = instance["instance_id"]
+        base = {"instance_id": iid, "resolved": False}
+        if not patch.strip():
+            # patch_replay would apply nothing and run the verifier; V2's release
+            # gate fails every task on an empty patch, so the run is skipped.
+            return {**base, "status": "empty_patch"}
+        tests = self.tasks.tests(iid)
+
+        with make_sandbox(self._image(instance), backend=self.opt("sandbox", "")) as sb:
+            workdir = _last_line(sb.execute(PRO_WORKDIR).output) or "/app"
+            sb.write_file("/tmp/replay.patch", patch)
+            applied = sb.execute(PRO_APPLY, cwd=workdir, timeout=300)
+            (idir / "patch_apply.txt").write_text(f"$ {PRO_APPLY}  (exit {applied.returncode})\n{applied.output}")
+            for name, content in tests.items():
+                sb.write_file(f"/tests/{name}", content)
+            sb.execute("mkdir -p /logs/verifier && chmod +x /tests/test.sh")
+            result = sb.execute(
+                "/tests/test.sh > /logs/verifier/test-stdout.txt 2>&1",
+                cwd=workdir,
+                timeout=self.opt("eval_timeout", PRO_VERIFIER_TIMEOUT_S),
+            )
+            (idir / "test_output.txt").write_text(sb.execute("cat /logs/verifier/test-stdout.txt").output)
+            output_json = sb.execute("cat /logs/verifier/output.json")
+            if output_json.returncode == 0:
+                (idir / "output.json").write_text(output_json.output)
+            reward = sb.execute("cat /logs/verifier/reward.txt")
+
+        info = {"apply_rc": applied.returncode, "verifier_rc": result.returncode}
+        if result.timed_out:
+            return {**base, **info, "status": "eval_timeout"}
+        try:
+            value = float(_last_line(reward.output))
+        except ValueError:
+            return {**base, **info, "status": "no_reward"}
+        return {**base, **info, "resolved": value == 1.0, "status": "graded", "reward": value}
