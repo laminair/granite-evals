@@ -38,6 +38,18 @@ def test_enroot_sandbox_keeps_tmp_between_commands(tmp_path, monkeypatch):
     assert not sb.tmp.exists()
 
 
+def test_enroot_sandbox_gets_no_secrets(monkeypatch):
+    # enroot start passes its environment into the sandbox, where model-written code runs.
+    for name in ("SAGE2_JUDGE_API_KEY", "SAGE2_USER_API_KEY", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(name, "s3cret")
+    monkeypatch.setenv("SAGE2_SPEND_LEDGER", "/proj/ledger.jsonl")
+    sb = enroot.EnrootSandbox("img:latest", env={"HF_TOKEN": "explicit"})
+    env = sb._run_env()
+    assert "s3cret" not in env.values() and env["PATH"] and env["SAGE2_SPEND_LEDGER"]
+    argv = sb._exec_argv("true", "/", sb.env)
+    assert argv[argv.index("--env") + 1] == "HF_TOKEN=explicit"  # explicit env still reaches it
+
+
 def test_take_is_stable_and_limited():
     rows = [{"id": "b"}, {"id": "c"}, {"id": "a"}]
     assert [r["id"] for r in data.take(rows, 2, key="id")] == ["a", "b"]

@@ -14,6 +14,11 @@ Sandboxes get no GPUs: enroot passes our environment through, and in a GPU
 job NVIDIA_VISIBLE_DEVICES would make its nvidia hook look for
 nvidia-container-cli, which the image doesn't have.
 
+Nor do they get our secrets: the model under test runs code in the sandbox,
+so variables whose names look like credentials (judge and user-simulator
+keys, HF_TOKEN, ...) are dropped from what ``enroot start`` passes through.
+A benchmark that needs one in the sandbox passes it explicitly as ``env``.
+
 Imports use the rootless helpers in :mod:`sage2_evals.sandbox.ovlfs`, because
 enroot's own need capabilities BlueVela's compute nodes don't grant. Set
 ``SAGE2_ENROOT_ROOTLESS=0`` to use enroot's.
@@ -37,6 +42,7 @@ from sage2_evals.sandbox import Sandbox, ovlfs
 log = logging.getLogger(__name__)
 
 ENROOT = os.environ.get("SAGE2_ENROOT", "enroot")
+SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSW|CREDENTIAL|AUTH", re.IGNORECASE)
 
 
 def enroot_uri(image: str) -> str:
@@ -106,7 +112,8 @@ class EnrootSandbox(Sandbox):
         return argv + [self.name, "bash", "-c", f"cd {shlex.quote(cwd)} && {command}"]
 
     def _run_env(self) -> dict[str, str]:
-        return {**os.environ, "NVIDIA_VISIBLE_DEVICES": "void"}
+        env = {k: v for k, v in os.environ.items() if not SECRET_NAME.search(k)}
+        return {**env, "NVIDIA_VISIBLE_DEVICES": "void"}
 
     def close(self) -> None:
         subprocess.run(
