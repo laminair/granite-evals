@@ -72,6 +72,20 @@ bfcl = [
 # extraction). Same commit as the nemoskills extra.
 bird = [
     "nemo-skills @ git+https://github.com/NVIDIA-NeMo/Skills@bcf059af55c20a89f797724598f9908d126153e6",
+# LLM-judged general benchmarks (profbench, gdpval): the GDPval agent harness
+# (Stirrup, as in Artificial Analysis' GDPval-AA), the judge client, ProfBench's
+# scorer dependencies and the office-file readers that render deliverables for
+# the judge. ProfBench's own scripts are fetched by commit (docker/extras/judged.sh).
+judged = [
+    "stirrup==0.2.0; python_version >= '3.12'",  # stirrup needs 3.12 (the image has it)
+    "openai>=1.99",
+    "numpy>=1.26",
+    "scikit-learn>=1.5",
+    "tqdm>=4.66",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
+    "pypdf>=5.0",
 ]
 # The inference server. Kept out of the base install so the CLI, tests and the
 # result tooling run on a laptop without CUDA.

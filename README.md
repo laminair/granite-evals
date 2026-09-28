@@ -37,6 +37,8 @@ official GPT-4.1 judge, and without style control; results record both judges.
 | `tau3-banking-knowledge` | pass@1 (pass^1 over 4 trials, BM25 + grep retrieval) | `tau` |
 | `bfcl-v4` | overall_accuracy accuracy (web search via IBM search MCP, not SerpAPI) | `bfcl` |
 | `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
+| `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000); `details.elo_is_approximation` | `judged` |
+| `profbench` | overall (ProfBench report generation, lite, LLM-judged rubrics) | `judged` |
 
 ## Layout
 
