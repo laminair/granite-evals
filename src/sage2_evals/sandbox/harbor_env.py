@@ -30,6 +30,7 @@ behaviour of ``docker exec``).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import signal
@@ -44,6 +45,8 @@ from harbor.environments.capabilities import EnvironmentCapabilities
 from harbor.models.trial.paths import EnvironmentPaths
 
 from sage2_evals.sandbox import make_sandbox
+
+log = logging.getLogger(__name__)
 
 MARKER = "SAGE2_SANDBOX_ID"
 TIMEOUT_RC = 124  # what harbor's own environments return (coreutils `timeout`)
@@ -160,6 +163,7 @@ class SandboxEnvironment(BaseEnvironment):
         await asyncio.to_thread(self._sandbox.start)
         if self._backend == "enroot" and self._pid_namespace:
             await self._start_keeper()
+        log.info("%s: %s in %s (exec: %s)", self.environment_name, self.task_env_config.docker_image, self._sandbox.name, self.exec_mode)
         dirs = [str(EnvironmentPaths.agent_dir), str(EnvironmentPaths.verifier_dir), str(EnvironmentPaths.artifacts_dir)]
         dirs += [str(m["target"]) for m in self._mounts if m.get("target")]
         setup = f"mkdir -p {' '.join(map(shlex.quote, dirs))} && chmod 777 {' '.join(map(shlex.quote, dirs))}"
@@ -174,26 +178,37 @@ class SandboxEnvironment(BaseEnvironment):
         sb = self._sandbox
         self._nsenter = shutil.which("nsenter") or "nsenter"
         argv = sb._exec_argv(KEEPER_CMD, "/", {MARKER: sb.name})
-        self._keeper = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=self._enroot_env(),
-            start_new_session=True,
-        )
+        err_path = self._scratch / "keeper.err"
+        with open(err_path, "wb") as err_f:
+            self._keeper = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=err_f,
+                stderr=err_f,
+                env=self._enroot_env(),
+                start_new_session=True,
+            )
+        why = "no PID 1 after 30s"
         for _ in range(300):
             if self._keeper.returncode is not None:
+                why = f"keeper exited {self._keeper.returncode}"
                 break
             if (pid := _ns_init(self._keeper.pid)) is not None:
                 try:
                     self._ns_env = _read_environ(pid)
                     self._ns_pid = pid
+                except OSError as e:
+                    why = f"reading its environment: {e}"
+                    break
+                rc, out, err = await self._run("true", cwd="/", timeout_sec=60)
+                if rc == 0:
                     return
-                except OSError:
-                    pass
+                why = f"nsenter exit {rc}: {(out + err).strip()[-500:]}"
+                self._ns_pid = None
+                break
             await asyncio.sleep(0.1)
-        self.logger.warning("no PID namespace for %s (keeper failed); one enroot start per command", sb.name)
+        keeper_err = err_path.read_text("utf-8", "replace").strip()[-500:]
+        log.warning("no PID namespace for %s (%s; %s); one enroot start per command", sb.name, why, keeper_err)
         await self._stop_keeper()
 
     async def _stop_keeper(self) -> None:

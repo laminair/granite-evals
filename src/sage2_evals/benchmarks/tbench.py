@@ -209,6 +209,7 @@ class TerminalBench21(Benchmark):
                 }
             )
         per_task = {t["name"]: sum(r["resolved"] for r in reports if r["task"] == t["name"]) for t in tasks}
+        per_task_status = {t["name"]: _count(r["status"] for r in reports if r["task"] == t["name"]) for t in tasks}
         return {
             "value": sum(r["resolve_rate"] for r in per_repeat) / len(per_repeat) if per_repeat else 0.0,
             "n": len(tasks),
@@ -221,6 +222,7 @@ class TerminalBench21(Benchmark):
             "sampling": self.sampling(),
             "per_repeat": per_repeat,
             "per_task_resolved": per_task,
+            "per_task_status": per_task_status,
             "tasks": [t["name"] for t in tasks],
         }
 
@@ -308,7 +310,7 @@ class TerminalBench21(Benchmark):
         summary = tdir / "sage2.json"
         if summary.exists():
             return json.loads(summary.read_text())
-        base = {"task": name, "repeat": k, "resolved": False, "reward": 0.0}
+        base = {"task": name, "repeat": k, "image": task["image"], "resolved": False, "reward": 0.0}
         if task["image"] in image_errors:
             return {**base, "status": f"error:image:{image_errors[task['image']]}"}
 
@@ -371,8 +373,10 @@ class TerminalBench21(Benchmark):
         if exc is not None and exc.exception_type not in FINAL_EXCEPTIONS:
             status = f"error:{exc.exception_type}"
         ar = result.agent_result
+        started, finished = getattr(result, "started_at", None), getattr(result, "finished_at", None)
         return {
             **base,
+            "duration_sec": round((finished - started).total_seconds(), 1) if started and finished else None,
             "resolved": reward >= 1.0,
             "reward": reward,
             "status": status,
