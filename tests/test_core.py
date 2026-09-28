@@ -5,6 +5,7 @@ import pytest
 from sage2_evals import cli, data, registry, suites
 from sage2_evals.registry import Benchmark, RunConfig
 from sage2_evals.results import write_results
+from sage2_evals.sandbox import enroot
 from sage2_evals.sandbox.enroot import enroot_uri
 from sage2_evals.serving import ServerConfig, VLLMServer
 
@@ -20,6 +21,20 @@ from sage2_evals.serving import ServerConfig, VLLMServer
 )
 def test_enroot_uri(image, uri):
     assert enroot_uri(image) == uri
+
+
+def test_enroot_sandbox_keeps_tmp_between_commands(tmp_path, monkeypatch):
+    # enroot mounts a fresh tmpfs on /tmp per `start`; the sandbox binds its own dir.
+    monkeypatch.setenv("ENROOT_TEMP_PATH", str(tmp_path))
+    monkeypatch.setattr(enroot, "ensure_squashfs", lambda image: tmp_path / "x.sqsh")
+    monkeypatch.setattr(enroot.subprocess, "run", lambda *a, **k: None)
+    sb = enroot.EnrootSandbox("img:latest")
+    sb.start()
+    argv = sb._exec_argv("true", "/testbed", {})
+    assert argv[argv.index("--mount") + 1] == f"{sb.tmp}:/tmp"
+    assert sb.tmp.parent == tmp_path and sb.tmp.is_dir()
+    sb.close()
+    assert not sb.tmp.exists()
 
 
 def test_take_is_stable_and_limited():

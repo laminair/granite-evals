@@ -187,12 +187,16 @@ class SWEBench(Benchmark):
         spec = make_test_spec(instance)
         with make_sandbox(instance["image"], backend=self.opt("sandbox", "")) as sb:
             sb.write_file(PATCH_FILE, patch)
+            attempts = []
             for i, cmd in enumerate(GIT_APPLY_CMDS):
                 if i:
                     sb.execute("git checkout -- . ; git clean -fd", cwd="/testbed")
-                if sb.execute(f"{cmd} {PATCH_FILE}", cwd="/testbed").returncode == 0:
+                r = sb.execute(f"{cmd} {PATCH_FILE}", cwd="/testbed")
+                attempts.append(f"$ {cmd} {PATCH_FILE}  (exit {r.returncode})\n{r.output}")
+                if r.returncode == 0:
                     break
-            else:
+            (idir / "patch_apply.txt").write_text("\n".join(attempts))
+            if r.returncode != 0:
                 return {**base, "status": "patch_failed"}
 
             sb.write_file("/eval.sh", spec.eval_script)

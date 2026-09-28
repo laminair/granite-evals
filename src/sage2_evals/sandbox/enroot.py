@@ -5,6 +5,11 @@ shared filesystem on BlueVela so every job reuses them) and each sandbox is a
 throwaway ``enroot create`` of that squashfs. Commands run with
 ``enroot start --root --rw``: SWE-bench images expect to be root in /testbed.
 
+Every ``enroot start`` mounts a fresh tmpfs on /tmp (enroot's default
+mounts), and each command is its own ``start``, so a sandbox gets a host
+directory (under ``ENROOT_TEMP_PATH``) bound over /tmp instead: files written
+there by one command are still there for the next.
+
 Imports use the rootless helpers in :mod:`sage2_evals.sandbox.ovlfs`, because
 enroot's own need capabilities BlueVela's compute nodes don't grant. Set
 ``SAGE2_ENROOT_ROOTLESS=0`` to use enroot's.
@@ -18,7 +23,9 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from sage2_evals.sandbox import Sandbox, ovlfs
@@ -71,8 +78,14 @@ def ensure_squashfs(image: str) -> Path:
 
 
 class EnrootSandbox(Sandbox):
+    tmp: Path | None = None
+
     def start(self) -> None:
         sqsh = ensure_squashfs(self.image)
+        base = os.environ.get("ENROOT_TEMP_PATH") or tempfile.gettempdir()
+        os.makedirs(base, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix=f"{self.name}-tmp-", dir=base))
+        self.tmp.chmod(0o1777)
         subprocess.run(
             [ENROOT, "create", "--name", self.name, str(sqsh)],
             check=True,
@@ -82,6 +95,8 @@ class EnrootSandbox(Sandbox):
 
     def _exec_argv(self, command: str, cwd: str, env: dict[str, str]) -> list[str]:
         argv = [ENROOT, "start", "--root", "--rw"]
+        if self.tmp:
+            argv += ["--mount", f"{self.tmp}:/tmp"]
         for key, value in env.items():
             argv += ["--env", f"{key}={value}"]
         return argv + [self.name, "bash", "-c", f"cd {shlex.quote(cwd)} && {command}"]
@@ -92,3 +107,5 @@ class EnrootSandbox(Sandbox):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        if self.tmp:
+            shutil.rmtree(self.tmp, ignore_errors=True)
