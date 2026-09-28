@@ -41,6 +41,10 @@ class Sandbox(abc.ABC):
     @abc.abstractmethod
     def close(self) -> None: ...
 
+    def _run_env(self) -> dict[str, str] | None:
+        """Environment of the local process that runs a command (None = ours)."""
+        return None
+
     def execute(
         self,
         command: str,
@@ -61,6 +65,7 @@ class Sandbox(abc.ABC):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
+                env=self._run_env(),
             )
             return ExecResult(p.stdout, p.returncode)
         except subprocess.TimeoutExpired as e:

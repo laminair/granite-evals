@@ -33,6 +33,7 @@ def test_enroot_sandbox_keeps_tmp_between_commands(tmp_path, monkeypatch):
     argv = sb._exec_argv("true", "/testbed", {})
     assert argv[argv.index("--mount") + 1] == f"{sb.tmp}:/tmp"
     assert sb.tmp.parent == tmp_path and sb.tmp.is_dir()
+    assert sb._run_env()["NVIDIA_VISIBLE_DEVICES"] == "void"
     sb.close()
     assert not sb.tmp.exists()
 

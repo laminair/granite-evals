@@ -10,6 +10,10 @@ mounts), and each command is its own ``start``, so a sandbox gets a host
 directory (under ``ENROOT_TEMP_PATH``) bound over /tmp instead: files written
 there by one command are still there for the next.
 
+Sandboxes get no GPUs: enroot passes our environment through, and in a GPU
+job NVIDIA_VISIBLE_DEVICES would make its nvidia hook look for
+nvidia-container-cli, which the image doesn't have.
+
 Imports use the rootless helpers in :mod:`sage2_evals.sandbox.ovlfs`, because
 enroot's own need capabilities BlueVela's compute nodes don't grant. Set
 ``SAGE2_ENROOT_ROOTLESS=0`` to use enroot's.
@@ -100,6 +104,9 @@ class EnrootSandbox(Sandbox):
         for key, value in env.items():
             argv += ["--env", f"{key}={value}"]
         return argv + [self.name, "bash", "-c", f"cd {shlex.quote(cwd)} && {command}"]
+
+    def _run_env(self) -> dict[str, str]:
+        return {**os.environ, "NVIDIA_VISIBLE_DEVICES": "void"}
 
     def close(self) -> None:
         subprocess.run(

@@ -99,9 +99,13 @@ case "$MODEL" in /*) MOUNTS+=(--mount "$MODEL:$MODEL") ;; esac
 OPTS=""
 for kv in $OPTIONS; do OPTS="$OPTS --option $kv"; done
 
+# The GPU env granite.build's SkyPilot LSF provider also sets; it makes enroot's
+# nvidia hook mount the job's GPUs.
 echo "=== sage2-evals run $BENCHMARK ==="
 enroot start --rw "${MOUNTS[@]}" \
     --env HF_HOME="$ROOT/hf-home" \
+    --env NVIDIA_VISIBLE_DEVICES=all \
+    --env NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     --env SAGE2_SANDBOX=enroot \
     --env SAGE2_ENROOT_CACHE="$ROOT/enroot-cache" \
     --env ENROOT_DATA_PATH=/scratch/data \
