@@ -35,6 +35,8 @@ official GPT-4.1 judge, and without style control; results record both judges.
 | `tau3-retail` | pass@1 (pass^1 over 4 trials) | `tau` |
 | `tau3-telecom` | pass@1 (pass^1 over 4 trials) | `tau` |
 | `tau3-banking-knowledge` | pass@1 (pass^1 over 4 trials, BM25 + grep retrieval) | `tau` |
+| `bfcl-v4` | overall_accuracy accuracy (web search via IBM search MCP, not SerpAPI) | `bfcl` |
+| `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
 
 ## Layout
 
