@@ -24,10 +24,11 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 
 | Path | What |
 |---|---|
-| `cli.py` | `run` / `list` |
+| `cli.py` | `run` / `list` / `spend` |
 | `registry.py` | `Benchmark` base class, `RunConfig`, `@register` |
 | `serving.py` | vLLM server lifecycle (`--tool-call-parser auto --reasoning-parser auto`) |
 | `data.py` | dataset loading (upstream HF datasets, pinned by commit) |
+| `meter.py` | metering proxy for paid judge / user-simulator APIs: cost ledger, budget cap |
 | `results.py` | `results.json` schema (value, n, smoke flag, versions, details) |
 | `sandbox/` | per-task containers: enroot (BlueVela), podman/docker (local) |
 | `benchmarks/` | one module per benchmark family |
@@ -52,6 +53,18 @@ see the same examples. `results.json` records `smoke: true` for such runs.
 | `HF_TOKEN` | read access to gated upstream datasets |
 | `SAGE2_SANDBOX` | `enroot` (default), `podman`, `docker` |
 | `SAGE2_ENROOT_CACHE` | shared squashfs cache for sandbox images |
+| `SAGE2_SPEND_LEDGER` | JSONL ledger of paid API calls, shared by concurrent jobs |
+| `SAGE2_SPEND_BUDGET_USD` | refuse paid API calls once the ledger's total reaches this |
+
+## Paid APIs (judges, user simulators)
+
+Calls to paid endpoints go through `sage2_evals.meter`, a local proxy that records
+each call's cost (the gateway's `x-litellm-response-cost`, or a deliberately high
+token-price fallback) in the ledger and answers HTTP 402 once the budget is spent.
+Options named `*_base_url` are metered automatically; a benchmark sends any other
+paid endpoint through `meter.metered(url, role)`. `results.json` carries the run's
+spend as `details.api_spend`; `sage2-evals spend <ledger>` totals a ledger by
+benchmark, model, role and job.
 
 ## Datasets
 

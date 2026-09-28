@@ -2,6 +2,7 @@
 
     sage2-evals run swebench-verified --model /path/to/hf_model --output-dir out --limit 5
     sage2-evals list [--suite granite42]
+    sage2-evals spend [ledger.jsonl]
 
 ``run`` is what every granite.build ``sage2-*`` step calls. It serves the model
 with vLLM (unless ``--base-url`` points at an existing server), runs one
@@ -14,12 +15,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
-from sage2_evals import registry, suites
+from sage2_evals import meter, registry, suites
 from sage2_evals.registry import RunConfig
 from sage2_evals.results import write_results
 from sage2_evals.serving import ServerConfig, VLLMServer
@@ -95,8 +98,12 @@ def cmd_run(args) -> int:
         )
         base_url = server.base_url
 
-    with server:
+    tags = {"benchmark": benchmark.id, "job": os.environ.get("LSB_JOBID", ""), "run": str(args.output_dir)}
+    with server, meter.Meters(config.options, tags) as meters:
         outcome = benchmark.run(base_url, served)
+    if (spend := meters.summary()) is not None:
+        outcome["api_spend"] = spend
+        print(f"sage2-evals: paid API spend ${spend['usd']:.4f} over {spend['calls']} calls")
     path = write_results(benchmark, outcome, started=started, served_model_name=served)
     print(f"sage2-evals: {benchmark.id} = {benchmark_value(path)} ({benchmark.metric})")
     print(f"sage2-evals: results {path.resolve()}")
@@ -104,8 +111,6 @@ def cmd_run(args) -> int:
 
 
 def benchmark_value(path: Path) -> str:
-    import json
-
     return f"{json.loads(path.read_text())['value']:.4f}"
 
 
@@ -121,6 +126,11 @@ def cmd_list(args) -> int:
     return 0
 
 
+def cmd_spend(args) -> int:
+    print(json.dumps(meter.report(args.ledger), indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="sage2-evals")
@@ -128,8 +138,10 @@ def main(argv: list[str] | None = None) -> int:
     _add_run(sub)
     p = sub.add_parser("list", help="list implemented benchmarks, or a suite's bring-up status")
     p.add_argument("--suite", choices=suites.names())
+    p = sub.add_parser("spend", help="paid API spend recorded in a ledger")
+    p.add_argument("ledger", type=Path, nargs="?", default=Path(os.environ.get("SAGE2_SPEND_LEDGER", "spend.jsonl")))
     args = parser.parse_args(argv)
-    return {"run": cmd_run, "list": cmd_list}[args.command](args)
+    return {"run": cmd_run, "list": cmd_list, "spend": cmd_spend}[args.command](args)
 
 
 if __name__ == "__main__":
