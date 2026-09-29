@@ -23,13 +23,20 @@ finished instance is skipped on restart, so granite.build retries resume.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import errno
 import functools
 import hashlib
 import json
 import logging
+import os
 import re
+import socket
+import sys
+import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -114,6 +121,7 @@ class SWEBench(Benchmark):
                     "n": len(reports),
                     "resolve_rate": resolved / len(reports) if reports else 0.0,
                     "statuses": _count(r["status"] for r in reports),
+                    **self._repeat_details(reports),
                 }
             )
             log.info("%s repeat %d: %d/%d resolved", self.id, k, resolved, len(reports))
@@ -126,6 +134,10 @@ class SWEBench(Benchmark):
             "per_repeat": per_repeat,
             "instances": [i["instance_id"] for i in instances],
         }
+
+    def _repeat_details(self, reports: list[dict]) -> dict[str, Any]:
+        """Extra per-repeat counts for results.json."""
+        return {}
 
     # -- one instance ------------------------------------------------------
 
@@ -398,6 +410,22 @@ PRO_APPLY = (
 )
 # The repo is at /app (a few tasks use /testbed), as every V2 script assumes.
 PRO_WORKDIR = "if [ -d /app ]; then echo /app; else echo /testbed; fi"
+# Under Harbor the verifier's services (NodeBB's redis-server and test server,
+# qutebrowser's Xvfb) die with its container. enroot has no PID namespace, so
+# test.sh runs in one of its own when the probe says the sandbox can make one;
+# otherwise they outlive the sandbox (the marker kill still gets them) and the
+# report says ``verifier_pid_ns: false``.
+PRO_PIDNS = "unshare --pid --fork --mount-proc --kill-child"
+PRO_PIDNS_PROBE = f"{PRO_PIDNS} true"
+PRO_VERIFY_LOG = "> /logs/verifier/test-stdout.txt 2>&1"
+PRO_VERIFY_PIDNS_CMD = f"{PRO_PIDNS} /tests/test.sh {PRO_VERIFY_LOG}"
+PRO_VERIFY_PLAIN_CMD = f"/tests/test.sh {PRO_VERIFY_LOG}"
+# LISTEN sockets in the sandbox's network namespace (the host's, under enroot),
+# from /proc so no tool is needed: shows what a fixed-port service would hit.
+PRO_LISTENING = "awk 'NR > 1 && $4 == \"0A\" {print $2}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u"
+# The verifier's raw logs that test.sh copies to /logs/verifier, capped.
+PRO_VERIFIER_LOGS = ("run-script-stdout.txt", "run-script-stderr.txt")
+PRO_LOG_CAP = 4_000_000
 
 
 class ProTasks:
@@ -475,6 +503,147 @@ class ProTasks:
         return {name: self.file(prefix + name) for name in names}
 
 
+PRO_MARKER = "SAGE2_SANDBOX_ID"
+
+
+def _kill_marked(marker: str) -> int:
+    """SIGKILL every process whose environment carries ``PRO_MARKER=marker``.
+
+    enroot gives a sandbox no PID namespace, so what its commands leave running
+    (an agent's ``redis-server --daemonize``, a command killed by its timeout)
+    outlives the sandbox, holds its fixed ports and answers the next task's
+    tests. Every command of a Pro sandbox carries the marker, so this finds them
+    (as sandbox/harbor_env.py does for its fallback)."""
+    import signal
+
+    needle = f"{PRO_MARKER}={marker}".encode()
+    killed = 0
+    if not os.path.isdir("/proc"):  # not Linux: podman/docker sandboxes clean up themselves
+        return 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            if needle in (Path("/proc") / entry / "environ").read_bytes().split(b"\0"):
+                os.kill(int(entry), signal.SIGKILL)
+                killed += 1
+        except (OSError, ProcessLookupError):
+            continue
+    if killed:
+        log.info("killed %d process(es) left by sandbox %s", killed, marker)
+    return killed
+
+
+# -- fixed resources shared by every sandbox on a node ------------------------
+#
+# enroot sandboxes also share the host's network namespace, so two tasks whose
+# scripts start a service on a fixed port (NodeBB: redis-server on 6379 and the
+# forum on the port its run_script writes into config.json; qutebrowser: Xvfb
+# on display :99) clash when they run at once, in this job or in another job on
+# the node. Such tasks take a node-wide lock per resource around the whole agent
+# run and the whole grade. The keys come from the scripts that run (run_script.sh
+# and test.sh), not from test_patch, whose port literals are test data.
+
+PRO_RESOURCE_SCRIPTS = ("run_script.sh", "test.sh")
+_REDIS = re.compile(r"\bredis-server\b(?P<args>[^\n;&|]*)")
+_REDIS_PORT = re.compile(r"--port[= ](\d+)")
+_DISPLAY = re.compile(r"\b(?:Xvfb|Xvnc|Xephyr)\s+:(\d+)|\bDISPLAY=[\"']?:(\d+)")
+_PORTS = (
+    re.compile(r"\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})\b"),
+    re.compile(r"--port[= ](\d{2,5})\b"),
+    re.compile(r"\"port\"\s*:\s*\"?(\d{2,5})\b"),
+)
+
+
+def pro_fixed_resources(tests: dict[str, str]) -> list[str]:
+    """Node-wide lock keys (``port-6379``, ``x99``) for the fixed ports and X
+    displays the task's scripts use."""
+    keys: set[str] = set()
+    for name in PRO_RESOURCE_SCRIPTS:
+        text = tests.get(name, "")
+        for m in _REDIS.finditer(text):
+            port = _REDIS_PORT.search(m["args"])
+            keys.add(f"port-{port[1] if port else 6379}")
+        for m in _DISPLAY.finditer(text):
+            keys.add(f"x{m[1] or m[2]}")
+        for pattern in _PORTS:
+            keys.update(f"port-{p}" for p in pattern.findall(text))
+    keys.discard("port-0")  # redis-server --port 0: no TCP port
+    return sorted(keys)
+
+
+class NodeLock:
+    """A mutex shared by every process on the node that sees the same network
+    namespace, named by ``key``.
+
+    On Linux it is an abstract unix socket bound to ``@sage2-lock-<key>``: the
+    name lives in the network namespace, which enroot shares with the host, so
+    it reaches across LSF jobs whose containers each have a private /tmp, and
+    the kernel frees it when its holder dies (no stale lock files). Elsewhere
+    (macOS, where sandboxes have their own network) it is an flock on a file in
+    ``SAGE2_LOCK_DIR`` or the temp dir."""
+
+    def __init__(self, key: str, *, poll_s: float = 2.0, abstract: bool | None = None):
+        self.key, self.poll_s = key, poll_s
+        self.abstract = sys.platform == "linux" if abstract is None else abstract
+        self._held = None
+
+    def _try(self):
+        if self.abstract:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.bind(f"\0sage2-lock-{self.key}")
+            except OSError as e:
+                s.close()
+                if e.errno == errno.EADDRINUSE:
+                    return None
+                raise
+            return s
+        import fcntl
+
+        path = Path(os.environ.get("SAGE2_LOCK_DIR") or tempfile.gettempdir()) / f"sage2-{self.key}.lock"
+        f = open(path, "a")  # noqa: SIM115 - held until release
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            f.close()
+            return None
+        return f
+
+    def acquire(self) -> float:
+        """Blocks until held; returns the seconds waited."""
+        start = last_log = time.monotonic()
+        while (held := self._try()) is None:
+            if time.monotonic() - last_log >= 60:
+                log.info("waiting for node lock %s (%.0f s)", self.key, time.monotonic() - start)
+                last_log = time.monotonic()
+            time.sleep(self.poll_s)
+        self._held = held
+        return time.monotonic() - start
+
+    def release(self) -> None:
+        if self._held is not None:
+            self._held.close()
+            self._held = None
+
+
+@contextlib.contextmanager
+def node_locks(keys: list[str], *, what: str = "", poll_s: float = 2.0):
+    """Holds a NodeLock per key (taken in sorted order, so two holders of
+    overlapping sets cannot deadlock); yields the seconds waited."""
+    locks = [NodeLock(k, poll_s=poll_s) for k in sorted(set(keys))]
+    waited = 0.0
+    try:
+        for lock in locks:
+            waited += lock.acquire()
+        if locks:
+            log.info("%s: holding node locks %s (waited %.0f s)", what, [l.key for l in locks], waited)  # noqa: E741
+        yield waited
+    finally:
+        for lock in reversed(locks):
+            lock.release()
+
+
 def _last_line(output: str) -> str:
     lines = output.strip().splitlines()
     return lines[-1].strip() if lines else ""
@@ -522,7 +691,17 @@ class SWEBenchPro(SWEBench):
         out = super().run(base_url, served_model_name)
         out["subset"] = self.dataset_config()
         out["verifier"] = {"repo": PRO_REPO, "commit": PRO_COMMIT, "sha256sums": PRO_SHA256SUMS_SHA256}
+        if "per_repeat" in out:
+            total: dict[str, int] = {}
+            for rep in out["per_repeat"]:
+                for key, n in rep.get("verifier_pid_ns", {}).items():
+                    total[key] = total.get(key, 0) + n
+            out["verifier_pid_ns"] = total
         return out
+
+    def _repeat_details(self, reports: list[dict]) -> dict[str, Any]:
+        # Graded instances only: an empty patch or an error never ran the verifier.
+        return {"verifier_pid_ns": _count(str(r["verifier_pid_ns"]).lower() for r in reports if "verifier_pid_ns" in r)}
 
     def _gold_patch(self, instance: dict) -> str:
         # What Harbor's oracle agent applies.
@@ -576,11 +755,6 @@ class SWEBenchPro(SWEBench):
         )
 
     def _generate(self, instance: dict, idir: Path, base_url: str, served: str, k: int) -> str:
-        from minisweagent.agents.default import DefaultAgent
-        from minisweagent.models import get_model
-
-        from sage2_evals.sandbox.minisweagent_env import SandboxEnvironment
-
         iid = instance["instance_id"]
         instruction = self.tasks.task_file(iid, "instruction.md")
         config = self._agent_config(base_url, served, k)
@@ -588,6 +762,19 @@ class SWEBenchPro(SWEBench):
         # Harbor runs mini-swe-agent's LocalEnvironment inside the container:
         # its default 30 s command timeout, in the image's repo directory.
         env_config.setdefault("timeout", 30)
+        marker = f"{iid}-r{k}-gen-{uuid.uuid4().hex[:8]}"  # unique across jobs on one node
+        env_config["env"] = {**env_config.get("env", {}), PRO_MARKER: marker}
+        # The agent may start the task's services itself (it can read run_script.sh).
+        with node_locks(pro_fixed_resources(self.tasks.tests(iid)), what=f"{iid} generate"):
+            return self._generate_in(instance, idir, config, env_config, instruction, marker)
+
+    def _generate_in(self, instance: dict, idir: Path, config: dict, env_config: dict, instruction: str, marker: str) -> str:
+        from minisweagent.agents.default import DefaultAgent
+        from minisweagent.models import get_model
+
+        from sage2_evals.sandbox.minisweagent_env import SandboxEnvironment
+
+        iid = instance["instance_id"]
         env = SandboxEnvironment(image=self._image(instance), backend=self.opt("sandbox", ""), **env_config)
         try:
             env.config.cwd = _last_line(env.sandbox.execute(PRO_WORKDIR).output) or "/app"
@@ -610,6 +797,7 @@ class SWEBenchPro(SWEBench):
             return patch.output
         finally:
             env.cleanup()
+            _kill_marked(marker)
 
     def _grade(self, instance: dict, patch: str, idir: Path) -> dict:
         iid = instance["instance_id"]
@@ -619,8 +807,19 @@ class SWEBenchPro(SWEBench):
             # gate fails every task on an empty patch, so the run is skipped.
             return {**base, "status": "empty_patch"}
         tests = self.tasks.tests(iid)
+        marker = f"{iid}-grade-{uuid.uuid4().hex[:8]}"
+        keys = pro_fixed_resources(tests)
+        # Held until the marker kill is done, so the next holder finds the port free.
+        with node_locks(keys, what=f"{iid} grade") as waited:
+            try:
+                report = self._grade_in(instance, patch, idir, tests, marker)
+            finally:
+                _kill_marked(marker)
+        return {**report, "node_locks": keys, "lock_wait_s": round(waited, 1)} if keys else report
 
-        with make_sandbox(self._image(instance), backend=self.opt("sandbox", "")) as sb:
+    def _grade_in(self, instance: dict, patch: str, idir: Path, tests: dict[str, str], marker: str) -> dict:
+        base = {"instance_id": instance["instance_id"], "resolved": False}
+        with make_sandbox(self._image(instance), backend=self.opt("sandbox", ""), env={PRO_MARKER: marker}) as sb:
             workdir = _last_line(sb.execute(PRO_WORKDIR).output) or "/app"
             sb.write_file("/tmp/replay.patch", patch)
             applied = sb.execute(PRO_APPLY, cwd=workdir, timeout=300)
@@ -628,8 +827,16 @@ class SWEBenchPro(SWEBench):
             for name, content in tests.items():
                 sb.write_file(f"/tests/{name}", content)
             sb.execute("mkdir -p /logs/verifier && chmod +x /tests/test.sh")
+            (idir / "listening.txt").write_text(sb.execute(PRO_LISTENING).output)
+            probe = sb.execute(PRO_PIDNS_PROBE, timeout=60)
+            pid_ns = probe.returncode == 0
+            if not pid_ns:
+                log.warning(
+                    "%s: no PID namespace for the verifier (%s exit %d: %s); its services outlive it until the marker kill",
+                    instance["instance_id"], PRO_PIDNS_PROBE, probe.returncode, _last_line(probe.output),
+                )
             result = sb.execute(
-                "/tests/test.sh > /logs/verifier/test-stdout.txt 2>&1",
+                PRO_VERIFY_PIDNS_CMD if pid_ns else PRO_VERIFY_PLAIN_CMD,
                 cwd=workdir,
                 timeout=self.opt("eval_timeout", PRO_VERIFIER_TIMEOUT_S),
             )
@@ -637,9 +844,13 @@ class SWEBenchPro(SWEBench):
             output_json = sb.execute("cat /logs/verifier/output.json")
             if output_json.returncode == 0:
                 (idir / "output.json").write_text(output_json.output)
+            for name in PRO_VERIFIER_LOGS:
+                log_file = sb.execute(f"tail -c {PRO_LOG_CAP} /logs/verifier/{name}")
+                if log_file.returncode == 0:
+                    (idir / name).write_text(log_file.output)
             reward = sb.execute("cat /logs/verifier/reward.txt")
 
-        info = {"apply_rc": applied.returncode, "verifier_rc": result.returncode}
+        info = {"apply_rc": applied.returncode, "verifier_rc": result.returncode, "verifier_pid_ns": pid_ns}
         if result.timed_out:
             return {**base, **info, "status": "eval_timeout"}
         try:
