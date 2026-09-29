@@ -314,10 +314,40 @@ def test_profbench_failed_criteria_are_retried_on_resume(tmp_path, monkeypatch, 
             raise RuntimeError("gateway hiccup")
         return rubric_judge(request)
 
-    out = make_pb(tmp_path, monkeypatch, fake_judge(flaky), limit=1, samples="1", judge_parallel=1).run("http://p/v1", "s")
+    with pytest.raises(SystemExit, match="criteria_failed 1/2"):  # above the default 0.05
+        make_pb(tmp_path, monkeypatch, fake_judge(flaky), limit=1, samples="1", judge_parallel=1).run("http://p/v1", "s")
+    calls["n"] = 0
+    (tmp_path / "samples" / "Fin-0" / "0" / "judgments.json").unlink()
+    out = make_pb(tmp_path, monkeypatch, fake_judge(flaky), limit=1, samples="1", judge_parallel=1,
+                  max_failed_frac="0.5").run("http://p/v1", "s")
     assert out["statuses"] == {"judge_incomplete": 1} and out["criteria_judged"] == 1
+    assert (out["criteria_failed"], out["criteria_total"], out["incomplete"], out["n"]) == (1, 2, True, 1)
     out = make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge), limit=1, samples="1").run("http://p/v1", "s")
     assert out["statuses"] == {"ok": 1} and out["criteria_judged"] == 2
+    assert (out["criteria_failed"], out["criteria_total"], out["incomplete"]) == (0, 2, False)
+
+
+@needs_upstream
+def test_profbench_failed_generation_is_dropped_not_zero(tmp_path, monkeypatch, pb_env):
+    import openai
+
+    class OnePhysFails:
+        def __init__(self, **kw):
+            self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self.create))
+
+        def create(self, **request):
+            if "Phys-0" in request["messages"][0]["content"] and request["seed"] == 2:
+                raise ConnectionError("policy server gone")
+            return completion("My report says GOOD things.", Usage(50, 200))
+
+    monkeypatch.setattr(openai, "OpenAI", OnePhysFails)
+    with pytest.raises(SystemExit, match="criteria_failed 1/12"):
+        make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge)).run("http://p/v1", "s")
+    out = make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge), max_failed_frac="0.1").run("http://p/v1", "s")
+    # Phys-0's three generated reports all score 100; the failed one is left out, not a 0
+    assert out["scores"]["Physics PhD"] == 100.0 and out["n"] == 7
+    assert (out["criteria_failed"], out["criteria_total"], out["incomplete"]) == (1, 12, True)
+    assert out["statuses"]["generation_failed"] == 1
 
 
 @needs_upstream

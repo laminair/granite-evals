@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, failure_policy, register
 
 log = logging.getLogger(__name__)
 
@@ -441,6 +441,12 @@ class ProfBench(JudgedBenchmark):
                                 e.g. to re-judge the same reports with other settings
       judge_max_criteria=0      probes: judge at most this many criteria per sample
                                 (the rest are left unjudged and not scored)
+      max_failed_frac=0.05      see below
+
+    A failed generation drops its sample and a failed judge call drops its
+    criterion, as upstream does; both are retried on resume. ``details.criteria_failed``
+    / ``criteria_total`` count the criteria left unrated; above ``max_failed_frac``
+    (0 = any) the run fails, below it the result is flagged ``incomplete``.
 
     The verdict is the judge message's ``content`` only (upstream's
     ``startswith("Yes")``); reasoning / thinking fields of the response are never
@@ -608,20 +614,31 @@ class ProfBench(JudgedBenchmark):
 
     # -- scoring -------------------------------------------------------------
 
+    def _expected_criteria(self, task: dict, gen: dict) -> int:
+        """Criteria a sample should have ratings for: all of them, or the first
+        judge_max_criteria of a response the judge grades."""
+        n = len(task["rubrics"])
+        cap = self.opt("judge_max_criteria", 0)
+        graded_by_judge = self.judge_model != "human" and (gen["response"] is None or gen["response"].strip())
+        return min(n, cap) if cap and graded_by_judge else n
+
     def _aggregate(self, pb, samples, gens, judged, judge, source, revision) -> dict[str, Any]:
         rows, usage, statuses = [], [], []
+        failed = total = scored = 0
         for sample, gen, j in zip(samples, gens, judged):
-            task, k = sample["task"], sample["k"]
+            task = sample["task"]
             statuses.append(gen["status"] if j["status"] == "judged" else j["status"])
-            response = gen["response"]
-            if response is None:
-                # A sample that could not be generated scores 0 (upstream would drop it);
-                # a unique placeholder keeps it from collapsing with other responses.
-                response = f"<generation failed: {task['task_id']}#{k}>"
-                ratings = {str(i): {"judge_rating": "No"} for i in range(len(task["rubrics"]))}
-            else:
-                ratings = j["ratings"]
-            for i, dp in enumerate(self._criteria(task, response)):
+            expected = self._expected_criteria(task, gen)
+            total += expected
+            if gen["response"] is None:
+                # Generation failed: the sample is dropped, as upstream's parallel_launcher
+                # drops an item whose worker raised (utils.py:44-59); counted as failed.
+                failed += expected
+                continue
+            ratings = j["ratings"]
+            failed += sum(str(i) not in ratings for i in range(expected))
+            scored += any(str(i) in ratings for i in range(len(task["rubrics"])))
+            for i, dp in enumerate(self._criteria(task, gen["response"])):
                 r = ratings.get(str(i))
                 if r is None:  # judge failed on this criterion: dropped, as upstream does
                     continue
@@ -634,6 +651,10 @@ class ProfBench(JudgedBenchmark):
                     "judge_rating": r["judge_rating"],
                     "human_annotation": task["rubrics"][i].get(f"{self.responses}_fulfilment"),
                 })
+        policy = failure_policy(self.id, "criteria", failed, total, self.opt("max_failed_frac", 0.05))
+        if failed:
+            log.warning("profbench: %d/%d criteria not rated (generation or judge failed), left out; "
+                        "rerun to retry them", failed, total)  # fmt: skip
         if not rows:
             raise SystemExit("profbench: nothing was judged")
         # The upstream scorer averages token counts over tasks; guard all-None fields.
@@ -648,7 +669,8 @@ class ProfBench(JudgedBenchmark):
         scores = {k: (v.item() if hasattr(v, "item") else v) for k, v in scores.items()}
         out: dict[str, Any] = {
             "value": scores["Overall"] / 100,
-            "n": len(samples),
+            "n": scored,  # samples with at least one rated criterion
+            **policy,
             "dataset": source,
             "dataset_revision": revision,
             "harness": f"github.com/{PROFBENCH_REPO}@{PROFBENCH_COMMIT}",
@@ -677,13 +699,13 @@ class ProfBench(JudgedBenchmark):
                 out["judge_max_criteria"] = cap
             out["judge_unparsed_ratings"] = sum(
                 not str(r["judge_rating"]).startswith(("Yes", "No")) for r in rows)
-            out["judge_usage"] = total_usage(usage, len(samples))
+            out["judge_usage"] = total_usage(usage, scored)
         else:
             out["judge_model"] = "human"
             out["judge_is_self"] = False
         if self.responses != "model" and self.judge_model != "human":
             out["judge_agreement"] = self._agreement(pb, rows)
-        log.info("profbench: Overall %.1f over %d samples (%s)", scores["Overall"], len(samples),
+        log.info("profbench: Overall %.1f over %d samples (%s)", scores["Overall"], scored,
                  ", ".join(f"{k} {v}" for k, v in scores.items() if k.endswith(("PhD", "MBA"))))
         return out
 
