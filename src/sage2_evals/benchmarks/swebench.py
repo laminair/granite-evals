@@ -199,6 +199,8 @@ class SWEBench(Benchmark):
 
         config = self._agent_config(base_url, served, k)
         env_config = {key: v for key, v in config["environment"].items() if key != "environment_class"}
+        marker = f"{instance['instance_id']}-r{k}-gen-{uuid.uuid4().hex[:8]}"
+        env_config["env"] = {**env_config.get("env", {}), PRO_MARKER: marker}
         env = SandboxEnvironment(image=instance["image"], backend=self.opt("sandbox", ""), **env_config)
         try:
             agent = DefaultAgent(get_model(config=config["model"]), env, **config["agent"])
@@ -206,15 +208,19 @@ class SWEBench(Benchmark):
             try:
                 info = agent.run(instance["problem_statement"])
                 exit_status, submission = info.get("exit_status"), info.get("submission") or ""
+            except _agent_end_exceptions() as e:
+                # mini-swe-agent's swebench runner records these as the run's
+                # exit status with an empty submission (unresolved, not retried).
+                log.info("%s: agent ended by %s", instance["instance_id"], type(e).__name__)
+                exit_status = type(e).__name__
             finally:
                 agent.save(idir / "traj.json", {"info": {"exit_status": exit_status}, "instance_id": instance["instance_id"]})
             return submission
         finally:
             env.cleanup()
+            _kill_marked(marker)
 
     def _grade(self, instance: dict, patch: str, idir: Path) -> dict:
-        from swebench.harness.grading import get_eval_report
-        from swebench.harness.run_evaluation import GIT_APPLY_CMDS
         from swebench.harness.utils import make_test_spec
 
         iid = instance["instance_id"]
@@ -225,7 +231,21 @@ class SWEBench(Benchmark):
             raise NotImplementedError(f"{iid}: image_assets staging is not supported yet")
 
         spec = make_test_spec(instance)
-        with make_sandbox(instance["image"], backend=self.opt("sandbox", "")) as sb:
+        marker = f"{iid}-grade-{uuid.uuid4().hex[:8]}"
+        try:
+            return self._grade_in(instance, patch, idir, spec, marker)
+        finally:
+            # A timed-out eval_script's processes (mvn, gradle daemons) outlive
+            # the enroot sandbox otherwise, and keep the LSF job running.
+            _kill_marked(marker)
+
+    def _grade_in(self, instance: dict, patch: str, idir: Path, spec, marker: str) -> dict:
+        from swebench.harness.grading import get_eval_report
+        from swebench.harness.run_evaluation import GIT_APPLY_CMDS
+
+        iid = instance["instance_id"]
+        base = {"instance_id": iid, "resolved": False}
+        with make_sandbox(instance["image"], backend=self.opt("sandbox", ""), env={PRO_MARKER: marker}) as sb:
             sb.write_file(PATCH_FILE, patch)
             attempts = []
             for i, cmd in enumerate(GIT_APPLY_CMDS):
@@ -359,6 +379,15 @@ def probe_image(ref: str, *, client=None) -> dict[str, Any]:
     finally:
         if own:
             client.close()
+
+
+def _agent_end_exceptions() -> tuple[type[Exception], ...]:
+    """Model errors that end an agent run as the model's own outcome (the
+    trajectory outgrew the context window), not an infrastructure failure to
+    retry. Other errors (server down, sandbox failure) still propagate."""
+    from litellm.exceptions import ContextWindowExceededError
+
+    return (ContextWindowExceededError,)
 
 
 def _count(values) -> dict[str, int]:
@@ -787,6 +816,9 @@ class SWEBenchPro(SWEBench):
             try:
                 info = agent.run(instruction, **platform_vars)
                 exit_status = info.get("exit_status")
+            except _agent_end_exceptions() as e:
+                log.info("%s: agent ended by %s", iid, type(e).__name__)
+                exit_status = type(e).__name__  # its work so far is still captured and graded
             finally:
                 agent.save(idir / "traj.json", {"info": {"exit_status": exit_status}, "instance_id": iid})
                 capture = env.sandbox.execute(PRO_CAPTURE, cwd=env.config.cwd, timeout=300)

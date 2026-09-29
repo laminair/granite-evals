@@ -86,6 +86,69 @@ def test_patch_that_never_applies(bench, tmp_path, monkeypatch):
     assert "/bin/bash /eval.sh" not in fake.commands
 
 
+def test_grade_kills_what_its_sandbox_left_running(bench, tmp_path, monkeypatch):
+    # e.g. an eval_script's mvn after its timeout: no PID namespace under enroot.
+    envs, killed = [], []
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: envs.append(k.get("env")) or FakeSandbox())
+    monkeypatch.setattr(sb_mod, "_kill_marked", killed.append)
+    assert bench._grade(INSTANCE, "diff --git a/x b/x\n", tmp_path)["resolved"] is True
+    assert killed == [envs[0][sb_mod.PRO_MARKER]] and INSTANCE["instance_id"] in killed[0]
+
+
+class RaisingAgent:
+    def __init__(self, model, env, **kwargs):
+        pass
+
+    def run(self, task, **kwargs):
+        import litellm
+
+        raise litellm.exceptions.ContextWindowExceededError("context length exceeded", "m", "hosted_vllm")
+
+    def save(self, path, *extra):
+        import json
+
+        path.write_text(json.dumps(extra[0] if extra else {}))
+
+
+def _patch_agent(monkeypatch, agent_cls):
+    import minisweagent.agents.default as default_mod
+    import minisweagent.models as models_mod
+
+    monkeypatch.setattr(default_mod, "DefaultAgent", agent_cls)
+    monkeypatch.setattr(models_mod, "get_model", lambda config: object())
+
+
+def test_context_window_overflow_ends_the_run_with_an_empty_patch(bench, tmp_path, monkeypatch):
+    # As mini-swe-agent's swebench runner records it: unresolved, persisted, not an error to retry.
+    from sage2_evals.sandbox import minisweagent_env
+
+    sandbox_env, killed = {}, []
+    monkeypatch.setattr(minisweagent_env, "make_sandbox", lambda *a, **k: sandbox_env.update(k.get("env") or {}) or ProSandbox())
+    monkeypatch.setattr(sb_mod, "_kill_marked", killed.append)
+    _patch_agent(monkeypatch, RaisingAgent)
+    assert bench._generate(INSTANCE, tmp_path, "http://h/v1", "m", 0) == ""
+    import json
+
+    assert json.loads((tmp_path / "traj.json").read_text())["info"]["exit_status"] == "ContextWindowExceededError"
+    assert killed == [sandbox_env[sb_mod.PRO_MARKER]]
+    report = bench._instance(INSTANCE, tmp_path / "rep", "http://h/v1", "m", 0)
+    assert report["status"] == "empty_patch" and (tmp_path / "rep" / INSTANCE["instance_id"] / "report.json").exists()
+
+
+def test_other_agent_errors_still_propagate(bench, tmp_path, monkeypatch):
+    from sage2_evals.sandbox import minisweagent_env
+
+    class Down(RaisingAgent):
+        def run(self, task, **kwargs):
+            raise ConnectionError("server down")
+
+    monkeypatch.setattr(minisweagent_env, "make_sandbox", lambda *a, **k: ProSandbox())
+    _patch_agent(monkeypatch, Down)
+    report = bench._instance(INSTANCE, tmp_path, "http://h/v1", "m", 0)
+    assert report["status"] == "error:ConnectionError"
+    assert not (tmp_path / INSTANCE["instance_id"] / "report.json").exists()  # retried on resume
+
+
 def test_run_aggregates_repeats_and_resumes(tmp_path, monkeypatch):
     bench = sb_mod.SWEBenchVerified(RunConfig(model="m", output_dir=tmp_path, repeats=2, limit=1, workers=1))
     monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [INSTANCE, {**INSTANCE, "instance_id": "z"}])
