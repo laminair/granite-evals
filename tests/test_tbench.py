@@ -141,7 +141,7 @@ def test_infra_errors_retry_and_are_not_persisted(tmp_path, monkeypatch, caplog)
 
 def test_pinned_dataset_digest_is_checked(tmp_path, monkeypatch):
     root = make_dataset(tmp_path / "ds", ["a"])
-    monkeypatch.setattr(tb, "load_tasks", lambda s, r: (root, [{"name": "a", "path": "tasks/a"}]))
+    monkeypatch.setattr(tb, "load_tasks", lambda s, r, d: (root, [{"name": "a", "path": "tasks/a"}]))
     b = tb.TerminalBench21(RunConfig(model="m", output_dir=tmp_path / "out", options={"agent": "oracle"}))
     with pytest.raises(SystemExit, match="digests"):
         b.run("", "")
@@ -163,7 +163,7 @@ def test_pinned_check_hashes_registry_paths(tmp_path, monkeypatch):
     got = tb.task_digest_map(dirs)
     monkeypatch.setattr(tb, "TASK_DIGESTS", got)
     monkeypatch.setattr(tb, "TASKS_DIGEST", tb.task_digests(dirs))
-    monkeypatch.setattr(tb, "load_tasks", lambda s, r: (root, [{"name": n, "path": f"tasks/{n}"} for n in ("a", "b")]))
+    monkeypatch.setattr(tb, "load_tasks", lambda s, r, d: (root, [{"name": n, "path": f"tasks/{n}"} for n in ("a", "b")]))
     monkeypatch.setattr(tb.TerminalBench21, "_run_trial", lambda *a: None)
     b = tb.TerminalBench21(RunConfig(model="m", output_dir=tmp_path / "out", options={"agent": "oracle", "sandbox": "podman"}))
     b.repeats = 0
@@ -294,3 +294,24 @@ def test_no_paid_endpoints(tmp_path, monkeypatch):
     monkeypatch.setattr(tb.TerminalBench21, "_max_model_len", lambda self, url, served: 4096)
     kw = b._agent_config("http://127.0.0.1:8000/v1", "m")["kwargs"]
     assert kw["api_base"] == "http://127.0.0.1:8000/v1" and kw["llm_call_kwargs"]["api_key"] == "EMPTY"
+
+
+def test_symlinked_dataset_is_materialized(tmp_path):
+    """HF cache snapshots are symlinks into a blob store, which harbor refuses."""
+    real = make_dataset(tmp_path / "blobs", ["a"])
+    snap = tmp_path / "snap"
+    for f in real.rglob("*"):
+        if f.is_file():
+            link = snap / f.relative_to(real)
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(f)
+    root, rows = tb.load_tasks(str(snap), None, tmp_path / "out" / "dataset")
+    assert root == tmp_path / "out" / "dataset" and rows == [{"name": "a", "path": "tasks/a"}]
+    assert not tb._has_symlinks(root) and (root / "tasks" / "a" / "tests" / "test.sh").read_text() == "exit 0\n"
+    from harbor.models.task.task import Task
+
+    with pytest.raises(ValueError, match="stay within the task"):
+        Task(snap / "tasks" / "a")
+    Task(root / "tasks" / "a")  # harbor accepts the copy
+    # A plain local dataset is used in place.
+    assert tb.load_tasks(str(real), None, tmp_path / "unused")[0] == real

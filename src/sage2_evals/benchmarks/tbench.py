@@ -11,7 +11,7 @@ environment becomes :class:`sage2_evals.sandbox.harbor_env.SandboxEnvironment`
 (enroot on BlueVela), started from each task's prebuilt ``docker_image``.
 
 Tasks are read from the pinned HF mirror of the dataset (``registry.json`` +
-``tasks/``). At the pinned revision, the harbor content digests of all 89
+``tasks/``), downloaded as plain files into ``<output_dir>/dataset``. At the pinned revision, the harbor content digests of all 89
 tasks are checked against the digests of the published dataset manifest, so a
 score always names the exact task bytes.
 
@@ -194,16 +194,28 @@ def task_digests(task_dirs: dict[str, Path]) -> str:
     return hashlib.sha256(",".join(sorted(task_digest_map(task_dirs).values())).encode()).hexdigest()
 
 
-def load_tasks(source: str, revision: str | None) -> tuple[Path, list[dict]]:
+def _has_symlinks(root: Path) -> bool:
+    return any(p.is_symlink() for p in root.rglob("*"))
+
+
+def load_tasks(source: str, revision: str | None, local_dir: Path) -> tuple[Path, list[dict]]:
     """(dataset root, registry rows ``{name, path}``) of ``source``: an HF
-    dataset repo in harbor registry layout, or a local directory of one."""
+    dataset repo in harbor registry layout, or a local directory of one.
+
+    Harbor refuses task files that are symlinks out of the task (its input
+    path check), which is how the HF cache stores snapshots; so the tasks
+    are materialized as plain files in ``local_dir``."""
     if Path(source).exists():
         root = Path(source)
+        if _has_symlinks(root):
+            log.info("copying %s to %s (symlinks resolved)", root, local_dir)
+            shutil.copytree(root, local_dir, symlinks=False, dirs_exist_ok=True)
+            root = local_dir
     else:
         from huggingface_hub import snapshot_download
 
-        log.info("downloading %s@%s", source, revision or "main")
-        root = Path(snapshot_download(source, repo_type="dataset", revision=revision))
+        log.info("downloading %s@%s to %s", source, revision or "main", local_dir)
+        root = Path(snapshot_download(source, repo_type="dataset", revision=revision, local_dir=local_dir))
     registry = json.loads((root / "registry.json").read_text())
     rows = [dict(t) for entry in registry for t in entry["tasks"]]
     return root, rows
@@ -276,7 +288,7 @@ class TerminalBench21(Benchmark):
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         source, revision = self.dataset_source()
-        root, rows = load_tasks(source, revision)
+        root, rows = load_tasks(source, revision, self.config.output_dir / "dataset")
         names = [r["name"] for r in rows]
         digest = None
         if source == self.dataset and revision == self.dataset_revision:
