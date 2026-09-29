@@ -1,5 +1,8 @@
 """SWE-bench adapter tests with a fake sandbox (no containers, no model)."""
 
+import os
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("swebench")
@@ -248,8 +251,14 @@ class ProSandbox:
             return ExecResult("/app\n", 0)
         if command == sb_mod.PRO_APPLY:
             return ExecResult("Applied patch", self.apply_rc)
-        if command.startswith("/tests/test.sh"):
+        if command == sb_mod.PRO_VERIFY_CMD:
             return ExecResult("", 0 if self.reward == "1" else 1)
+        if command == sb_mod.PRO_LISTENING:
+            return ExecResult("0100007F:18EB\n", 0)
+        if command.startswith("tail -c ") and command.endswith("/logs/verifier/run-script-stdout.txt"):
+            return ExecResult('{"stats": {}}\n', 0)
+        if command.startswith("tail -c "):
+            return ExecResult("tail: cannot open", 1)
         if command == "cat /logs/verifier/reward.txt":
             return ExecResult(f"{self.reward}\n", 0) if self.reward is not None else ExecResult("No such file", 1)
         if command == "cat /logs/verifier/test-stdout.txt":
@@ -316,10 +325,22 @@ def test_pro_grade_runs_the_task_verifier_in_a_fresh_sandbox(pro, tmp_path, monk
     assert fake.files["/tmp/replay.patch"] == "diff --git a/x b/x\n"
     assert set(fake.files) >= {f"/tests/{n}" for n in ("test.sh", "run_script.sh", "parser.py", "config.json", "test_patch.patch")}
     commands = [c for c, _ in fake.commands]
-    assert commands.index(sb_mod.PRO_APPLY) < commands.index("/tests/test.sh > /logs/verifier/test-stdout.txt 2>&1")
-    assert ("/tests/test.sh > /logs/verifier/test-stdout.txt 2>&1", "/app") in fake.commands
+    assert commands.index(sb_mod.PRO_APPLY) < commands.index(sb_mod.PRO_VERIFY_CMD)
+    assert (sb_mod.PRO_VERIFY_CMD, "/app") in fake.commands
     assert (tmp_path / "test_output.txt").read_text() == "RESULT: PASSED\n"
     assert (tmp_path / "output.json").exists()
+    # The verifier's raw logs and the ports already listening are kept for debugging.
+    assert (tmp_path / "run-script-stdout.txt").read_text() == '{"stats": {}}\n'
+    assert not (tmp_path / "run-script-stderr.txt").exists()
+    assert (tmp_path / "listening.txt").read_text() == "0100007F:18EB\n"
+    assert commands.index(sb_mod.PRO_LISTENING) < commands.index(sb_mod.PRO_VERIFY_CMD)
+
+
+def test_pro_verifier_runs_in_its_own_pid_namespace_when_it_can():
+    # Services test.sh starts (redis-server, Xvfb) must die with it, as with Harbor's container.
+    assert "exec unshare --pid --fork --mount-proc --kill-child /tests/test.sh" in sb_mod.PRO_VERIFY
+    assert "exec /tests/test.sh; fi" in sb_mod.PRO_VERIFY  # fallback without unshare
+    assert sb_mod.PRO_VERIFY_CMD.endswith("> /logs/verifier/test-stdout.txt 2>&1")
 
 
 def test_pro_grade_unresolved_on_zero_reward_or_missing_reward(pro, tmp_path, monkeypatch):
@@ -337,7 +358,7 @@ def test_pro_grade_still_runs_the_verifier_when_the_patch_does_not_apply(pro, tm
     monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
     report = pro._grade(PRO_INSTANCE, "diff\n", tmp_path)
     assert report["apply_rc"] == 1 and report["status"] == "graded" and not report["resolved"]
-    assert any(c.startswith("/tests/test.sh") for c, _ in fake.commands)
+    assert any(c == sb_mod.PRO_VERIFY_CMD for c, _ in fake.commands)
 
 
 def test_pro_empty_patch_needs_no_sandbox(pro, tmp_path, monkeypatch):
@@ -361,7 +382,9 @@ def test_pro_generate_gives_the_instruction_and_captures_the_diff(pro, tmp_path,
     fake = ProSandbox(patch="diff --git a/f b/f\n+fix\n")
     from sage2_evals.sandbox import minisweagent_env
 
-    monkeypatch.setattr(minisweagent_env, "make_sandbox", lambda *a, **k: fake)
+    sandbox_env, killed = {}, []
+    monkeypatch.setattr(minisweagent_env, "make_sandbox", lambda *a, **k: sandbox_env.update(k.get("env") or {}) or fake)
+    monkeypatch.setattr(sb_mod, "_kill_marked", killed.append)
     seen = {}
 
     class FakeAgent:
@@ -386,6 +409,34 @@ def test_pro_generate_gives_the_instruction_and_captures_the_diff(pro, tmp_path,
     assert seen["cwd"] == "/app" and seen["vars"] == {"system": "Linux", "release": "5.14", "version": "#1 SMP", "machine": "x86_64"}
     assert (sb_mod.PRO_CAPTURE, "/app") in fake.commands
     assert (tmp_path / "traj.json").exists()
+    # Every agent command carries the marker; what they left running is killed afterwards.
+    assert killed == [sandbox_env[sb_mod.PRO_MARKER]] and PRO_IID in killed[0]
+
+
+def test_pro_grade_kills_what_its_sandbox_left_running(pro, tmp_path, monkeypatch):
+    envs, killed = [], []
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: envs.append(k.get("env")) or ProSandbox(reward="1"))
+    monkeypatch.setattr(sb_mod, "_kill_marked", killed.append)
+    pro._grade(PRO_INSTANCE, "diff\n", tmp_path)
+    assert killed == [envs[0][sb_mod.PRO_MARKER]]
+
+
+def test_kill_marked_kills_only_processes_with_the_marker(tmp_path, monkeypatch):
+    import signal
+
+    proc = tmp_path / "proc"
+    for pid, environ in {"101": b"A=1\0SAGE2_SANDBOX_ID=t-1\0", "102": b"SAGE2_SANDBOX_ID=t-10\0", "103": b"B=2\0"}.items():
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "environ").write_bytes(environ)
+    (proc / "self").mkdir()
+    real_listdir, real_isdir = os.listdir, os.path.isdir
+    monkeypatch.setattr(sb_mod.os, "listdir", lambda p: real_listdir(proc) if p == "/proc" else real_listdir(p))
+    monkeypatch.setattr(sb_mod.os.path, "isdir", lambda p: True if p == "/proc" else real_isdir(p))
+    monkeypatch.setattr(sb_mod, "Path", lambda p: proc if p == "/proc" else Path(p))
+    sent = []
+    monkeypatch.setattr(sb_mod.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    assert sb_mod._kill_marked("t-1") == 1
+    assert sent == [(101, signal.SIGKILL)]
 
 
 def test_pro_gold_run_uses_the_task_reference_patch(pro, tmp_path, monkeypatch):

@@ -27,9 +27,11 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -398,6 +400,22 @@ PRO_APPLY = (
 )
 # The repo is at /app (a few tasks use /testbed), as every V2 script assumes.
 PRO_WORKDIR = "if [ -d /app ]; then echo /app; else echo /testbed; fi"
+# Under Harbor the verifier's services (NodeBB's redis-server and test server,
+# qutebrowser's Xvfb) die with its container. enroot has no PID namespace, so
+# test.sh runs in one of its own when the image has unshare; otherwise they
+# would outlive the sandbox and answer the next task's verifier.
+PRO_VERIFY = (
+    "if unshare --pid --fork --mount-proc --kill-child true 2>/dev/null; "
+    "then exec unshare --pid --fork --mount-proc --kill-child /tests/test.sh; "
+    "else echo 'sage2: no PID namespace for the verifier' >&2; exec /tests/test.sh; fi"
+)
+PRO_VERIFY_CMD = f"( {PRO_VERIFY} ) > /logs/verifier/test-stdout.txt 2>&1"
+# LISTEN sockets in the sandbox's network namespace (the host's, under enroot),
+# from /proc so no tool is needed: shows what a fixed-port service would hit.
+PRO_LISTENING = "awk 'NR > 1 && $4 == \"0A\" {print $2}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u"
+# The verifier's raw logs that test.sh copies to /logs/verifier, capped.
+PRO_VERIFIER_LOGS = ("run-script-stdout.txt", "run-script-stderr.txt")
+PRO_LOG_CAP = 4_000_000
 
 
 class ProTasks:
@@ -473,6 +491,37 @@ class ProTasks:
         if "test.sh" not in names:
             raise KeyError(f"no verifier for {iid} in {PRO_REPO}@{self.commit}")
         return {name: self.file(prefix + name) for name in names}
+
+
+PRO_MARKER = "SAGE2_SANDBOX_ID"
+
+
+def _kill_marked(marker: str) -> int:
+    """SIGKILL every process whose environment carries ``PRO_MARKER=marker``.
+
+    enroot gives a sandbox no PID namespace, so what its commands leave running
+    (an agent's ``redis-server --daemonize``, a command killed by its timeout)
+    outlives the sandbox, holds its fixed ports and answers the next task's
+    tests. Every command of a Pro sandbox carries the marker, so this finds them
+    (as sandbox/harbor_env.py does for its fallback)."""
+    import signal
+
+    needle = f"{PRO_MARKER}={marker}".encode()
+    killed = 0
+    if not os.path.isdir("/proc"):  # not Linux: podman/docker sandboxes clean up themselves
+        return 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            if needle in (Path("/proc") / entry / "environ").read_bytes().split(b"\0"):
+                os.kill(int(entry), signal.SIGKILL)
+                killed += 1
+        except (OSError, ProcessLookupError):
+            continue
+    if killed:
+        log.info("killed %d process(es) left by sandbox %s", killed, marker)
+    return killed
 
 
 def _last_line(output: str) -> str:
@@ -588,6 +637,8 @@ class SWEBenchPro(SWEBench):
         # Harbor runs mini-swe-agent's LocalEnvironment inside the container:
         # its default 30 s command timeout, in the image's repo directory.
         env_config.setdefault("timeout", 30)
+        marker = f"{iid}-r{k}-gen-{uuid.uuid4().hex[:8]}"  # unique across jobs on one node
+        env_config["env"] = {**env_config.get("env", {}), PRO_MARKER: marker}
         env = SandboxEnvironment(image=self._image(instance), backend=self.opt("sandbox", ""), **env_config)
         try:
             env.config.cwd = _last_line(env.sandbox.execute(PRO_WORKDIR).output) or "/app"
@@ -610,6 +661,7 @@ class SWEBenchPro(SWEBench):
             return patch.output
         finally:
             env.cleanup()
+            _kill_marked(marker)
 
     def _grade(self, instance: dict, patch: str, idir: Path) -> dict:
         iid = instance["instance_id"]
@@ -619,8 +671,15 @@ class SWEBenchPro(SWEBench):
             # gate fails every task on an empty patch, so the run is skipped.
             return {**base, "status": "empty_patch"}
         tests = self.tasks.tests(iid)
+        marker = f"{iid}-grade-{uuid.uuid4().hex[:8]}"
+        try:
+            return self._grade_in(instance, patch, idir, tests, marker)
+        finally:
+            _kill_marked(marker)
 
-        with make_sandbox(self._image(instance), backend=self.opt("sandbox", "")) as sb:
+    def _grade_in(self, instance: dict, patch: str, idir: Path, tests: dict[str, str], marker: str) -> dict:
+        base = {"instance_id": instance["instance_id"], "resolved": False}
+        with make_sandbox(self._image(instance), backend=self.opt("sandbox", ""), env={PRO_MARKER: marker}) as sb:
             workdir = _last_line(sb.execute(PRO_WORKDIR).output) or "/app"
             sb.write_file("/tmp/replay.patch", patch)
             applied = sb.execute(PRO_APPLY, cwd=workdir, timeout=300)
@@ -628,8 +687,9 @@ class SWEBenchPro(SWEBench):
             for name, content in tests.items():
                 sb.write_file(f"/tests/{name}", content)
             sb.execute("mkdir -p /logs/verifier && chmod +x /tests/test.sh")
+            (idir / "listening.txt").write_text(sb.execute(PRO_LISTENING).output)
             result = sb.execute(
-                "/tests/test.sh > /logs/verifier/test-stdout.txt 2>&1",
+                PRO_VERIFY_CMD,
                 cwd=workdir,
                 timeout=self.opt("eval_timeout", PRO_VERIFIER_TIMEOUT_S),
             )
@@ -637,6 +697,10 @@ class SWEBenchPro(SWEBench):
             output_json = sb.execute("cat /logs/verifier/output.json")
             if output_json.returncode == 0:
                 (idir / "output.json").write_text(output_json.output)
+            for name in PRO_VERIFIER_LOGS:
+                log_file = sb.execute(f"tail -c {PRO_LOG_CAP} /logs/verifier/{name}")
+                if log_file.returncode == 0:
+                    (idir / name).write_text(log_file.output)
             reward = sb.execute("cat /logs/verifier/reward.txt")
 
         info = {"apply_rc": applied.returncode, "verifier_rc": result.returncode}
