@@ -45,6 +45,7 @@ from harbor.environments.capabilities import EnvironmentCapabilities
 from harbor.models.trial.paths import EnvironmentPaths
 
 from sage2_evals.sandbox import make_sandbox
+from sage2_evals.sandbox.enroot import _kill_rooted, enroot_rootfs
 
 log = logging.getLogger(__name__)
 
@@ -107,44 +108,6 @@ def _kill_marked(marker: str) -> int:
         except (OSError, ProcessLookupError):
             continue
     return killed
-
-
-def _kill_rooted(rootfs: str) -> int:
-    """SIGKILL every process of ours whose root directory is ``rootfs``: the
-    daemons a task starts that drop the environment marker (nginx workers
-    clear their environment), which would otherwise outlive the task and keep
-    the batch job alive."""
-    # Compare by inode: enroot pivots into the rootfs in its own mount
-    # namespace, so readlink() of /proc/<pid>/root from outside it gives "/"
-    # (checked on BlueVela), while stat() follows it to the directory itself.
-    try:
-        st = os.stat(rootfs)
-    except OSError:
-        return 0
-    want = (st.st_dev, st.st_ino)
-    host = os.stat("/")
-    if want == (host.st_dev, host.st_ino):  # never every process on the node
-        return 0
-    killed = 0
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit() or int(entry) == os.getpid():
-            continue
-        try:
-            root = os.stat(f"/proc/{entry}/root")
-            if (root.st_dev, root.st_ino) == want:
-                os.kill(int(entry), signal.SIGKILL)
-                killed += 1
-        except (OSError, ProcessLookupError):
-            continue
-    return killed
-
-
-def enroot_rootfs(name: str) -> str:
-    """Where ``enroot create --name name`` puts the container's root filesystem."""
-    data = os.environ.get("ENROOT_DATA_PATH") or os.path.join(
-        os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "enroot"
-    )
-    return os.path.join(data, name)
 
 
 def dockerfile_workdir(environment_dir: Path) -> str | None:

@@ -38,6 +38,18 @@ def test_enroot_sandbox_keeps_tmp_between_commands(tmp_path, monkeypatch):
     assert not sb.tmp.exists()
 
 
+def test_enroot_sandbox_kills_its_leftovers_before_remove(tmp_path, monkeypatch):
+    # No PID namespace: a daemon that rewrites its environment (redis-server) would
+    # outlive the sandbox and answer the next task on its port.
+    monkeypatch.setenv("ENROOT_DATA_PATH", str(tmp_path / "data"))
+    calls = []
+    monkeypatch.setattr(enroot, "_kill_rooted", lambda rootfs: calls.append(("kill", rootfs)) or 1)
+    monkeypatch.setattr(enroot.subprocess, "run", lambda argv, **k: calls.append(("run", argv[1])))
+    sb = enroot.EnrootSandbox("img:latest")
+    sb.close()
+    assert calls == [("kill", str(tmp_path / "data" / sb.name)), ("run", "remove")]
+
+
 def test_enroot_sandbox_gets_no_secrets(monkeypatch):
     # enroot start passes its environment into the sandbox, where model-written code runs.
     for name in ("SAGE2_JUDGE_API_KEY", "SAGE2_USER_API_KEY", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY"):
