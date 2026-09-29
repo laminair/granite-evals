@@ -238,12 +238,14 @@ class Judge:
                         for m in request["messages"]
                     ]
                     continue
-                # Drop the first optional parameter the error names, else the next one in order.
+                # Drop the first optional parameter the error names. Any other 400 (context
+                # length, a bad extra_body field, ...) is raised: dropping a parameter the
+                # endpoint did not object to would change the judge without fixing anything.
                 optional = [k for k in ("top_p", "temperature", "reasoning_effort") if k in request]
                 named = [k for k in optional if k.replace("_", "") in message.replace("_", "")]
-                if not optional:
+                if not named:
                     raise
-                key = (named or optional)[0]
+                key = named[0]
                 request.pop(key)
                 with self._lock:
                     if key not in self.dropped:

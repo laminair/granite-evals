@@ -107,6 +107,25 @@ def test_rejected_parameters_are_dropped_once_and_recorded():
     assert j.dropped == ["top_p"] and "top_p" in j.adaptations[0]
 
 
+def test_a_400_that_names_no_parameter_is_raised_with_the_request_intact():
+    class TooLong(FakeJudgeClient):
+        def create(self, **request):
+            self.requests.append(request)
+            err = Exception("Error code: 400 - prompt is too long: 250000 tokens > 200000 maximum")
+            err.status_code = 400
+            raise err
+
+    j = jg.Judge(base_url="http://judge/v1", model="judge-m", api_key="k", is_self=False,
+                 client=TooLong(lambda r: "Yes"), extra_body={"thinking": {"type": "adaptive"}})
+    with pytest.raises(Exception, match="prompt is too long"):
+        j.chat.completions.create(model="m", messages=[{"role": "user", "content": "q"}],
+                                  temperature=0.6, top_p=0.95, reasoning_effort="high")
+    (sent,) = j._client.requests  # no retry with a parameter dropped
+    assert (sent["temperature"], sent["top_p"], sent["reasoning_effort"]) == (0.6, 0.95, "high")
+    assert sent["extra_body"] == {"thinking": {"type": "adaptive"}}
+    assert j.dropped == [] and j.adaptations == []
+
+
 def test_usage_totals_and_cost():
     recs = [jg.usage_record(Usage(1000, 10, cached=900)), jg.usage_record(Usage(1000, 10, cache_write=1000))]
     t = jg.total_usage(recs, n_examples=2)
