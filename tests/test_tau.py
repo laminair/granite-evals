@@ -144,8 +144,10 @@ def test_default_gateway_goes_through_the_meter(tmp_path, monkeypatch):
         u = b.llm_endpoint("user", "http://vllm/v1", "granite", temperature=0.0)
         j = b.llm_endpoint("judge", "http://vllm/v1", "granite", temperature=0.0)
         proxy = meter.metered(tau.DEFAULT_GATEWAY, role="user")
-        assert u.kwargs["api_base"] == proxy == j.kwargs["api_base"]
-        assert proxy.startswith("http://127.0.0.1:") and len(meters._meters) == 1
+        # Same gateway, one meter per role, so the ledger tells simulator from judge.
+        assert u.kwargs["api_base"] == proxy != j.kwargs["api_base"]
+        assert proxy.startswith("http://127.0.0.1:") and j.kwargs["api_base"].startswith("http://127.0.0.1:")
+        assert sorted(r for _, r in meters._meters) == ["judge", "user"]
     assert u.model == "openai/aws/claude-sonnet-5" and u.record()["base_url"] == tau.DEFAULT_GATEWAY
 
 
@@ -155,7 +157,7 @@ def test_given_base_url_is_metered_once(tmp_path, monkeypatch):
     with meter.Meters(b.config.options, {}) as meters:
         u = b.llm_endpoint("user", "http://vllm/v1", "granite", temperature=0.0)
         assert u.kwargs["api_base"].startswith("http://127.0.0.1:")
-        assert list(meters._meters) == ["https://gw.example/v1"]
+        assert list(meters._meters) == [("https://gw.example/v1", "user")]
 
 
 # -- end to end with the harness -----------------------------------------------

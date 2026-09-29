@@ -246,13 +246,15 @@ class Meters:
         self.budget_usd = float(budget) if budget else None
         self.options = options
         self.tags = tags
-        self._meters: dict[str, Meter] = {}
+        self._meters: dict[tuple[str, str], Meter] = {}
 
     def url(self, upstream: str, role: str) -> str:
-        key = upstream.rstrip("/")
+        # One meter per endpoint and role: a judge and a user simulator on the same
+        # gateway are accounted apart.
+        key = (upstream.rstrip("/"), role)
         if key not in self._meters:
             self._meters[key] = Meter(
-                key, role=role, ledger=self.ledger, budget_usd=self.budget_usd, tags=self.tags
+                key[0], role=role, ledger=self.ledger, budget_usd=self.budget_usd, tags=self.tags
             ).start()
         return self._meters[key].url
 

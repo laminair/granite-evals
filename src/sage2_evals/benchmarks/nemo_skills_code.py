@@ -36,6 +36,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Iterator
@@ -157,6 +158,15 @@ SANDBOX_ENV = "/opt/ns-sandbox"
 NEXT_STEP_MARKER = "NEXT STEP - PROBLEM STEP AND FUNCTION HEADER:"
 
 
+def sandbox_env(python: Path) -> dict[str, str]:
+    """The environment for the sandbox env's interpreter: none of the job venv's
+    Python settings, so only the sandbox env's own packages import."""
+    env = dict(os.environ, PATH=f"{python.parent}:{os.environ.get('PATH', '')}", PYTHONNOUSERSITE="1")
+    for k in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        env.pop(k, None)
+    return env
+
+
 @register
 class SciCode(NemoSkillsBenchmark):
     id = "scicode"
@@ -177,19 +187,32 @@ class SciCode(NemoSkillsBenchmark):
             raise SystemExit(f"{self.id}: no sandbox env at {python.parent.parent} (built by docker/extras/nemoskills.sh)")
         return python
 
+    def sandbox_app(self) -> Path:
+        """ns's sandbox server module, copied out of the job's venv.
+
+        `flask --app <file>` puts the top of the file's package on sys.path; for the
+        installed module that is the job's Python 3.12 site-packages, which would
+        shadow the sandbox env's own IPython, numpy, scipy... in the server and in
+        the code it runs. The server imports nothing from nemo_skills, so a lone copy
+        in a directory with no __init__.py runs on the sandbox env alone."""
+        import importlib.util
+
+        origin = importlib.util.find_spec("nemo_skills.code_execution.local_sandbox.local_sandbox_server").origin
+        app_dir = self.config.output_dir / "ns-sandbox-app"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        app = app_dir / "ns_local_sandbox_server.py"
+        shutil.copyfile(origin, app)
+        return app
+
     @contextlib.contextmanager
     def ns_sandbox(self) -> Iterator[list[str]]:
         """ns's local sandbox server, run by the image's pinned sandbox env
         (the job's own venv has none of SciCode's scientific stack)."""
-        import importlib.util
-
         python = self.sandbox_python()
-        server =importlib.util.find_spec("nemo_skills.code_execution.local_sandbox.local_sandbox_server").origin
+        server = self.sandbox_app()
         port = _free_port()
-        env = dict(os.environ, PATH=f"{python.parent}:{os.environ.get('PATH', '')}")
-        env.pop("PYTHONPATH", None)
-        env.pop("VIRTUAL_ENV", None)
-        cmd = [str(python), "-m", "flask", "--app", server, "run", "--host", "127.0.0.1", "--port", str(port)]
+        env = sandbox_env(python)
+        cmd = [str(python), "-m", "flask", "--app", str(server), "run", "--host", "127.0.0.1", "--port", str(port)]
         log.info("%s: starting ns sandbox: %s", self.id, shlex.join(cmd))
         logf = (self.config.output_dir / "ns-sandbox.log").open("ab")
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, env=env)
@@ -238,7 +261,7 @@ class SciCode(NemoSkillsBenchmark):
             "        vers[p] = None\n"
             "print(json.dumps({'python': sys.version.split()[0], 'packages': vers, 'h5_sha256': sha, 'import_failures': failed}))\n"
         )
-        r = subprocess.run([str(python), "-c", script], capture_output=True, text=True, timeout=1800)
+        r = subprocess.run([str(python), "-c", script], capture_output=True, text=True, timeout=1800, env=sandbox_env(python))
         try:
             report = json.loads(r.stdout.strip().splitlines()[-1])
         except (IndexError, ValueError):

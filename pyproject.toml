@@ -31,8 +31,10 @@ nemoskills = [
     # livecodebench-v6: the evaluator ns's LiveCodeBench eval pip-installs, pinned.
     "livecodebench @ git+https://github.com/wasiahmad/livecodebench@de8b59485a841a43ee2d66fc058f017e42f638db",
     # ruler-*: RULER's data generators (ns's prepare pip-installs them unpinned).
+    # tenacity: RULER's scripts/data/tokenizer.py imports it at the top.
     "wonderwords",
     "nltk",
+    "tenacity",
 ]
 # IFBench through NeMo-Skills (the `nemoskills` extra) plus the requirements of
 # allenai/IFBench's run_eval.py, which ns's ifbench evaluator runs from

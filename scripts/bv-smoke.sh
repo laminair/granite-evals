@@ -31,7 +31,8 @@ if [ -r "$JUDGE_ENV" ]; then set -a; . "$JUDGE_ENV"; set +a; echo "judge env: lo
 SPEND_LEDGER="${SPEND_LEDGER:-$ROOT/spend/ledger.jsonl}"
 SPEND_BUDGET_USD="${SPEND_BUDGET_USD:-50}"
 mkdir -p "$(dirname "$SPEND_LEDGER")"
-ENV_ARGS=(--env SAGE2_SPEND_LEDGER="$SPEND_LEDGER" --env SAGE2_SPEND_BUDGET_USD="$SPEND_BUDGET_USD")
+ENV_ARGS=(--env SAGE2_SPEND_LEDGER="$SPEND_LEDGER" --env SAGE2_SPEND_BUDGET_USD="$SPEND_BUDGET_USD"
+    --env LSB_JOBID="${LSB_JOBID:-}")  # the ledger's job column
 for v in SAGE2_JUDGE_API_KEY SAGE2_USER_API_KEY; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
 RUN="${RUN:-$ROOT/runs/smoke-${LSB_JOBID:-$$}}"
 

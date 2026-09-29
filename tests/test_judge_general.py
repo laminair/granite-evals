@@ -135,7 +135,7 @@ def test_default_judge_url_is_proxied_by_an_active_meter(tmp_path, monkeypatch):
     with meter.Meters(bench.config.options, {"benchmark": "gdpval"}) as meters:
         j = bench.make_judge("http://policy/v1", "served")
         assert j.base_url.startswith("http://127.0.0.1:")
-        assert meters._meters[jg.DEFAULT_JUDGE_BASE_URL.rstrip("/")].role == "judge"
+        assert (jg.DEFAULT_JUDGE_BASE_URL.rstrip("/"), "judge") in meters._meters
 
 
 def test_judge_base_url_option_is_not_metered_twice(tmp_path, monkeypatch):
