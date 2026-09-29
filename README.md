@@ -103,6 +103,10 @@ make publish-image EXTRA=swebench   # -> icr.io/tir-hew-sage2-evals/sage2-evals-
 
 Tags are the git short SHA. Pin that tag in the granite.build recipe.
 
+[docs/bluevela.md](docs/bluevela.md) covers image families, direct BlueVela runs
+(`scripts/bv-smoke.sh`, secrets, gold checks). Favored configs per benchmark are in
+granite.build's `recipes/sage2/lsf/eval-granite42/README.md`.
+
 ## Adding a benchmark
 
 1. Add `benchmarks/<family>.py` with a `@register`ed `Benchmark` subclass (every
