@@ -45,6 +45,47 @@ log = logging.getLogger(__name__)
 PATCH_FILE = "/tmp/patch.diff"
 EVAL_TIMEOUT_S = 1800
 
+MAVEN_MIRROR_ENV = "SAGE2_MAVEN_MIRROR"
+"""URL of a Maven Central mirror for the instance sandboxes (unset: none).
+The Java images (druid, gson, javaparser) resolve a few artifacts at test
+time, e.g. surefire's junit provider, which their images do not ship; where
+repo.maven.apache.org refuses the node's egress IP (HTTP 429 on every
+request), those tests fail on the environment, not the patch."""
+MAVEN_SETTINGS_STAGED = "/tmp/sage2-maven-settings.xml"
+# cp -n: a settings.xml the image ships wins.
+MAVEN_SETTINGS_INSTALL = (
+    f'mkdir -p "$HOME/.m2" && cp -n {MAVEN_SETTINGS_STAGED} "$HOME/.m2/settings.xml"; rm -f {MAVEN_SETTINGS_STAGED}'
+)
+
+
+def maven_settings(mirror: str) -> str:
+    """A user settings.xml that sends Maven Central (repository id ``central``)
+    to ``mirror``; other repositories a project declares are left alone."""
+    from xml.sax.saxutils import escape
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0">\n'
+        "  <mirrors>\n"
+        "    <mirror>\n"
+        "      <id>sage2-central-mirror</id>\n"
+        "      <mirrorOf>central</mirrorOf>\n"
+        f"      <url>{escape(mirror)}</url>\n"
+        "    </mirror>\n"
+        "  </mirrors>\n"
+        "</settings>\n"
+    )
+
+
+def maven_mirror() -> str:
+    return os.environ.get(MAVEN_MIRROR_ENV, "").strip()
+
+
+def _install_maven_mirror(sb) -> None:
+    if mirror := maven_mirror():
+        sb.write_file(MAVEN_SETTINGS_STAGED, maven_settings(mirror))
+        sb.execute(MAVEN_SETTINGS_INSTALL, timeout=60)
+
 
 class SWEBench(Benchmark):
     metric = "pass@1[avg-of-3] resolve rate"
@@ -129,6 +170,7 @@ class SWEBench(Benchmark):
             "dataset_revision": revision,
             "per_repeat": per_repeat,
             "instances": [i["instance_id"] for i in instances],
+            "maven_mirror": maven_mirror() or None,
         }
 
     def _repeat_details(self, reports: list[dict]) -> dict[str, Any]:
@@ -199,6 +241,7 @@ class SWEBench(Benchmark):
         env_config["env"] = {**env_config.get("env", {}), PRO_MARKER: marker}
         env = SandboxEnvironment(image=instance["image"], backend=self.opt("sandbox", ""), **env_config)
         try:
+            _install_maven_mirror(env.sandbox)
             agent = DefaultAgent(get_model(config=config["model"]), env, **config["agent"])
             exit_status, submission = "unknown", ""
             try:
@@ -255,6 +298,7 @@ class SWEBench(Benchmark):
             if r.returncode != 0:
                 return {**base, "status": "patch_failed"}
 
+            _install_maven_mirror(sb)
             sb.write_file("/eval.sh", spec.eval_script)
             result = sb.execute("/bin/bash /eval.sh", cwd="/testbed", timeout=self.opt("eval_timeout", EVAL_TIMEOUT_S))
             log_path = idir / "test_output.txt"
@@ -642,6 +686,7 @@ class SWEBenchPro(SWEBench):
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         out = super().run(base_url, served_model_name)
+        out.pop("maven_mirror", None)  # Pro's own sandboxes do not install it
         out["subset"] = self.dataset_config()
         out["verifier"] = {"repo": PRO_REPO, "commit": PRO_COMMIT, "sha256sums": PRO_SHA256SUMS_SHA256}
         if "per_repeat" in out:
