@@ -176,15 +176,68 @@ def test_model_mode_with_fakes(tmp_path, dev, monkeypatch):
     monkeypatch.setattr(birdbench.BirdBench, "schemas", lambda self, dev: {"toy": "CREATE TABLE t (...)"})
 
     cfg = RunConfig(model="m", output_dir=tmp_path / "out", dataset=str(dev), workers=1, repeats=2, seed=7,
-                    options={"temperature": "0.6", "max_tokens": "100"})
+                    options={"temperature": "0.5", "max_tokens": "100"})
     out = birdbench.BirdBench(cfg).run("http://srv/v1", "served")
     assert out["value"] == pytest.approx(1 / 3) and out["n"] == 3
     assert out["per_repeat"][0]["statuses"] == {"correct": 1, "pred_error": 1, "wrong": 1}
-    assert out["sampling"] == {"temperature": 0.6, "max_tokens": 100}
+    assert out["sampling"] == {"max_tokens": 100, "temperature": 0.5, "top_p": 0.95, "top_k": 20}
     assert {kw["seed"] for kw in sent} == {7, 8} and all(kw["model"] == "served" for kw in sent)
-    assert all("top_p" not in kw for kw in sent)  # unset: the checkpoint's generation_config
+    # ns's GENERATION_ARGS unless overridden; top_k as vLLM's extra_body
+    assert all((kw["max_tokens"], kw["temperature"], kw["top_p"], kw["extra_body"]) == (100, 0.5, 0.95, {"top_k": 20})
+               for kw in sent)  # fmt: skip
+    assert (out["questions_failed"], out["questions_total"], out["incomplete"]) == (0, 6, False)
     rec = json.loads((tmp_path / "out" / "repeat-1" / "1.json").read_text())
     assert rec["pred_sql"] == "SELECT COUNT(*) FROM t" and rec["reasoning"] == "r"
+
+
+def test_sampling_is_nemo_skills_generation_args():
+    ns = pytest.importorskip("nemo_skills.dataset.birdbench")
+    args = dict(a[2:].split("=", 1) for a in ns.GENERATION_ARGS.split())
+    assert birdbench.NS_SAMPLING == {
+        "max_tokens": int(args["inference.tokens_to_generate"]),
+        "temperature": float(args["inference.temperature"]),
+        "top_p": float(args["inference.top_p"]),
+        "top_k": int(args["inference.top_k"]),
+    }
+    assert args["prompt_config"] == birdbench.PROMPT_CONFIG
+    b = birdbench.BirdBench(RunConfig(model="m", output_dir=None, options={"top_k": "-1"}))
+    assert "extra_body" not in b.request_args()  # top_k <= 0: not sent, as ns
+
+
+def _failing_client(fail):
+    class Completions:
+        def create(self, **kw):
+            question = kw["messages"][-1]["content"]
+            if question in fail:
+                raise ConnectionError("server gone")
+            sql = "SELECT COUNT(*) FROM t" if question == "How many rows?" else "SELECT 0"
+            msg = SimpleNamespace(content=f"```sql\n{sql}\n```", reasoning=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")], usage=None)
+
+    return lambda url: SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+
+def test_failed_requests_are_left_out_counted_and_retried(tmp_path, dev, monkeypatch):
+    prompt = SimpleNamespace(fill=lambda v: [{"role": "user", "content": v["question"]}])
+    monkeypatch.setattr(birdbench, "_prompt", lambda: prompt)
+    monkeypatch.setattr(birdbench, "_extractor", lambda dev: lambda t: t.split("```sql")[-1].split("```")[0].strip())
+    monkeypatch.setattr(birdbench.BirdBench, "schemas", lambda self, dev: {"toy": ""})
+    cfg = RunConfig(model="m", output_dir=tmp_path / "out", dataset=str(dev), workers=1,
+                    options={"max_failed_frac": "0.5"})
+    monkeypatch.setattr(birdbench, "_client", _failing_client({"Names?"}))
+    out = birdbench.BirdBench(cfg).run("http://srv/v1", "served")
+    # 1 of 2 scored questions right, not 1 of 3: the failed one is no wrong answer
+    assert (out["value"], out["n"], out["questions_failed"], out["questions_total"]) == (0.5, 2, 1, 3)
+    assert out["incomplete"] and not (tmp_path / "out" / "repeat-0" / "0.json").exists()
+    monkeypatch.setattr(birdbench, "_client", _failing_client(set()))
+    out = birdbench.BirdBench(cfg).run("http://srv/v1", "served")  # retried on resume
+    assert (out["n"], out["questions_failed"], out["incomplete"]) == (3, 0, False)
+    # default threshold 0.05: one failed question of three fails the run
+    for p in (tmp_path / "out" / "repeat-0").iterdir():
+        p.unlink()
+    monkeypatch.setattr(birdbench, "_client", _failing_client({"Names?"}))
+    with pytest.raises(SystemExit, match="questions_failed 1/3"):
+        birdbench.BirdBench(RunConfig(model="m", output_dir=tmp_path / "out", dataset=str(dev))).run("u", "s")
 
 
 def test_nemo_skills_prompt_and_extraction(tmp_path):

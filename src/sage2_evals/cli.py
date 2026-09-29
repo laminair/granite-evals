@@ -106,6 +106,8 @@ def cmd_run(args) -> int:
         print(f"sage2-evals: paid API spend ${spend['usd']:.4f} over {spend['calls']} calls")
     path = write_results(benchmark, outcome, started=started, served_model_name=served)
     print(f"sage2-evals: {benchmark.id} = {benchmark_value(path)} ({benchmark.metric})")
+    if outcome.get("incomplete"):
+        print("sage2-evals: INCOMPLETE: some items failed and were left out; rerun to retry them")
     print(f"sage2-evals: results {path.resolve()}")
     return 0
 

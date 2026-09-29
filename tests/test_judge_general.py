@@ -107,6 +107,25 @@ def test_rejected_parameters_are_dropped_once_and_recorded():
     assert j.dropped == ["top_p"] and "top_p" in j.adaptations[0]
 
 
+def test_a_400_that_names_no_parameter_is_raised_with_the_request_intact():
+    class TooLong(FakeJudgeClient):
+        def create(self, **request):
+            self.requests.append(request)
+            err = Exception("Error code: 400 - prompt is too long: 250000 tokens > 200000 maximum")
+            err.status_code = 400
+            raise err
+
+    j = jg.Judge(base_url="http://judge/v1", model="judge-m", api_key="k", is_self=False,
+                 client=TooLong(lambda r: "Yes"), extra_body={"thinking": {"type": "adaptive"}})
+    with pytest.raises(Exception, match="prompt is too long"):
+        j.chat.completions.create(model="m", messages=[{"role": "user", "content": "q"}],
+                                  temperature=0.6, top_p=0.95, reasoning_effort="high")
+    (sent,) = j._client.requests  # no retry with a parameter dropped
+    assert (sent["temperature"], sent["top_p"], sent["reasoning_effort"]) == (0.6, 0.95, "high")
+    assert sent["extra_body"] == {"thinking": {"type": "adaptive"}}
+    assert j.dropped == [] and j.adaptations == []
+
+
 def test_usage_totals_and_cost():
     recs = [jg.usage_record(Usage(1000, 10, cached=900)), jg.usage_record(Usage(1000, 10, cache_write=1000))]
     t = jg.total_usage(recs, n_examples=2)
@@ -295,10 +314,40 @@ def test_profbench_failed_criteria_are_retried_on_resume(tmp_path, monkeypatch, 
             raise RuntimeError("gateway hiccup")
         return rubric_judge(request)
 
-    out = make_pb(tmp_path, monkeypatch, fake_judge(flaky), limit=1, samples="1", judge_parallel=1).run("http://p/v1", "s")
+    with pytest.raises(SystemExit, match="criteria_failed 1/2"):  # above the default 0.05
+        make_pb(tmp_path, monkeypatch, fake_judge(flaky), limit=1, samples="1", judge_parallel=1).run("http://p/v1", "s")
+    calls["n"] = 0
+    (tmp_path / "samples" / "Fin-0" / "0" / "judgments.json").unlink()
+    out = make_pb(tmp_path, monkeypatch, fake_judge(flaky), limit=1, samples="1", judge_parallel=1,
+                  max_failed_frac="0.5").run("http://p/v1", "s")
     assert out["statuses"] == {"judge_incomplete": 1} and out["criteria_judged"] == 1
+    assert (out["criteria_failed"], out["criteria_total"], out["incomplete"], out["n"]) == (1, 2, True, 1)
     out = make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge), limit=1, samples="1").run("http://p/v1", "s")
     assert out["statuses"] == {"ok": 1} and out["criteria_judged"] == 2
+    assert (out["criteria_failed"], out["criteria_total"], out["incomplete"]) == (0, 2, False)
+
+
+@needs_upstream
+def test_profbench_failed_generation_is_dropped_not_zero(tmp_path, monkeypatch, pb_env):
+    import openai
+
+    class OnePhysFails:
+        def __init__(self, **kw):
+            self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self.create))
+
+        def create(self, **request):
+            if "Phys-0" in request["messages"][0]["content"] and request["seed"] == 2:
+                raise ConnectionError("policy server gone")
+            return completion("My report says GOOD things.", Usage(50, 200))
+
+    monkeypatch.setattr(openai, "OpenAI", OnePhysFails)
+    with pytest.raises(SystemExit, match="criteria_failed 1/12"):
+        make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge)).run("http://p/v1", "s")
+    out = make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge), max_failed_frac="0.1").run("http://p/v1", "s")
+    # Phys-0's three generated reports all score 100; the failed one is left out, not a 0
+    assert out["scores"]["Physics PhD"] == 100.0 and out["n"] == 7
+    assert (out["criteria_failed"], out["criteria_total"], out["incomplete"]) == (1, 12, True)
+    assert out["statuses"]["generation_failed"] == 1
 
 
 @needs_upstream
@@ -596,6 +645,51 @@ def test_gdpval_broken_task_does_not_sink_the_run(tmp_path, monkeypatch, gdp_env
         raise RuntimeError("sandbox died")
 
     monkeypatch.setattr(jg.GDPval, "_agent", boom)
-    out = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "VERDICT: A")).run("http://p/v1", "s")
-    assert out["statuses"]["error:RuntimeError"] == 1 and out["n"] == 0
+    # the other tasks are excluded, so t1 failing is 1/1 failed: the run fails, not a 0
+    with pytest.raises(SystemExit, match="tasks_failed 1/1"):
+        make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "VERDICT: A")).run("http://p/v1", "s")
+    with pytest.raises(SystemExit, match="no task was graded"):
+        make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "VERDICT: A"),
+                 max_failed_frac="1").run("http://p/v1", "s")
     assert not (tmp_path / "run/tasks/t1/report.json").exists()  # retried on resume
+
+
+def test_gdpval_failed_task_is_left_out_not_a_loss(tmp_path, monkeypatch, gdp_env):
+    async def agent(self, task, refs, out_dir, base_url, served):
+        if task["task_id"] == "t1b":
+            raise RuntimeError("sandbox died")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "memo.docx").write_bytes(_docx_bytes("MODEL memo"))
+        return {"finished": True, "note": "Done.", "paths": ["memo.docx"], "turns": 3,
+                "token_usage": {"input": 1, "output": 1, "reasoning": 0}, "failed_outputs": []}
+
+    tasks = GDP_TASKS + [{**GDP_TASKS[0], "task_id": "t1b"}]
+    monkeypatch.setattr(data, "load_split", lambda *a, **k: [dict(t) for t in tasks])
+    monkeypatch.setattr(jg.GDPval, "_agent", agent)
+    out = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(model_prefers("MODEL memo")),
+                   max_failed_frac="0.5").run("http://p/v1", "s")
+    assert out["win_rate"] == 1.0 and out["n"] == 1 and out["statuses"]["error:RuntimeError"] == 1
+    assert (out["tasks_failed"], out["tasks_total"], out["incomplete"]) == (1, 2, True)
+
+
+def test_gdpval_judge_invalid_is_a_failure_and_rejudged_on_resume(tmp_path, monkeypatch, gdp_env):
+    agents = []
+
+    async def fake_agent(self, task, refs, out_dir, base_url, served):
+        agents.append(task["task_id"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "memo.docx").write_bytes(_docx_bytes("MODEL memo"))
+        return {"finished": True, "note": "Done.", "paths": ["memo.docx"], "turns": 3,
+                "token_usage": {"input": 1, "output": 1, "reasoning": 0}, "failed_outputs": []}
+
+    monkeypatch.setattr(jg.GDPval, "_agent", fake_agent)
+    with pytest.raises(SystemExit, match="tasks_failed 1/1"):
+        make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "no verdict here")).run("http://p/v1", "s")
+    report = json.loads((tmp_path / "run/tasks/t1/report.json").read_text())
+    assert report["status"] == "judge_invalid" and "score" not in report
+    judge = fake_judge(model_prefers("MODEL memo"))
+    out = make_gdp(tmp_path, monkeypatch, gdp_env, judge).run("http://p/v1", "s")
+    # re-judged with the saved deliverables; the agent is not run again
+    assert agents == ["t1"] and len(judge._client.requests) == 2
+    assert out["statuses"]["judged"] == 1 and out["win_rate"] == 1.0
+    assert (out["tasks_failed"], out["tasks_total"], out["incomplete"]) == (0, 1, False)

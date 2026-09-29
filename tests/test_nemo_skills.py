@@ -255,3 +255,81 @@ def test_proxy_flags_budget_exhausted(tmp_path):
     with _Broke() as up, nsb._MeteringProxy(up.base_url, "", tmp_path / "u.jsonl") as proxy:
         assert httpx.post(proxy.base_url + "/chat/completions", json={}).status_code == 402
         assert proxy.budget_exhausted
+
+
+def _fake_arena_judge(verdicts, calls):
+    """Stands in for ns's arena judge: judges the rows its resume file lacks,
+    verdicts[i] for row i, as ns with ++skip_filled does (generate.py:559-590)."""
+
+    def run(cmd, out, *, log_path, what):
+        args = dict(a[2:].split("=", 1) for a in cmd if a.startswith("++"))
+        rows = nsb._read_jsonl(nsb.Path(args["input_file"]))
+        resume = out.with_name(out.name + "-async")
+        done = {r.pop("_async_position"): r for r in nsb._read_jsonl(resume)}
+        for i, row in enumerate(rows):
+            if i not in done:
+                calls.append(i)
+                a, b = verdicts[i]
+                done[i] = {**row, "judgement-gen-base": a, "judgement-base-gen": b, "judgement": ""}
+        nsb._write_jsonl(out, [done[i] for i in range(len(rows))])
+        resume.unlink(missing_ok=True)
+
+    return run
+
+
+def _judge(tmp_path, monkeypatch, verdicts, calls, **options):
+    gen = tmp_path / "generation" / "output-rs0.jsonl"
+    nsb._write_jsonl(gen, [{"generation": f"g{i}", "category": "hard_prompt"} for i in range(len(verdicts))])
+    monkeypatch.setattr(nsb, "_run_ns", _fake_arena_judge(verdicts, calls))
+    b = bench("arena-hard-v2", tmp_path, options={"judge_model": "self", **options})
+    return b, b._judge_all(tmp_path / "generation", tmp_path / "judged", "http://127.0.0.1:9/v1", "g")
+
+
+def test_arena_all_valid_judgements(ns, tmp_path, monkeypatch):
+    _, d = _judge(tmp_path, monkeypatch, [("[[A>B]]", "[[B>A]]")] * 10, calls := [])
+    assert (d["judge_invalid"], d["judge_total"], d["incomplete"]) == (0, 20, False)
+    assert len(calls) == 10
+
+
+def test_arena_invalid_judgements_above_threshold_fail(ns, tmp_path, monkeypatch):
+    verdicts = [("[[A>B]]", "[[B>A]]")] * 9 + [("", "no verdict")]  # 2/20 invalid
+    with pytest.raises(SystemExit, match="judge_invalid 2/20"):
+        _judge(tmp_path, monkeypatch, verdicts, [])
+    (tmp_path / "judged" / "output-rs0.jsonl").unlink()
+    ok = [("[[A>B]]", "[[B>A]]")] * 99 + [("[[A>B]]", "")]  # 1/200 invalid
+    assert _judge(tmp_path, monkeypatch, ok, [])[1]["judge_invalid"] == 1
+    with pytest.raises(SystemExit):  # 0: any invalid judgement fails
+        _judge(tmp_path, monkeypatch, ok, [], max_judge_invalid_frac="0")
+
+
+def test_arena_invalid_judgements_below_threshold_counted_and_rejudged(ns, tmp_path, monkeypatch):
+    verdicts = [("[[A>B]]", "[[B>A]]")] * 19 + [("[[A>B]] or [[B>A]]", "[[A=B]]")]  # conflicting: invalid
+    b, d = _judge(tmp_path, monkeypatch, verdicts, calls := [])
+    assert (d["judge_invalid"], d["judge_total"], d["incomplete"]) == (1, 40, True)
+    judged = tmp_path / "judged" / "output-rs0.jsonl"
+    assert b.compute_metrics([judged])["_all_"]["pass@1"]["invalid_scores"] == 1  # ns agrees
+    # resume re-judges only the invalid row, keeping the others and their order
+    verdicts[19] = ("[[A>B]]", "[[B>A]]")
+    calls.clear()
+    _, d = _judge(tmp_path, monkeypatch, verdicts, calls)
+    assert calls == [19] and (d["judge_invalid"], d["incomplete"]) == (0, False)
+    assert [r["generation"] for r in nsb._read_jsonl(judged)] == [f"g{i}" for i in range(20)]
+
+
+def test_arena_budget_exhausted_stops_and_keeps_the_file(ns, tmp_path, monkeypatch):
+    rows = [{"generation": "g", "category": "hard_prompt"}] * 2
+    for k in range(2):
+        nsb._write_jsonl(tmp_path / "generation" / f"output-rs{k}.jsonl", rows)
+    judge = _fake_arena_judge([("", "")] * 2, calls := [])
+
+    def refused(cmd, out, **kw):  # every call answered 402 by the meter, soft-failed by ns
+        base = next(a.split("=", 1)[1] for a in cmd if a.startswith("++server.base_url="))
+        assert httpx.post(base + "/chat/completions", json={}).status_code == 402
+        judge(cmd, out, **kw)
+
+    monkeypatch.setattr(nsb, "_run_ns", refused)
+    b = bench("arena-hard-v2", tmp_path, repeats=2, options={"judge_model": "self"})
+    with _Broke() as up, pytest.raises(SystemExit, match="402"):
+        b._judge_all(tmp_path / "generation", tmp_path / "judged", up.base_url, "g")
+    assert (tmp_path / "judged" / "output-rs0.jsonl").exists() and len(calls) == 2  # stopped before rs1
+    assert not (tmp_path / "judged" / "output-rs1.jsonl").exists()
