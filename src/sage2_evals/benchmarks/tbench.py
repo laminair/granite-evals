@@ -141,15 +141,20 @@ TASK_DIGESTS = {
 }
 
 # Tasks that can't run on the sandbox, with the reason; excluded from n and
-# recorded in results.json. Established by an oracle run on BlueVela.
-EXCLUDED: dict[str, str] = {}
+# recorded in results.json. Established by oracle runs on BlueVela.
+_SSHD = (
+    "runs sshd and its tests git-clone over ssh to localhost:22; the enroot sandbox shares the "
+    "host network, so that reaches the host's sshd (oracle fails on BlueVela, job 1956502)"
+)
+EXCLUDED: dict[str, str] = {
+    "configure-git-webserver": _SSHD,
+    "git-multibranch": _SSHD,
+}
 
 # Tasks whose services listen on fixed ports. The enroot sandbox shares the
 # host network, so these run one at a time (per sage2-evals process).
 HOST_PORT_TASKS = frozenset(
     {
-        "configure-git-webserver",
-        "git-multibranch",
         "headless-terminal",
         "hf-model-inference",
         "install-windows-3.11",
