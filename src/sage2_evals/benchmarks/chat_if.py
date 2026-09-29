@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -392,6 +393,8 @@ last change to data/IFBench_test.jsonl (2026-08-30). ns's prepare.py reads the
 file from ``refs/heads/main``; this is that read, pinned."""
 IFBENCH_TEST_URL = "https://raw.githubusercontent.com/allenai/IFBench/refs/heads/main/data/IFBench_test.jsonl"
 IFBENCH_TEST_SHA256 = "d2ada7da94a38cfe406351614c4e686846ed2da6d1b339db95fa5ead19554a4a"
+IFBENCH_DIR = Path("/opt/benchmarks/IFBench")  # where ns's evaluator runs run_eval (docker/extras/ifbench.sh)
+IFBENCH_NLTK_DATA = "/usr/local/share/nltk_data"  # the pinned NLTK data (docker/extras/ifbench.sh)
 
 
 @register
@@ -428,4 +431,10 @@ class IFBench(NemoSkillsBenchmark):
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         if self.gold:
             raise SystemExit(f"{self.id}: IFBench has no reference responses, so there is no answers=gold mode")
+        # IFBench's verifiers call nltk.download() when they are built, and nltk
+        # searches ~/nltk_data before the image's pinned copy: a download there (or
+        # data already in the job's home) would replace it. NLTK_DATA goes first on
+        # nltk's search path, in the run_eval subprocess too.
+        paths = [p for p in os.environ.get("NLTK_DATA", "").split(os.pathsep) if p]
+        os.environ["NLTK_DATA"] = os.pathsep.join([IFBENCH_NLTK_DATA, *(p for p in paths if p != IFBENCH_NLTK_DATA)])
         return super().run(base_url, served_model_name)
