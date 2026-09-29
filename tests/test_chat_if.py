@@ -282,6 +282,7 @@ def test_ifbench_registered_and_pinned(tmp_path):
     assert b.pins() == {}  # a GitHub file, pinned by URL + sha256, not an HF repo
     pinned, sha = cls.pinned_urls[chat_if.IFBENCH_TEST_URL]
     assert chat_if.IFBENCH_DATA_COMMIT in pinned and len(sha) == 64
+    assert len(cls.prepared_sha256) == 64  # the prepared test.jsonl is checked too
 
 
 def test_ifbench_has_no_gold_mode(tmp_path):

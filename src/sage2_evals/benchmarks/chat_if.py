@@ -416,6 +416,8 @@ class IFBench(NemoSkillsBenchmark):
     ns_metric = "prompt_loose_accuracy"
     dataset = f"https://github.com/allenai/IFBench/blob/{IFBENCH_DATA_COMMIT}/data/IFBench_test.jsonl"
     dataset_revision = IFBENCH_DATA_COMMIT
+    # ns prepare's test.jsonl from the pinned data (BV job 1956210, image ifbench:952082c).
+    prepared_sha256 = "4dcc770a51d3d56d26c3b84410a734582587ce95a7cb7a5a0e58575f483308e3"
     pinned_urls = {
         IFBENCH_TEST_URL: (
             f"https://raw.githubusercontent.com/allenai/IFBench/{IFBENCH_DATA_COMMIT}/data/IFBench_test.jsonl",
