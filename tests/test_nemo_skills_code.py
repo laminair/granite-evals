@@ -12,6 +12,7 @@ import pytest
 from sage2_evals import registry
 from sage2_evals.benchmarks import nemo_skills as nsb
 from sage2_evals.benchmarks import nemo_skills_code as nsc
+from sage2_evals.benchmarks import scicode_prefill as scp
 from sage2_evals.registry import RunConfig
 
 IDS = {
@@ -184,7 +185,8 @@ def test_module_args(ns, tmp_path):
     assert args[-1] == f"++eval_config.test_file={tmp_path / 'lcb-tests.jsonl'}"
     assert lcb.split() == "test_v6_2408_2505" and lcb.metrics_type() == "livecodebench"
     sc = bench("scicode", tmp_path)
-    assert sc.generation_module() == "nemo_skills.inference.eval.scicode"
+    assert sc.generation_module() == "sage2_evals.benchmarks.scicode_prefill"  # wraps ns's module
+    assert bench("scicode", tmp_path, options={"prefill_fixes": "false"}).generation_module() == scp.NS_SCICODE_MODULE
     assert sc.uses_sandbox() and sc.metrics_type() == "scicode"
     assert "++prompt_config=eval/scicode/background" in sc.generation_args([])
     for b in (lcb, sc):
@@ -282,3 +284,99 @@ def test_image_sandbox_runs_its_own_scientific_stack(ns, tmp_path):
         )
     assert r.status_code == 200, r.text
     assert r.json()["stdout"].strip() == "(3, 10) 1.26.4 1.10.1", r.json()
+
+
+# -- SciCode prefilled steps (scicode_prefill) ---------------------------------
+
+
+def test_prefill_originals_are_pinned():
+    for key, text in scp.ORIGINAL.items():
+        assert hashlib.sha256(text.encode()).hexdigest() == scp.ORIGINAL_SHA256[key]
+    assert scp.ORIGINAL.keys() == {("13", 5), ("62", 0)}
+    assert "class Maxwell:" in scp.ORIGINAL["13", 5]
+    assert "class Block:" in scp.ORIGINAL["62", 0] and "class EnlargedBlock:" in scp.ORIGINAL["62", 0]
+
+
+def test_misplaced_methods():
+    assert scp.misplaced_methods("def __init__(self, n):\n    self.n = n\n") == ["__init__"]
+    assert scp.misplaced_methods("def make(cls):\n    return cls()\n") == ["make"]
+    assert scp.misplaced_methods("class A:\n    def __init__(self):\n        pass\n") == []
+    assert scp.misplaced_methods("def f(x):\n    return x\n") == []
+    assert scp.misplaced_methods("def (:") == []
+
+
+def test_prefill_plan_on_synthetic():
+    fixed, rec = scp.plan({("13", 5): "def __init__(self, n):\n    self.n = n\n", ("76", 2): "def f(x):\n    return x\n"})
+    assert fixed == {("13", 5): scp.ORIGINAL["13", 5]}
+    assert rec[0]["step"] == "13.6" and rec[0]["restored_classes"] == ["Maxwell"]
+    assert rec[0]["source"].endswith(f"{scp.SCICODE_DATA_COMMIT}/eval/data/13.6.txt")
+    with pytest.raises(RuntimeError, match="9.2.*no original"):
+        scp.plan({("9", 1): "def run(self):\n    pass\n"})
+
+
+def _norm(node):
+    """The node's AST with trailing whitespace stripped from docstring lines (ns's
+    13.6 text drops the original's indentation on one blank docstring line)."""
+    import ast
+
+    for n in ast.walk(node):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str):
+            n.value = "\n".join(line.rstrip() for line in n.value.split("\n"))
+    return ast.dump(node)
+
+
+def test_prefill_plan_on_ns(ns):
+    """Every ns prefilled step is scanned: exactly 13.6 and 62.1 are methods cut
+    out of their class, and the restored text holds the same methods."""
+    import ast
+
+    from nemo_skills.inference.eval.scicode_utils import prefilled_steps_code
+
+    fixed, rec = scp.plan(prefilled_steps_code)
+    assert [r["step"] for r in rec] == ["13.6", "62.1"]
+    assert [r["restored_classes"] for r in rec] == [["Maxwell"], ["Block", "EnlargedBlock"]]
+    for key, new in fixed.items():
+        ns_funcs = [_norm(n) for n in ast.parse(prefilled_steps_code[key]).body if isinstance(n, ast.FunctionDef)]
+        methods = [_norm(m) for c in ast.parse(new).body if isinstance(c, ast.ClassDef) for m in c.body]
+        assert ns_funcs and all(f in methods for f in ns_funcs)  # ns's code is a method of the original
+    unfixed = {k for k in prefilled_steps_code if k not in fixed}
+    assert unfixed and not any(scp.misplaced_methods(prefilled_steps_code[k]) for k in unfixed)
+
+
+def test_prefill_apply_reaches_ns_generation_module(ns):
+    """ns's generation module holds the very dict apply() updates, so the wrapper's
+    fix reaches it (it imports the dict by name)."""
+    import importlib
+
+    from nemo_skills.inference.eval import scicode_utils
+
+    gen = importlib.import_module(scp.NS_SCICODE_MODULE)
+    assert gen.prefilled_steps_code is scicode_utils.prefilled_steps_code
+    saved = dict(scicode_utils.prefilled_steps_code)
+    try:
+        assert [r["step"] for r in scp.apply()] == ["13.6", "62.1"]
+        assert gen.prefilled_steps_code["13", 5] == scp.ORIGINAL["13", 5]
+        assert gen.prefilled_steps_code["62", 0] == scp.ORIGINAL["62", 0]
+        assert scp.plan(gen.prefilled_steps_code) == ({}, [])  # nothing left to fix
+    finally:
+        scicode_utils.prefilled_steps_code.clear()
+        scicode_utils.prefilled_steps_code.update(saved)
+
+
+def test_prefill_wrapper_runs_ns_main(ns):
+    """``python -m`` the wrapper: fixes reported, then ns's Hydra entry point runs."""
+    import subprocess
+
+    p = subprocess.run([sys.executable, "-m", "sage2_evals.benchmarks.scicode_prefill", "--help"], capture_output=True, text=True, check=False)
+    assert p.returncode == 0, p.stderr
+    assert "restored ['Maxwell']" in p.stderr and "restored ['Block', 'EnlargedBlock']" in p.stderr
+    assert "prompt_config" in p.stdout
+
+
+def test_prefill_record(ns, tmp_path):
+    r = bench("scicode", tmp_path).prefill_record()
+    assert r["prefill_fixes_enabled"] and [f["step"] for f in r["prefill_fixes"]] == ["13.6", "62.1"]
+    assert bench("scicode", tmp_path, options={"prefill_fixes": "false"}).prefill_record() == {
+        "prefill_fixes": [],
+        "prefill_fixes_enabled": False,
+    }
