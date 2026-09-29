@@ -85,7 +85,8 @@ def test_prompt_caching_splits_the_shared_response_prefix():
     blocks = req["messages"][0]["content"]
     assert blocks[0] == {"type": "text", "text": "Response:\n\nREPORT", "cache_control": {"type": "ephemeral"}}
     assert "".join(b["text"] for b in blocks) == prompt
-    assert j.last_usage() == {"prompt_tokens": 1000, "completion_tokens": 10, "cached_tokens": 900, "cache_write_tokens": 0}
+    assert j.last_usage() == {"prompt_tokens": 1000, "completion_tokens": 10, "cached_tokens": 900, "cache_write_tokens": 0,
+                            "reasoning_tokens": 0}
 
 
 def test_self_judge_sends_plain_prompts():
@@ -153,6 +154,25 @@ def test_real_judge_needs_its_key(tmp_path, monkeypatch):
     self_judge = jg.ProfBench(RunConfig(model="m", output_dir=tmp_path, options={"judge_model": "self"}))
     j = self_judge.make_judge("http://p/v1", "served")
     assert j.is_self and j.model == "served" and j.base_url == "http://p/v1"
+
+
+def test_judge_thinking_options_go_into_every_request_body(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "k")
+    monkeypatch.setattr(meter, "metered", lambda url, role: "http://127.0.0.1:1/v1")
+    opts = {"judge_thinking": "adaptive", "judge_effort": "max", "judge_extra_body": '{"x": 1}'}
+    bench = jg.ProfBench(RunConfig(model="m", output_dir=tmp_path, options=opts))
+    assert bench.judge_extra_body() == {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}, "x": 1}
+    budget = jg.ProfBench(RunConfig(model="m", output_dir=tmp_path, options={"judge_thinking": "enabled:4096"}))
+    assert budget.judge_extra_body() == {"thinking": {"type": "enabled", "budget_tokens": 4096}}
+    with pytest.raises(SystemExit, match="judge_thinking"):
+        jg.ProfBench(RunConfig(model="m", output_dir=tmp_path, options={"judge_thinking": "max"})).judge_extra_body()
+    assert bench.make_judge("http://p/v1", "s").extra_body["output_config"] == {"effort": "max"}
+    j = fake_judge(lambda r: "Yes", extra_body={"thinking": {"type": "adaptive"}}, reject={"temperature"})
+    j.chat.completions.create(model="m", messages=[{"role": "user", "content": "q"}], temperature=0.6)
+    assert all(r["extra_body"] == {"thinking": {"type": "adaptive"}} for r in j._client.requests)
+    assert j.dropped == ["temperature"] and j.describe()["judge_extra_body"] == {"thinking": {"type": "adaptive"}}
+    assert jg.usage_record({"completion_tokens": 900, "completion_tokens_details": {"reasoning_tokens": 850}})[
+        "reasoning_tokens"] == 850
 
 
 def test_registered_ids_metrics_and_pins():
@@ -312,6 +332,46 @@ def test_profbench_empty_response_scores_zero_without_judging(tmp_path, monkeypa
     judge = fake_judge(lambda r: pytest.fail("nothing to judge"))
     out = make_pb(tmp_path, monkeypatch, judge, version="debug", limit=1).run("http://p/v1", "s")
     assert out["value"] == 0.0 and out["statuses"] == {"empty_response": 1}
+
+
+@needs_upstream
+def test_profbench_max_effort_judge_verdict_is_the_content_only(tmp_path, monkeypatch, pb_env):
+    """judge_reasoning_effort=max on every criterion, thinking fields in the body,
+    temperature dropped when rejected; the thinking text never becomes the verdict."""
+
+    class Thinking(FakeJudgeClient):
+        def create(self, **request):
+            self.requests.append(request)
+            if "temperature" in request:
+                err = Exception("Error code: 400 - temperature may only be set to 1 when thinking is enabled")
+                err.status_code = 400
+                raise err
+            c = completion("No")
+            c.choices[0].message.reasoning_content = "Yes. The criterion is clearly met, so: Yes"
+            c.usage = Usage(1000, 900)
+            c.usage._d["completion_tokens_details"] = {"reasoning_tokens": 850}
+            return c
+
+    # A default run first: its ratings stay apart from the tagged re-judging.
+    make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge), limit=1, samples="1").run("http://p/v1", "s")
+    client = Thinking(None)
+    judge = jg.Judge(base_url="http://judge/v1", model="judge-m", api_key="k", is_self=False, client=client,
+                     extra_body={"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}})
+    out = make_pb(tmp_path, monkeypatch, judge, limit=1, samples="1", judge_reasoning_effort="max",
+                  judge_tag="max", judge_parallel=1).run("http://p/v1", "s")
+    sent = [r for r in client.requests if "temperature" not in r]
+    assert len(sent) == 2 and all(r["reasoning_effort"] == "max" for r in client.requests)
+    assert all(r["extra_body"]["output_config"] == {"effort": "max"} and "top_p" in r for r in sent)
+    assert judge.dropped == ["temperature"]
+    assert out["value"] == 0.0 and out["judge_unparsed_ratings"] == 0  # every verdict "No", from content
+    assert out["judge_reasoning_effort"] == "max" and "reasoning_effort max for every criterion" in out["judge_request"]
+    assert out["judge_usage"]["reasoning_tokens"] == 2 * 850 and out["judge_tag"] == "max"
+    sdir = tmp_path / "samples" / "Fin-0" / "0"
+    assert json.loads((sdir / "judgments.json").read_text())["0"]["judge_rating"] == "Yes"
+    assert json.loads((sdir / "judgments-max.json").read_text())["0"]["judge_rating"] == "No"
+    probe = make_pb(tmp_path, monkeypatch, fake_judge(lambda r: "Yes"), limit=1, samples="1",
+                    judge_tag="probe", judge_max_criteria="1").run("http://p/v1", "s")
+    assert probe["criteria_judged"] == 1 and probe["judge_max_criteria"] == 1
 
 
 # -- GDPval ---------------------------------------------------------------------

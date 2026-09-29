@@ -96,7 +96,8 @@ def usage_record(usage: Any) -> dict[str, int]:
     cached tokens.
     """
     if usage is None:
-        return {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0}
+        return {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0,
+                "reasoning_tokens": 0}
     u = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
     details = u.get("prompt_tokens_details") or {}
     cached = details.get("cached_tokens") or u.get("cache_read_input_tokens") or 0
@@ -105,12 +106,14 @@ def usage_record(usage: Any) -> dict[str, int]:
         "completion_tokens": int(u.get("completion_tokens") or 0),
         "cached_tokens": int(cached),
         "cache_write_tokens": int(u.get("cache_creation_input_tokens") or 0),
+        # Thinking tokens (part of completion_tokens), when the endpoint reports them.
+        "reasoning_tokens": int((u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
     }
 
 
 def total_usage(records: list[dict], n_examples: int) -> dict[str, Any]:
     """Sum per-call usage records, with per-example averages and a cost estimate."""
-    keys = ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens")
+    keys = ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens", "reasoning_tokens")
     tot = {k: sum(r.get(k, 0) for r in records) for k in keys}
     uncached = max(tot["prompt_tokens"] - tot["cached_tokens"] - tot["cache_write_tokens"], 0)
     cost = (
@@ -144,6 +147,8 @@ class Judge:
     - request parameters the endpoint rejects with a 400 (e.g. temperature and
       top_p together on newer Claude models) are dropped once, recorded in
       ``adaptations``, and not sent again,
+    - ``extra_body``: provider fields merged into every request body (e.g.
+      Anthropic ``thinking`` / ``output_config`` through LiteLLM); never dropped,
     - the usage of the last call on this thread (``last_usage``).
     """
 
@@ -157,6 +162,7 @@ class Judge:
         api_key: str,
         is_self: bool,
         cache_split=None,
+        extra_body: dict | None = None,
         timeout: float = 600,
         max_retries: int = 5,
         client: Any = None,
@@ -168,6 +174,7 @@ class Judge:
         self._client = client
         self.base_url, self.model, self.is_self = base_url, model, is_self
         self.cache_split = None if is_self else cache_split
+        self.extra_body = dict(extra_body or {})
         self.dropped: list[str] = []
         self.adaptations: list[str] = []
         self._lock = threading.Lock()
@@ -180,6 +187,7 @@ class Judge:
             "judge_base_url": self.base_url,
             "judge_is_self": self.is_self,
             "judge_prompt_caching": self.cache_split is not None,
+            "judge_extra_body": dict(self.extra_body),
             "judge_dropped_params": list(self.dropped),
             "judge_adaptations": list(self.adaptations),
         }
@@ -208,6 +216,8 @@ class Judge:
     def create(self, **request):
         request = {**request, "model": self.model}
         request["messages"] = self._cached_messages(request["messages"])
+        if self.extra_body:
+            request["extra_body"] = {**self.extra_body, **(request.get("extra_body") or {})}
         with self._lock:
             for key in self.dropped:
                 request.pop(key, None)
@@ -281,8 +291,38 @@ class JudgedBenchmark(Benchmark):
             api_key=key,
             is_self=False,
             cache_split=cache_split if self.opt("judge_cache", True) else None,
+            extra_body=self.judge_extra_body(),
             timeout=self.opt("judge_timeout", 600.0),
         )
+
+    def judge_extra_body(self) -> dict[str, Any]:
+        """Provider request fields for the judge, from the options
+
+        judge_thinking=adaptive|enabled:<budget_tokens>|disabled
+                          Anthropic ``thinking`` (LiteLLM passes it through)
+        judge_effort=low|medium|high|xhigh|max
+                          Anthropic ``output_config.effort``
+        judge_extra_body=<json object>
+                          anything else, merged last
+
+        (``judge_reasoning_effort`` is the OpenAI-style top-level field instead.)
+        """
+        body: dict[str, Any] = {}
+        thinking = self.opt("judge_thinking", "")
+        if thinking in ("adaptive", "disabled"):
+            body["thinking"] = {"type": thinking}
+        elif thinking.startswith("enabled:"):
+            body["thinking"] = {"type": "enabled", "budget_tokens": int(thinking.split(":", 1)[1])}
+        elif thinking:
+            raise SystemExit(f"{self.id}: judge_thinking must be adaptive, enabled:<budget_tokens> or disabled")
+        if effort := self.opt("judge_effort", ""):
+            body["output_config"] = {"effort": effort}
+        if extra := self.opt("judge_extra_body", ""):
+            parsed = json.loads(extra)
+            if not isinstance(parsed, dict):
+                raise SystemExit(f"{self.id}: judge_extra_body must be a JSON object")
+            body.update(parsed)
+        return body
 
     def sampling(self) -> dict[str, Any]:
         """Policy-model sampling overrides; unset ones fall back to the
@@ -390,6 +430,20 @@ class ProfBench(JudgedBenchmark):
       max_tokens=64000          policy generation cap (upstream's reasoning setting)
       temperature, top_p        policy sampling (default: generation_config)
       judge_workers=16          concurrent samples being judged
+      judge_reasoning_effort=   one effort for every criterion, sent by upstream's
+                                call as ``reasoning_effort`` (unset = upstream's
+                                mixed high/low)
+      judge_thinking, judge_effort, judge_extra_body
+                                provider thinking fields (JudgedBenchmark.judge_extra_body)
+      judge_tag=                keep this judge's ratings apart (judgments-<tag>.json),
+                                e.g. to re-judge the same reports with other settings
+      judge_max_criteria=0      probes: judge at most this many criteria per sample
+                                (the rest are left unjudged and not scored)
+
+    The verdict is the judge message's ``content`` only (upstream's
+    ``startswith("Yes")``); reasoning / thinking fields of the response are never
+    read. Ratings that start with neither Yes nor No are counted in
+    ``details.judge_unparsed_ratings``.
     """
 
     id = "profbench"
@@ -510,7 +564,8 @@ class ProfBench(JudgedBenchmark):
     def _judge_sample(self, pb, sample: dict, gen: dict, root: Path, judge: Judge | None) -> dict:
         """Ratings for every criterion of one sample: {idx: {judge_rating, usage}}."""
         task, k = sample["task"], sample["k"]
-        path = root / task["task_id"] / str(k) / "judgments.json"
+        tag = self.opt("judge_tag", "")
+        path = root / task["task_id"] / str(k) / (f"judgments-{tag}.json" if tag else "judgments.json")
         done: dict[str, dict] = json.loads(path.read_text()) if path.exists() else {}
         if gen["response"] is None:
             return {"status": "generation_failed", "ratings": {}}
@@ -524,10 +579,14 @@ class ProfBench(JudgedBenchmark):
                 done.setdefault(str(i), {"judge_rating": "No", "usage": None, "skipped": "empty_response"})
         else:
             todo = [i for i in range(len(points)) if str(i) not in done]
+            if cap := self.opt("judge_max_criteria", 0):
+                todo = [i for i in todo if i < cap]
+            # None = upstream's mixed effort; a string is sent as reasoning_effort on every call.
+            hyper = {"reasoning": self.opt("judge_reasoning_effort", "") or None}
 
             def one(i: int) -> None:
                 try:
-                    dp = pb.utils.get_criterion_fulfilment(dict(points[i]), i, {"reasoning": None}, judge, judge.model)
+                    dp = pb.utils.get_criterion_fulfilment(dict(points[i]), i, hyper, judge, judge.model)
                     done[str(i)] = {"judge_rating": dp["judge_rating"] or "", "usage": judge.last_usage()}
                 except Exception as e:
                     log.warning("profbench: judge %s#%d criterion %d failed: %s", task["task_id"], k, i, e)
@@ -602,7 +661,20 @@ class ProfBench(JudgedBenchmark):
         }
         if judge is not None:
             out.update(judge.describe())
-            out["judge_request"] = "upstream utils.get_criterion_fulfilment: reasoning mixed (high for Physics/Chemistry PhD or Style criteria, else low), temperature 0.6, top_p 0.95, max_tokens 32768"
+            effort = self.opt("judge_reasoning_effort", "")
+            out["judge_request"] = (
+                "upstream utils.get_criterion_fulfilment: "
+                + (f"reasoning_effort {effort} for every criterion" if effort else
+                   "reasoning mixed (high for Physics/Chemistry PhD or Style criteria, else low)")
+                + ", temperature 0.6, top_p 0.95, max_tokens 32768 (minus judge_dropped_params)"
+                + (f", extra body {json.dumps(judge.extra_body, sort_keys=True)}" if judge.extra_body else "")
+            )
+            out["judge_reasoning_effort"] = effort or "mixed"
+            out["judge_tag"] = self.opt("judge_tag", "")
+            if cap := self.opt("judge_max_criteria", 0):
+                out["judge_max_criteria"] = cap
+            out["judge_unparsed_ratings"] = sum(
+                not str(r["judge_rating"]).startswith(("Yes", "No")) for r in rows)
             out["judge_usage"] = total_usage(usage, len(samples))
         else:
             out["judge_model"] = "human"
@@ -960,7 +1032,9 @@ class GDPval(JudgedBenchmark):
       temperature, top_p          policy sampling (default: generation_config)
       judge_model / judge_base_url / judge_api_key_env, judge_max_tokens=16384,
       judge_reasoning_effort=     (unset = provider default)
-      judge_orders=2              1 = model as A only; 2 = both orders
+      judge_thinking, judge_effort, judge_extra_body
+                                  provider thinking fields (JudgedBenchmark.judge_extra_body)
+      judge_orders=2             1 = model as A only; 2 = both orders
       elo_anchor=1000             Elo-style value of the expert
     """
 
