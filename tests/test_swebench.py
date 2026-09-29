@@ -226,8 +226,8 @@ def pro(tmp_path):
 class ProSandbox:
     """Fake of a V2 image: /app exists, test.sh writes the given reward."""
 
-    def __init__(self, reward="1", apply_rc=0, patch=""):
-        self.reward, self.apply_rc, self.patch = reward, apply_rc, patch
+    def __init__(self, reward="1", apply_rc=0, patch="", pid_ns=True):
+        self.reward, self.apply_rc, self.patch, self.pid_ns = reward, apply_rc, patch, pid_ns
         self.commands, self.files = [], {}
 
     def __enter__(self):
@@ -251,7 +251,9 @@ class ProSandbox:
             return ExecResult("/app\n", 0)
         if command == sb_mod.PRO_APPLY:
             return ExecResult("Applied patch", self.apply_rc)
-        if command == sb_mod.PRO_VERIFY_CMD:
+        if command == sb_mod.PRO_PIDNS_PROBE:
+            return ExecResult("", 0) if self.pid_ns else ExecResult("unshare: unshare failed: Operation not permitted", 1)
+        if command in (sb_mod.PRO_VERIFY_PIDNS_CMD, sb_mod.PRO_VERIFY_PLAIN_CMD):
             return ExecResult("", 0 if self.reward == "1" else 1)
         if command == sb_mod.PRO_LISTENING:
             return ExecResult("0100007F:18EB\n", 0)
@@ -325,28 +327,44 @@ def test_pro_grade_runs_the_task_verifier_in_a_fresh_sandbox(pro, tmp_path, monk
     assert fake.files["/tmp/replay.patch"] == "diff --git a/x b/x\n"
     assert set(fake.files) >= {f"/tests/{n}" for n in ("test.sh", "run_script.sh", "parser.py", "config.json", "test_patch.patch")}
     commands = [c for c, _ in fake.commands]
-    assert commands.index(sb_mod.PRO_APPLY) < commands.index(sb_mod.PRO_VERIFY_CMD)
-    assert (sb_mod.PRO_VERIFY_CMD, "/app") in fake.commands
+    assert commands.index(sb_mod.PRO_APPLY) < commands.index(sb_mod.PRO_VERIFY_PIDNS_CMD)
+    assert (sb_mod.PRO_VERIFY_PIDNS_CMD, "/app") in fake.commands
+    assert sb_mod.PRO_VERIFY_PLAIN_CMD not in commands
+    assert report["verifier_pid_ns"] is True
+    assert "node_locks" not in report  # the fake task's scripts use no fixed resource
     assert (tmp_path / "test_output.txt").read_text() == "RESULT: PASSED\n"
     assert (tmp_path / "output.json").exists()
     # The verifier's raw logs and the ports already listening are kept for debugging.
     assert (tmp_path / "run-script-stdout.txt").read_text() == '{"stats": {}}\n'
     assert not (tmp_path / "run-script-stderr.txt").exists()
     assert (tmp_path / "listening.txt").read_text() == "0100007F:18EB\n"
-    assert commands.index(sb_mod.PRO_LISTENING) < commands.index(sb_mod.PRO_VERIFY_CMD)
+    assert commands.index(sb_mod.PRO_LISTENING) < commands.index(sb_mod.PRO_VERIFY_PIDNS_CMD)
 
 
 def test_pro_verifier_runs_in_its_own_pid_namespace_when_it_can():
     # Services test.sh starts (redis-server, Xvfb) must die with it, as with Harbor's container.
-    assert "exec unshare --pid --fork --mount-proc --kill-child /tests/test.sh" in sb_mod.PRO_VERIFY
-    assert "exec /tests/test.sh; fi" in sb_mod.PRO_VERIFY  # fallback without unshare
-    assert sb_mod.PRO_VERIFY_CMD.endswith("> /logs/verifier/test-stdout.txt 2>&1")
+    assert sb_mod.PRO_VERIFY_PIDNS_CMD.startswith("unshare --pid --fork --mount-proc --kill-child /tests/test.sh ")
+    assert sb_mod.PRO_PIDNS_PROBE == "unshare --pid --fork --mount-proc --kill-child true"
+    for cmd in (sb_mod.PRO_VERIFY_PIDNS_CMD, sb_mod.PRO_VERIFY_PLAIN_CMD):
+        assert cmd.endswith("> /logs/verifier/test-stdout.txt 2>&1")
+
+
+def test_pro_verifier_without_pid_namespace_is_recorded_not_silent(pro, tmp_path, monkeypatch, caplog):
+    fake = ProSandbox(reward="1", pid_ns=False)
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
+    with caplog.at_level("WARNING"):
+        report = pro._grade(PRO_INSTANCE, "diff\n", tmp_path)
+    commands = [c for c, _ in fake.commands]
+    assert sb_mod.PRO_VERIFY_PLAIN_CMD in commands and sb_mod.PRO_VERIFY_PIDNS_CMD not in commands
+    assert report["verifier_pid_ns"] is False and report["resolved"] is True
+    assert "no PID namespace for the verifier" in caplog.text and "Operation not permitted" in caplog.text
 
 
 def test_pro_grade_unresolved_on_zero_reward_or_missing_reward(pro, tmp_path, monkeypatch):
     monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: ProSandbox(reward="0"))
     assert pro._grade(PRO_INSTANCE, "diff\n", tmp_path) == {
         "instance_id": PRO_IID, "resolved": False, "status": "graded", "reward": 0.0, "apply_rc": 0, "verifier_rc": 1,
+        "verifier_pid_ns": True,
     }
     monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: ProSandbox(reward=None))
     assert pro._grade(PRO_INSTANCE, "diff\n", tmp_path)["status"] == "no_reward"
@@ -358,7 +376,7 @@ def test_pro_grade_still_runs_the_verifier_when_the_patch_does_not_apply(pro, tm
     monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
     report = pro._grade(PRO_INSTANCE, "diff\n", tmp_path)
     assert report["apply_rc"] == 1 and report["status"] == "graded" and not report["resolved"]
-    assert any(c == sb_mod.PRO_VERIFY_CMD for c, _ in fake.commands)
+    assert any(c == sb_mod.PRO_VERIFY_PIDNS_CMD for c, _ in fake.commands)
 
 
 def test_pro_empty_patch_needs_no_sandbox(pro, tmp_path, monkeypatch):
@@ -382,7 +400,18 @@ def test_pro_generate_gives_the_instruction_and_captures_the_diff(pro, tmp_path,
     fake = ProSandbox(patch="diff --git a/f b/f\n+fix\n")
     from sage2_evals.sandbox import minisweagent_env
 
-    sandbox_env, killed = {}, []
+    import contextlib
+
+    sandbox_env, killed, locks = {}, [], []
+
+    @contextlib.contextmanager
+    def fake_locks(keys, **kw):
+        locks.append(("lock", tuple(keys)))
+        yield 0.0
+        locks.append(("unlock", len(killed)))  # released after the kill
+
+    monkeypatch.setattr(sb_mod, "node_locks", fake_locks)
+    monkeypatch.setattr(sb_mod, "pro_fixed_resources", lambda tests: ["x99"])
     monkeypatch.setattr(minisweagent_env, "make_sandbox", lambda *a, **k: sandbox_env.update(k.get("env") or {}) or fake)
     monkeypatch.setattr(sb_mod, "_kill_marked", killed.append)
     seen = {}
@@ -411,6 +440,7 @@ def test_pro_generate_gives_the_instruction_and_captures_the_diff(pro, tmp_path,
     assert (tmp_path / "traj.json").exists()
     # Every agent command carries the marker; what they left running is killed afterwards.
     assert killed == [sandbox_env[sb_mod.PRO_MARKER]] and PRO_IID in killed[0]
+    assert locks == [("lock", ("x99",)), ("unlock", 1)]
 
 
 def test_pro_grade_kills_what_its_sandbox_left_running(pro, tmp_path, monkeypatch):
@@ -439,6 +469,96 @@ def test_kill_marked_kills_only_processes_with_the_marker(tmp_path, monkeypatch)
     assert sent == [(101, signal.SIGKILL)]
 
 
+# -- fixed resources and node locks ---------------------------------------------
+
+NODEBB_RUN_SCRIPT = """#!/bin/bash
+prepare_test_environment() {
+  redis-server --daemonize yes --protected-mode no --appendonly yes
+  while ! redis-cli ping; do sleep 1; done
+  echo '{"url":"http://localhost:4568","secret":"s","database":"redis","redis":{"host":"127.0.0.1","port":6379},"port":"4568"}' > config.json
+}
+"""
+QUTE_RUN_SCRIPT = """#!/bin/bash
+export DISPLAY=:99
+Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+pytest "$@"
+"""
+
+
+def test_pro_fixed_resources_come_from_the_scripts_that_run():
+    assert sb_mod.pro_fixed_resources({"run_script.sh": NODEBB_RUN_SCRIPT}) == ["port-4568", "port-6379"]
+    assert sb_mod.pro_fixed_resources({"run_script.sh": QUTE_RUN_SCRIPT}) == ["x99"]
+    assert sb_mod.pro_fixed_resources({"test.sh": "redis-server --port 7000 &\n"}) == ["port-7000"]
+    assert sb_mod.pro_fixed_resources({"run_script.sh": "redis-server --port 0 --unixsocket /tmp/r.sock\n"}) == []
+    assert sb_mod.pro_fixed_resources({"run_script.sh": "Xvfb :1 &\nexport DISPLAY=:1\n"}) == ["x1"]
+    # Port literals in the test code (test_patch) are test data, not services.
+    assert sb_mod.pro_fixed_resources({"run_script.sh": "#!/bin/bash\ngo test ./...\n",
+                                       "test_patch.patch": "+ addr := \"localhost:5432\"\n"}) == []
+
+
+@pytest.mark.parametrize("abstract", [False, pytest.param(True, marks=pytest.mark.skipif(
+    not __import__("sys").platform.startswith("linux"), reason="abstract unix sockets are Linux-only"))])
+def test_node_lock_excludes_other_holders_until_released(tmp_path, monkeypatch, abstract):
+    import uuid
+
+    monkeypatch.setenv("SAGE2_LOCK_DIR", str(tmp_path))
+    key = f"test-{uuid.uuid4().hex[:8]}"
+    first, second = sb_mod.NodeLock(key, abstract=abstract), sb_mod.NodeLock(key, abstract=abstract)
+    first.acquire()
+    assert second._try() is None  # held by another holder (another thread or job)
+    assert sb_mod.NodeLock(f"{key}-other", abstract=abstract)._try() is not None  # other keys are free
+    first.release()
+    assert second.acquire() < 1.0
+    second.release()
+
+
+def test_node_locks_wait_for_the_holder(tmp_path, monkeypatch):
+    import threading
+    import time
+    import uuid
+
+    monkeypatch.setenv("SAGE2_LOCK_DIR", str(tmp_path))
+    keys = [f"port-{uuid.uuid4().hex[:6]}", f"x{uuid.uuid4().hex[:6]}"]
+    events, holding = [], threading.Event()
+
+    def holder():
+        with sb_mod.node_locks(keys, poll_s=0.01):
+            events.append("a-in")
+            holding.set()
+            time.sleep(0.2)
+            events.append("a-out")
+
+    t = threading.Thread(target=holder)
+    t.start()
+    holding.wait()
+    with sb_mod.node_locks(list(reversed(keys)), poll_s=0.01) as waited:  # any order: taken sorted
+        events.append("b-in")
+    t.join()
+    assert events == ["a-in", "a-out", "b-in"] and waited > 0.1
+    with sb_mod.node_locks([]) as waited:
+        assert waited == 0.0
+
+
+def test_pro_grade_holds_its_locks_until_the_marker_kill(pro, tmp_path, monkeypatch):
+    import contextlib
+
+    events = []
+
+    @contextlib.contextmanager
+    def fake_locks(keys, **kw):
+        events.append(("lock", tuple(keys)))
+        yield 1.5
+        events.append(("unlock", tuple(keys)))
+
+    monkeypatch.setattr(sb_mod, "pro_fixed_resources", lambda tests: ["port-6379"])
+    monkeypatch.setattr(sb_mod, "node_locks", fake_locks)
+    monkeypatch.setattr(sb_mod, "_kill_marked", lambda marker: events.append(("kill",)))
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: ProSandbox(reward="1"))
+    report = pro._grade(PRO_INSTANCE, "diff\n", tmp_path)
+    assert events == [("lock", ("port-6379",)), ("kill",), ("unlock", ("port-6379",))]
+    assert report["node_locks"] == ["port-6379"] and report["lock_wait_s"] == 1.5 and report["resolved"]
+
+
 def test_pro_gold_run_uses_the_task_reference_patch(pro, tmp_path, monkeypatch):
     pro.config.options["patch"] = "gold"
     monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [PRO_INSTANCE])
@@ -447,6 +567,7 @@ def test_pro_gold_run_uses_the_task_reference_patch(pro, tmp_path, monkeypatch):
     monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
     out = pro.run("", "m")
     assert out["value"] == 1.0 and out["subset"] == "default"
+    assert out["per_repeat"][0]["verifier_pid_ns"] == {"true": 1} and out["verifier_pid_ns"] == {"true": 1}
     assert out["verifier"]["commit"] == sb_mod.PRO_COMMIT
     assert fake.files["/tmp/replay.patch"] == "gold-diff\n"
 
