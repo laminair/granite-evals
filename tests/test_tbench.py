@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shlex
 from pathlib import Path
 from types import SimpleNamespace
@@ -339,20 +340,23 @@ def test_env_enroot_passes_no_harness_secrets(env, monkeypatch):
 
 
 def test_leftover_daemons_are_killed_by_root(monkeypatch):
-    """Processes that drop the marker (nginx workers) are found by their root."""
-    roots = {"10": "/scratch/data/sage2-x", "11": "/", "12": "/scratch/data/sage2-x"}
+    """Processes that drop the marker (nginx workers) are found by their root
+    directory's inode: readlink() of another mount namespace's root gives "/"."""
+    rootfs = "/scratch/data/sage2-x"
+    inodes = {rootfs: (7, 42), "/proc/10/root": (7, 42), "/proc/11/root": (7, 2), "/proc/12/root": (7, 42)}
     killed = []
 
-    def readlink(path):
-        pid = path.split("/")[2]
-        if pid not in roots:
+    def stat(path):
+        if path not in inodes:
             raise OSError(path)
-        return roots[pid]
+        return os.stat_result((0, inodes[path][1], inodes[path][0], 0, 0, 0, 0, 0, 0, 0))
 
-    monkeypatch.setattr(harbor_env.os, "listdir", lambda p: [*roots, "self", "99999"])
-    monkeypatch.setattr(harbor_env.os, "readlink", readlink)
+    monkeypatch.setattr(harbor_env.os, "listdir", lambda p: ["10", "11", "12", "self", "99999"])
+    monkeypatch.setattr(harbor_env.os, "stat", stat)
+    monkeypatch.setattr(harbor_env.os, "readlink", lambda p: "/")
     monkeypatch.setattr(harbor_env.os, "kill", lambda pid, sig: killed.append(pid))
-    assert harbor_env._kill_rooted("/scratch/data/sage2-x") == 2 and killed == [10, 12]
+    assert harbor_env._kill_rooted(rootfs) == 2 and killed == [10, 12]
+    assert harbor_env._kill_rooted("/gone") == 0
     monkeypatch.setenv("ENROOT_DATA_PATH", "/scratch/data")
     assert harbor_env.enroot_rootfs("sage2-x") == "/scratch/data/sage2-x"
 
