@@ -114,6 +114,8 @@ def _kill_rooted(rootfs: str) -> int:
     daemons a task starts that drop the environment marker (nginx workers
     clear their environment), which would otherwise outlive the task and keep
     the batch job alive."""
+    # The kernel reports the resolved path.
+    rootfs = os.path.realpath(rootfs)
     killed = 0
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or int(entry) == os.getpid():
