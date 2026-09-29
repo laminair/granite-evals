@@ -343,7 +343,8 @@ def test_leftover_daemons_are_killed_by_root(monkeypatch):
     """Processes that drop the marker (nginx workers) are found by their root
     directory's inode: readlink() of another mount namespace's root gives "/"."""
     rootfs = "/scratch/data/sage2-x"
-    inodes = {rootfs: (7, 42), "/proc/10/root": (7, 42), "/proc/11/root": (7, 2), "/proc/12/root": (7, 42)}
+    inodes = {rootfs: (7, 42), "/": (7, 2), "/proc/10/root": (7, 42), "/proc/11/root": (7, 2),
+              "/proc/12/root": (7, 42)}
     killed = []
 
     def stat(path):
@@ -357,6 +358,8 @@ def test_leftover_daemons_are_killed_by_root(monkeypatch):
     monkeypatch.setattr(harbor_env.os, "kill", lambda pid, sig: killed.append(pid))
     assert harbor_env._kill_rooted(rootfs) == 2 and killed == [10, 12]
     assert harbor_env._kill_rooted("/gone") == 0
+    killed.clear()
+    assert harbor_env._kill_rooted("/") == 0 and killed == []  # the host root: kill nothing
     monkeypatch.setenv("ENROOT_DATA_PATH", "/scratch/data")
     assert harbor_env.enroot_rootfs("sage2-x") == "/scratch/data/sage2-x"
 

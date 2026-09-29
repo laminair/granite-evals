@@ -122,6 +122,9 @@ def _kill_rooted(rootfs: str) -> int:
     except OSError:
         return 0
     want = (st.st_dev, st.st_ino)
+    host = os.stat("/")
+    if want == (host.st_dev, host.st_ino):  # never every process on the node
+        return 0
     killed = 0
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or int(entry) == os.getpid():
