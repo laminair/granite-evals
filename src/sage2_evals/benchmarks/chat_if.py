@@ -23,9 +23,26 @@ The headline value is the mean over languages of each language's exact match
 (lm-eval's ``mmlu_prox_lite_{lang}`` group: size-weighted over subjects). All
 languages have the same 588 questions, so this is also the micro average.
 
-Generation follows the task configs (greedy, ``max_gen_toks: 2048``, the task's
-stop strings); ``--option temperature=/top_p=/max_tokens=`` override them and
-``--option thinking=off`` sends ``chat_template_kwargs.enable_thinking=false``.
+Generation uses Granite 4.2's card settings for thinking mode, not the task
+configs: ``temperature=1.0``, ``top_p=0.95``, ``max_tokens=8192``, thinking left
+on (see ``CARD_SAMPLING``). This deviates from NeMo Evaluator's lm-eval chat
+protocol (the task's ``max_gen_toks: 2048``, ``temperature 1e-7``/``top_p
+0.9999999``, the task's stop strings): with thinking on, 2048 tokens cut off
+nearly every reasoning trace, so that protocol scores the 3b near 0 against the
+card's 27.78. ``--option temperature=/top_p=/max_tokens=`` override the card
+values (``max_tokens=2048 temperature=0.0000001 top_p=0.9999999`` is the NeMo
+lm-eval chat protocol); ``--option thinking=off`` sends
+``chat_template_kwargs.enable_thinking=false``.
+
+``--option stop=`` replaces the task's stop strings (lm-eval's ``until``):
+``stop=task`` (default) keeps each language's own four (``</s>``, ``Q:``, the
+language's "Question:" word, ``<|im_end|>``); ``stop=none`` sends none (only
+the tokenizer's EOS, which lm-eval always appends); anything else is a
+comma-separated list of at most 4 strings, each percent-decoded, so the value
+has no spaces or shell characters and survives bv-smoke's space-split OPTIONS
+and its inner ``bash -c``: ``stop=%3C/s%3E,Q:`` is ``["</s>", "Q:"]``, ``%2C``
+is a comma, ``%20`` a space. The stops the task actually used (per language)
+are recorded in results.json as ``generation_kwargs``.
 The served model's reasoning parser keeps the thinking out of ``content``, which
 is what the regex sees. A thought cut off at ``max_tokens`` leaves no content
 and scores as wrong, like in the reference protocol.
@@ -46,6 +63,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -83,6 +101,15 @@ METRIC = "exact_match"
 ERROR_MARKER = "[sage2-evals: request failed]"
 PROGRESS_EVERY = 100
 RETRY_BACKOFF_S = 1.0  # doubles per attempt, capped at 30 s
+# Granite 4.2 recommended sampling for thinking mode (thinking is on by default):
+# the 3b model card, huggingface.co/ibm-granite/granite-4.2-3b README.md at
+# e459acce, lines 331-341 (temperature 1.0, top_p 0.95, max_new_tokens 8192 in
+# thinking mode, 2048 in non-thinking mode) and line 347 (thinking on by default).
+# NeMo Evaluator's lm-eval chat defaults differ (nvidia-lm-eval 26.3
+# core_evals/lm_evaluation_harness/framework.yml:21-23: max_new_tokens null, i.e.
+# the task's 2048, temperature 1e-7, top_p 0.9999999); see the module docstring.
+CARD_SAMPLING = {"temperature": 1.0, "top_p": 0.95, "max_tokens": 8192}
+MAX_STOPS = 4  # lm-eval's chat payload keeps until[:4] (openai_completions.py)
 
 
 def task_name(lang: str, subject: str) -> str:
@@ -152,6 +179,24 @@ def summarize(samples: dict[str, list[dict]]) -> dict[str, Any]:
         "per_subject": {s: {"exact_match": sum(v) / len(v), "n": len(v)} for s, v in sorted(per_subject.items())},
         "statuses": statuses,
     }
+
+
+def effective_generation_kwargs(configs: dict[str, dict]) -> dict[str, dict]:
+    """Per language, the generation_kwargs lm-eval ran the tasks with (the task
+    config after the overrides; ``until`` is the stop list sent, before
+    lm-eval appends the tokenizer's EOS and keeps the first 4). One entry per
+    language unless its subject tasks disagree (then also per task)."""
+    out: dict[str, dict] = {}
+    for task, cfg in sorted(configs.items()):
+        if not task.startswith("mmlu_prox_lite_"):
+            continue
+        lang, _ = parse_task(task)
+        gk = cfg.get("generation_kwargs") or {}
+        if lang not in out:
+            out[lang] = gk
+        elif out[lang] != gk:
+            out[task] = gk
+    return out
 
 
 def gold_response(lang: str, answer: str) -> str:
@@ -285,16 +330,37 @@ class MMLUProXLite(Benchmark):
             override["dataset_path"] = source
         return {"group": "sage2_mmlu_prox_lite", "task": [{"task": t, **override} for t in tasks]}
 
+    def stop(self) -> list[str] | None:
+        """``--option stop=``: None keeps the task's own stop strings."""
+        spec = self.opt("stop", "task")
+        if spec == "task":
+            return None
+        if spec == "none":
+            return []
+        stops = [urllib.parse.unquote(x) for x in spec.split(",")]
+        if any(not x for x in stops):
+            raise SystemExit(f"{self.id}: empty stop string in stop={spec!r}; use stop=none for no stops")
+        if len(stops) > MAX_STOPS:
+            raise SystemExit(f"{self.id}: {len(stops)} stop strings; lm-eval sends at most {MAX_STOPS}")
+        return stops
+
     def gen_kwargs(self) -> dict[str, Any]:
-        """Overrides of the task's generation_kwargs; empty = the task's own."""
-        kw: dict[str, Any] = {}
-        if "temperature" in self.config.options:
-            kw["temperature"] = float(self.config.options["temperature"])
-            kw["do_sample"] = kw["temperature"] > 0
-        if "top_p" in self.config.options:
-            kw["top_p"] = float(self.config.options["top_p"])
-        if "max_tokens" in self.config.options:
-            kw["max_gen_toks"] = int(self.config.options["max_tokens"])
+        """Overrides of the task's generation_kwargs: the card's sampling
+        (``CARD_SAMPLING``) unless an option overrides it, plus ``stop`` and
+        ``thinking``. Gold mode ignores them.
+
+        ``do_sample`` stays the task's ``false``: local-chat-completions drops
+        it from the request (the server samples per ``temperature``), and
+        lm-eval's response cache skips every ``do_sample=True`` request, which
+        would make a restarted run resend all of them. The cache is per
+        repeat (``repeat-<k>/lm_cache``), so repeats still sample afresh."""
+        kw: dict[str, Any] = {
+            "temperature": float(self.config.options.get("temperature", CARD_SAMPLING["temperature"])),
+            "top_p": float(self.config.options.get("top_p", CARD_SAMPLING["top_p"])),
+            "max_gen_toks": int(self.config.options.get("max_tokens", CARD_SAMPLING["max_tokens"])),
+        }
+        if (stops := self.stop()) is not None:
+            kw["until"] = stops
         if self.opt("thinking", "default") == "off":
             kw["chat_template_kwargs"] = {"enable_thinking": False}
         return kw
@@ -340,6 +406,8 @@ class MMLUProXLite(Benchmark):
             "languages": langs,
             "mode": "gold" if self.gold else "local-chat-completions, apply_chat_template, fewshot_as_multiturn",
             "gen_kwargs_overrides": self.gen_kwargs(),
+            "stop": "task" if self.stop() is None else self.stop(),
+            "generation_kwargs": per_repeat[0]["generation_kwargs"],
             "per_repeat": per_repeat,
         }
 
@@ -359,7 +427,7 @@ class MMLUProXLite(Benchmark):
             use_cache=None if self.gold else str(cache_dir / "cache"),
             apply_chat_template=True,
             fewshot_as_multiturn=True,
-            gen_kwargs=self.gen_kwargs() or None,
+            gen_kwargs=self.gen_kwargs(),
             log_samples=True,
             bootstrap_iters=0,
             random_seed=self.config.seed,
@@ -369,6 +437,7 @@ class MMLUProXLite(Benchmark):
                 log.warning("%s repeat %d: %d failed requests dropped from the cache for retry", self.id, k, dropped)
         self._write(repeat_dir, results)
         summary = summarize(results["samples"])
+        summary["generation_kwargs"] = effective_generation_kwargs(results.get("configs") or {})
         summary["duration_s"] = round(time.time() - started, 1)
         return summary
 

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -124,18 +125,81 @@ def test_summarize_macro_over_languages_and_ignores_other_filters():
     assert out["statuses"] == {"answered": 4, "no_content": 1, "error": 1}
 
 
-def test_gen_kwargs_default_to_the_task_and_record_overrides(tmp_path):
-    def kw(**options):
-        return chat_if.MMLUProXLite(RunConfig(model="m", output_dir=tmp_path, options=options)).gen_kwargs()
+def _kw(tmp_path, **options):
+    return chat_if.MMLUProXLite(RunConfig(model="m", output_dir=tmp_path, options=options)).gen_kwargs()
 
-    assert kw() == {}
-    assert kw(temperature="0.6", top_p="0.95", max_tokens="8192", thinking="off") == {
+
+def test_gen_kwargs_default_to_the_granite_card_and_the_task_stops(tmp_path):
+    # Granite 4.2 card, thinking mode: temperature 1.0, top_p 0.95, 8192 tokens;
+    # no until (the task's own stops), no chat_template_kwargs (thinking on).
+    # No do_sample: lm-eval's cache skips do_sample=True requests (resume).
+    assert _kw(tmp_path) == {"temperature": 1.0, "top_p": 0.95, "max_gen_toks": 8192}
+    assert _kw(tmp_path, temperature="0.6", top_p="0.9", max_tokens="16384", thinking="off") == {
         "temperature": 0.6,
-        "do_sample": True,
-        "top_p": 0.95,
-        "max_gen_toks": 8192,
+        "top_p": 0.9,
+        "max_gen_toks": 16384,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    # NeMo Evaluator's lm-eval chat protocol, spelled as options.
+    assert _kw(tmp_path, temperature="0.0000001", top_p="0.9999999", max_tokens="2048") == {
+        "temperature": 1e-7, "top_p": 0.9999999, "max_gen_toks": 2048,
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("spec", "until"),
+    [
+        ("task", None),
+        ("none", []),
+        ("%3C/s%3E", ["</s>"]),
+        ("%3C/s%3E,Q:,%E9%97%AE%E9%A2%98%EF%BC%9A", ["</s>", "Q:", "问题："]),
+        ("a%2Cb,x%20y", ["a,b", "x y"]),
+    ],
+)
+def test_stop_option(tmp_path, spec, until):
+    kw = _kw(tmp_path, stop=spec)
+    if until is None:
+        assert "until" not in kw
+    else:
+        assert kw["until"] == until
+
+
+@pytest.mark.parametrize("spec", ["a,,b", "a,b,c,d,e", ""])
+def test_stop_option_rejects_empty_and_too_many(tmp_path, spec):
+    with pytest.raises(SystemExit):
+        _kw(tmp_path, stop=spec)
+
+
+def test_bv_smoke_options_carry_a_stop_list_unchanged():
+    """bv-smoke splits OPTIONS on spaces and re-parses them in ``bash -c``:
+    a percent-encoded stop list has nothing either would touch."""
+    import shlex
+
+    options = "stop=%3C/s%3E,Q:,%3C%7Cim_end%7C%3E max_tokens=8192"
+    opts = "".join(f" --option {kv}" for kv in options.split())
+    assert shlex.split(opts) == ["--option", "stop=%3C/s%3E,Q:,%3C%7Cim_end%7C%3E", "--option", "max_tokens=8192"]
+
+
+def test_chat_payload_sends_the_card_sampling_and_stops(tmp_path):
+    """What lm-eval's local-chat-completions puts on the wire for the
+    task's generation_kwargs after our overrides."""
+    pytest.importorskip("lm_eval")
+    from lm_eval.models.openai_completions import LocalChatCompletion
+
+    task = {"until": ["</s>", "Q:", "问题：", "<|im_end|>"], "do_sample": False, "temperature": 0.0, "max_gen_toks": 2048}
+    msgs = [{"role": "user", "content": "q"}]
+
+    def payload(**options):
+        gk = {**task, **_kw(tmp_path, **options)}
+        return LocalChatCompletion._create_payload(SimpleNamespace(_max_gen_toks=256, model="m"), msgs, gen_kwargs=gk, seed=1, eos="<|end_of_text|>")
+
+    p = payload()
+    assert (p["temperature"], p["top_p"], p["max_tokens"]) == (1.0, 0.95, 8192)
+    assert p["stop"] == ["</s>", "Q:", "问题：", "<|im_end|>"]
+    assert "chat_template_kwargs" not in p and "do_sample" not in p
+    assert payload(stop="none")["stop"] == ["<|end_of_text|>"]
+    assert payload(stop="%3C/s%3E")["stop"] == ["</s>", "<|end_of_text|>"]
+    assert payload(thinking="off")["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_task_spec_pins_revision_per_subject_task(tmp_path):
@@ -173,6 +237,7 @@ class FakeChatLM:
     """Stands in for local-chat-completions: answers A, fails on one prompt."""
 
     calls: list = []
+    gen_kwargs: list = []
 
     @staticmethod
     def make(fail_on=None):
@@ -184,6 +249,7 @@ class FakeChatLM:
                 for req in requests:
                     ctx = req.args[0]
                     FakeChatLM.calls.append(ctx)
+                    FakeChatLM.gen_kwargs.append(req.args[1])
                     if fail_on and fail_on in ctx:
                         out.append(chat_if.ERROR_MARKER)
                     else:
@@ -235,6 +301,24 @@ def test_limit_errors_and_resume(tmp_path, dataset_dir, monkeypatch):
     out2 = _bench(tmp_path, dataset_dir, limit=8).run("http://x/v1", "m")
     assert len(FakeChatLM.calls) == 1 and "[en] question 3 " in FakeChatLM.calls[0]
     assert out2["per_repeat"][0]["statuses"] == {"answered": 8}
+
+
+@pytest.mark.parametrize(("stop", "until"), [(None, ["</s>", "Q:", "Frage:", "<|im_end|>"]), ("none", [])])
+def test_requests_carry_the_generation_kwargs_and_results_record_them(tmp_path, dataset_dir, monkeypatch, stop, until):
+    pytest.importorskip("lm_eval")
+    FakeChatLM.calls, FakeChatLM.gen_kwargs = [], []
+    monkeypatch.setattr(chat_if.MMLUProXLite, "make_lm", lambda self, *a, **k: FakeChatLM.make())
+    out = _bench(tmp_path, dataset_dir, limit=4, **({"stop": stop} if stop else {})).run("http://x/v1", "m")
+    de = [gk for ctx, gk in zip(FakeChatLM.calls, FakeChatLM.gen_kwargs) if "[de]" in ctx]
+    assert de and all(gk["until"] == until for gk in de)
+    assert all((gk["temperature"], gk["top_p"], gk["max_gen_toks"]) == (1.0, 0.95, 8192) for gk in FakeChatLM.gen_kwargs)
+    gk = out["generation_kwargs"]
+    assert set(gk) == set(LANGS)
+    assert gk["de"]["until"] == until and gk["en"]["until"] == (until and ["</s>", "Q:", "Question:", "<|im_end|>"])
+    assert gk["de"]["max_gen_toks"] == 8192 and gk["de"]["top_p"] == 0.95
+    assert out["stop"] == ("task" if stop is None else [])
+    assert json.dumps(out)  # results.json-serialisable
+    assert all(not gk.get("do_sample") for gk in FakeChatLM.gen_kwargs)  # cacheable, so resumable
 
 
 def test_chat_lm_turns_exhausted_retries_into_an_error_marker(monkeypatch):
