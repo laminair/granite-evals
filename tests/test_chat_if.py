@@ -282,6 +282,7 @@ def test_ifbench_registered_and_pinned(tmp_path):
     assert b.pins() == {}  # a GitHub file, pinned by URL + sha256, not an HF repo
     pinned, sha = cls.pinned_urls[chat_if.IFBENCH_TEST_URL]
     assert chat_if.IFBENCH_DATA_COMMIT in pinned and len(sha) == 64
+    assert len(cls.prepared_sha256) == 64  # the prepared test.jsonl is checked too
 
 
 def test_ifbench_has_no_gold_mode(tmp_path):
@@ -330,3 +331,77 @@ def test_ifbench_value_is_prompt_loose_accuracy_avg_of_2(tmp_path):
     assert m["prompt_loose_accuracy"] == pytest.approx(75.0)  # (1/2 + 2/2) / 2
     assert m["prompt_strict_accuracy"] == pytest.approx(25.0)
     assert m["instruction_loose_accuracy"] == pytest.approx(87.5)
+
+
+def test_ifbench_puts_the_pinned_nltk_data_first(tmp_path, monkeypatch):
+    """IFBench's verifiers nltk.download() at build time; ~/nltk_data would win over
+    the image's pinned copy unless NLTK_DATA names it (inherited by run_eval)."""
+    from sage2_evals.benchmarks.nemo_skills import NemoSkillsBenchmark
+
+    seen = {}
+    monkeypatch.setattr(NemoSkillsBenchmark, "run", lambda self, *a: seen.setdefault("NLTK_DATA", __import__("os").environ["NLTK_DATA"]))
+    monkeypatch.setenv("NLTK_DATA", f"/elsewhere:{chat_if.IFBENCH_NLTK_DATA}")
+    chat_if.IFBench(RunConfig(model="m", output_dir=tmp_path)).run("", "")
+    assert seen["NLTK_DATA"].split(":") == [chat_if.IFBENCH_NLTK_DATA, "/elsewhere"]
+
+
+# Every instruction of the pinned IFBench test data (newer than the IFBench checkout
+# ns pins, whose own data/ has 294 prompts) through its verifier, as ns's evaluator
+# runs them (cwd = the IFBench checkout, the job's python), with the exceptions
+# ns's patch would swallow (scored "not followed") reported instead. nltk.download is
+# a no-op here: the pinned data must be enough, and a build-time test must not
+# change it.
+IFBENCH_VERIFY = r"""
+import json, sys
+import nltk
+nltk.download = lambda *a, **k: True
+import instructions_registry as reg
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+response = (
+    "Birds sing at dawn. Do you hear them? I walked to the river with Maria and John, and the water was cold.\n\n"
+    "* Peter met them in Paris on 3 May 2024.\n* They counted 42 boats, 7 bridges and 1 dog!\n\n"
+    "Run, because the rain is coming; however, nobody ran. P.S. The end."
+)
+seen, failed = set(), {}
+for row in rows:
+    for iid, kw in zip(row["instruction_id_list"], row["kwargs"]):
+        seen.add(iid)
+        try:
+            inst = reg.INSTRUCTION_DICT[iid](iid)
+            inst.build_description(**{k: v for k, v in kw.items() if v is not None})
+            args = inst.get_instruction_args()
+            if args and "prompt" in args:
+                inst.build_description(prompt=row["prompt"])
+            inst.check_following(response)
+        except Exception as e:
+            failed.setdefault(iid, repr(e)[:300])
+found = {p: str(nltk.data.find(p)) for p in ("tokenizers/punkt", "tokenizers/punkt_tab", "corpora/stopwords", "taggers/averaged_perceptron_tagger_eng")}
+print(json.dumps({"rows": len(rows), "instructions": sorted(seen), "failed": failed, "nltk": found}))
+"""
+
+
+def test_ifbench_verifiers_run_in_the_image(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    import hashlib
+    import urllib.request
+
+    if not (chat_if.IFBENCH_DIR / "run_eval.py").is_file():
+        pytest.skip("no IFBench checkout (built by docker/extras/ifbench.sh)")
+    url, sha = chat_if.IFBench.pinned_urls[chat_if.IFBENCH_TEST_URL]
+    data = tmp_path / "IFBench_test.jsonl"
+    with urllib.request.urlopen(url, timeout=60) as f:
+        data.write_bytes(f.read())
+    assert hashlib.sha256(data.read_bytes()).hexdigest() == sha
+    env = dict(os.environ, NLTK_DATA=chat_if.IFBENCH_NLTK_DATA, HOME=str(tmp_path))
+    r = subprocess.run(
+        [sys.executable, "-c", IFBENCH_VERIFY, str(data)], cwd=chat_if.IFBENCH_DIR, env=env,
+        capture_output=True, text=True, timeout=900,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr[-3000:]
+    report = json.loads(r.stdout.strip().splitlines()[-1])
+    assert report["rows"] == 300 and len(report["instructions"]) > 50
+    assert report["failed"] == {}
+    assert all(p.startswith(chat_if.IFBENCH_NLTK_DATA + "/") for p in report["nltk"].values()), report["nltk"]
