@@ -67,6 +67,53 @@ def test_pass_hat_k_and_summary():
     assert s["pass_hat_1"] == 0.75 and s["pass_hat_2"] == 0.5
     assert s["per_trial_pass_1"] == [1.0, 0.5]
     assert s["statuses"] == {"fail": 1, "success": 3}
+    assert (s["simulations_failed"], s["simulations_total"]) == (0, 4)
+
+
+def test_failed_simulations_are_left_out_as_the_harness_does():
+    recs = [
+        {"task_id": "a", "trial": 0, "reward": 1.0, "status": "success"},
+        {"task_id": "a", "trial": 1, "reward": 0.0, "status": "error:infrastructure"},
+        {"task_id": "b", "trial": 0, "reward": 1.0, "status": "success"},
+        {"task_id": "b", "trial": 1, "reward": 0.0, "status": "fail"},
+        {"task_id": "c", "trial": 0, "reward": 0.0, "status": "error:ConnectionError"},
+        {"task_id": "c", "trial": 1, "reward": 0.0, "status": "error:budget_exhausted"},
+    ]
+    s = tau.domain_summary(recs, 2)
+    # a: 1/1, b: 1/2, c dropped (no trial ran); pass^2 undefined with a at one trial
+    assert s["pass_hat_1"] == 0.75 and "pass_hat_2" not in s
+    assert (s["n_tasks"], s["n_simulations"], s["simulations_failed"], s["simulations_total"]) == (2, 3, 3, 6)
+    assert s["avg_reward"] == pytest.approx(2 / 3) and s["per_trial_pass_1"] == [1.0, 0.0]
+
+
+def _run_with(tmp_path, monkeypatch, fail, **options):
+    b = _bench("tau3-airline", tmp_path, repeats=2, options={"user_model": "self", **options})
+    monkeypatch.setattr(b, "load_tasks", lambda: ({"airline": [_T(i) for i in range(10)]}, tau.TAU2_REPO, "c"))
+    monkeypatch.setattr(tau, "install_hooks", lambda: None)
+
+    def sim(domain, task, trial, seed, agent, user, judge):
+        bad = (task.id, trial) in fail
+        return {"domain": domain, "task_id": task.id, "trial": trial, "reward": 0.0 if bad else 1.0,
+                "status": "error:infrastructure" if bad else "success", "usage": tau._zero_usage()}
+
+    monkeypatch.setattr(b, "_simulation", sim)
+    return b.run("http://vllm/v1", "served")
+
+
+def test_failure_threshold_and_incomplete(tmp_path, monkeypatch):
+    out = _run_with(tmp_path, monkeypatch, set())
+    assert (out["value"], out["simulations_failed"], out["simulations_total"], out["incomplete"]) == (1.0, 0, 20, False)
+    out = _run_with(tmp_path, monkeypatch, {("3", 1)}, max_failed_frac="0.1")
+    # the failed trial is no loss: every scored simulation succeeded
+    assert (out["value"], out["n"], out["simulations_failed"], out["incomplete"]) == (1.0, 10, 1, True)
+    assert out["domains"]["airline"]["simulations_failed"] == 1
+    assert _run_with(tmp_path, monkeypatch, {("3", 1)})["incomplete"]  # 1/20: at the default 0.05
+    with pytest.raises(SystemExit, match="simulations_failed 2/20"):
+        _run_with(tmp_path, monkeypatch, {("3", 1), ("4", 0)})
+    with pytest.raises(SystemExit):
+        _run_with(tmp_path, monkeypatch, {("3", 1)}, max_failed_frac="0")
+    with pytest.raises(SystemExit, match="no simulation scored"):
+        _run_with(tmp_path, monkeypatch, {(str(i), k) for i in range(10) for k in range(2)}, max_failed_frac="1")
 
 
 def test_usage_counts_cached_tokens():
@@ -294,10 +341,8 @@ def test_budget_exhausted_stops_paid_calls(tmp_path, fake_llm, monkeypatch):
     monkeypatch.setenv("SAGE2_SPEND_BUDGET_USD", "50")
     opts = {"user_base_url": fake_llm, "max_retries": "0"}
     b = _bench("tau3-airline", tmp_path / "run", limit=2, repeats=1, dataset=str(_data_dir()), options=opts)
-    with meter.Meters(b.config.options, {}):
-        out = b.run(fake_llm, "granite")
-    assert out["budget_exhausted"]
-    assert out["domains"]["airline"]["statuses"] == {"error:budget_exhausted": 2}
+    with meter.Meters(b.config.options, {}), pytest.raises(SystemExit, match="402.*2 simulations not run"):
+        b.run(fake_llm, "granite")
     assert not [c for c in _FakeLLM.calls if c["model"] == "aws/claude-sonnet-5"]
     assert not list((tmp_path / "run").rglob("*.json"))  # nothing saved: rerunnable
 

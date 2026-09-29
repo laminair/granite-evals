@@ -20,6 +20,14 @@ banking is scored separately (web/leaderboard/src/components/Leaderboard.jsx).
 
 Everything is written under ``<output_dir>/<domain>/trial-<k>/<task>.json``;
 finished simulations are skipped on restart.
+
+A simulation that fails (an exception, the harness's infrastructure_error) is
+not a model failure: as the harness does, it is left out of pass^k and the
+average reward, and it is not saved, so a restart retries it. Each domain
+reports ``simulations_failed`` / ``simulations_total``; above ``--option
+max_failed_frac`` (default 0.05; 0 = any failure) in any domain the run fails,
+below it the result is flagged ``incomplete``. A 402 (paid budget exhausted)
+fails the run.
 """
 
 from __future__ import annotations
@@ -41,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar
 
 from sage2_evals import data, meter
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, failure_policy, register
 
 log = logging.getLogger(__name__)
 
@@ -269,22 +277,36 @@ def pass_hat_k(num_trials: int, successes: int, k: int) -> float:
     return comb(successes, k) / comb(num_trials, k) if num_trials >= k else float("nan")
 
 
+def is_failed(record: dict) -> bool:
+    """A simulation that never ran to a reward: an exception here, or the
+    harness's INFRASTRUCTURE_ERROR (which tau2's run_with_retry makes of one,
+    runner/progress.py:19-51), a 402 included. Never persisted, so retried."""
+    return record["status"].startswith("error:")
+
+
 def domain_summary(records: list[dict], trials: int) -> dict[str, Any]:
-    """pass^k and average reward over the (task, trial) records of one domain."""
+    """pass^k and average reward over the (task, trial) records of one domain,
+    as tau2's get_metrics_df: failed simulations are left out
+    (agent_metrics.py:138-145), and pass^k goes up to the fewest trials a task
+    has left (:158-165); a task with none left drops out."""
+    scored = [r for r in records if not is_failed(r)]
     by_task: dict[str, list[dict]] = {}
-    for r in records:
+    for r in scored:
         by_task.setdefault(r["task_id"], []).append(r)
-    rewards = [r["reward"] for r in records]
+    rewards = [r["reward"] for r in scored]
     out: dict[str, Any] = {
         "n_tasks": len(by_task),
-        "n_simulations": len(records),
+        "n_simulations": len(scored),
+        "simulations_failed": len(records) - len(scored),
+        "simulations_total": len(records),
         "avg_reward": sum(rewards) / len(rewards) if rewards else 0.0,
     }
-    for k in range(1, trials + 1):
+    max_k = min((len(rs) for rs in by_task.values()), default=0)
+    for k in range(1, max_k + 1):
         vals = [pass_hat_k(len(rs), sum(is_success(r["reward"]) for r in rs), k) for rs in by_task.values()]
-        out[f"pass_hat_{k}"] = sum(vals) / len(vals) if vals else 0.0
+        out[f"pass_hat_{k}"] = sum(vals) / len(vals)
     out["per_trial_pass_1"] = [
-        _mean([is_success(r["reward"]) for r in records if r["trial"] == t]) for t in range(trials)
+        _mean([is_success(r["reward"]) for r in scored if r["trial"] == t]) for t in range(trials)
     ]
     out["statuses"] = _count(r["status"] for r in records)
     out["termination_reasons"] = _count(r.get("termination_reason") or "none" for r in records)
@@ -435,20 +457,32 @@ class Tau3(Benchmark):
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
             records = list(pool.map(one, jobs))
         if budget_exhausted.is_set():
-            log.error("%s: the paid API budget is exhausted (HTTP 402); unfinished simulations "
-                      "are not scored and not saved. Do not rerun paid jobs.", self.id)
+            # The simulations cut short are not saved: a rerun with budget retries them.
+            raise SystemExit(f"{self.id}: the paid API budget is exhausted (HTTP 402); "
+                             f"{sum(map(is_failed, records))} simulations not run, nothing scored")
 
         per_domain = {}
+        max_frac = self.opt("max_failed_frac", 0.05)
         for d in tasks:
             summary = domain_summary([r for r in records if r["domain"] == d], self.repeats)
             per_domain[d] = summary
+            if summary["simulations_failed"]:
+                log.warning("%s %s: %d/%d simulations failed, left out of the score; rerun to retry them",
+                            self.id, d, summary["simulations_failed"], summary["simulations_total"])
+            # per domain: failures in one domain must not hide behind another's successes
+            failure_policy(f"{self.id} {d}", "simulations", summary["simulations_failed"],
+                           summary["simulations_total"], max_frac)  # fmt: skip
+            if not summary["n_simulations"]:
+                raise SystemExit(f"{self.id} {d}: no simulation scored")
             log.info("%s %s: pass^1=%.4f over %d tasks", self.id, d, summary["pass_hat_1"], summary["n_tasks"])
+        policy = failure_policy(self.id, "simulations", sum(map(is_failed, records)), len(records), max_frac)
         value = _mean([per_domain[d]["pass_hat_1"] for d in tasks])
         usage = {role: sum_usage([r["usage"][role] for r in records]) for role in ("agent", "user_sim", "judge")}
         n_sims = len(records)
         return {
             "value": value,
-            "n": sum(len(ts) for ts in tasks.values()),
+            "n": sum(per_domain[d]["n_tasks"] for d in tasks),  # tasks with a scored simulation
+            **policy,
             "dataset": source,
             "dataset_revision": revision,
             "harness": {"repo": TAU2_REPO, "commit": TAU2_COMMIT, "version": "1.0.1"},
@@ -472,7 +506,6 @@ class Tau3(Benchmark):
             "agent_usage": usage["agent"],
             "user_sim_usage_per_simulation": {k: v / n_sims for k, v in usage["user_sim"].items()} if n_sims else {},
             "tasks": {d: [t.id for t in ts] for d, ts in tasks.items()},
-            "budget_exhausted": budget_exhausted.is_set(),
         }
 
     def retrieval_config(self) -> str:
