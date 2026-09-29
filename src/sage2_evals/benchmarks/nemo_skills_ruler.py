@@ -15,10 +15,39 @@ The data depend on the tokenizer, so they are generated in the job (a few minute
 at 128k) and cached under ``<output_dir>/ns-data`` keyed by the RULER commit,
 length and tokenizer; ``--limit N`` takes the first N samples of *each* task.
 
-Options: ``tokenizer`` (default: ``--model``), ``enable_thinking`` (default: the
-chat template's default, i.e. on for Granite), ``tasks`` (comma-separated subset,
-for debugging; the headline then averages only those), ``ruler_dir``, the
-sampling options and ``ns.<key>=<value>`` of the NeMo-Skills family, and
+Thinking (a Sage2 decision, and a departure from ns/RULER). ns's RULER setup is
+for non-reasoning generation: RULER's answer prefix is prefilled after the chat
+template and each task gets a few dozen tokens (``tokens_to_generate``: niah 128,
+vt 30, cwe 120, fwe 50, qa 32). A thinking model then writes its answer inside a
+cut-off thinking block, or not at all. So with thinking on (the chat template's
+default for Granite: ``enable_thinking`` unset or true):
+
+* the data are ns's own ``--data_format chat``: no answer-prefix prefill, the chat
+  endpoint, and the chat template's thinking;
+* each task generates ``thinking_budget`` (default ``DEFAULT_THINKING_BUDGET``)
+  plus its ns/RULER answer budget;
+* only the post-thinking content is scored. ns scores ``generation``, which is the
+  message content after vLLM's reasoning parser; the thinking goes to
+  ``reasoning_content``. A generation cut off inside its thinking has no content
+  and scores 0, so a needle quoted in the thinking cannot match. A ``<think>`` or
+  ``</think>`` in any ``generation`` (no reasoning parser) fails the run.
+
+RULER's samples fill ``max_seq_length`` minus the answer budget, so thinking needs
+``max_seq_length + thinking_budget`` of served context. When the server has less
+(granite-4.2-3b has 131072 positions and no rope scaling, so it cannot do this at
+128k), the run stops before building data and names the options. One is
+``--option sample_length=N``, which builds shorter samples. That is a second
+departure: the headline is then RULER at N tokens, not at ``max_seq_length``.
+``enable_thinking=false`` runs ns's RULER exactly (text endpoint, answer prefix,
+task budgets). results.json records ``thinking`` (mode, budget, per-task
+``tokens_to_generate``, data format, scoring source, cut-off counts and token
+percentiles) and ``departures``.
+
+Options: ``tokenizer`` (default: ``--model``), ``enable_thinking``,
+``thinking_budget``, ``sample_length`` (default ``max_seq_length``), ``tasks``
+(comma-separated subset, for debugging; the headline then averages only those),
+``ruler_dir``, the sampling options and ``ns.<key>=<value>`` of the NeMo-Skills
+family (``max_tokens`` replaces every task's ``tokens_to_generate``), and
 ``answers=gold`` (serves each sample's expected outputs; needs a tokenizer but no
 GPU).
 """
@@ -94,6 +123,20 @@ TASKS = (
 NUM_SAMPLES = 100
 TEMPLATE_TOKENS = 50
 
+TOKENS_TO_GENERATE = {"niah": 128, "vt": 30, "cwe": 120, "fwe": 50, "qa": 32}
+"""ns/RULER's per-task answer budget (ns prepare.py). RULER sizes each sample to
+leave room for it within ``max_seq_length``."""
+
+DEFAULT_THINKING_BUDGET = 32768
+"""Thinking tokens added to each task's answer budget when thinking is on. From the
+granite-4.2-3b RULER-64k thinking smoke (BV 1957312: 5 samples x 13 tasks, chat
+format, 32768-token cap): generated tokens p50 1696, p90 17943, p95 26369; the
+longest completed generation 26369. The 3 of 65 that hit the cap were degenerate
+loops (re-quoting the haystack, a repeated "> ..." line), which a larger budget
+would not rescue."""
+
+SCORING_SOURCE = "generation: message content after the vLLM reasoning parser (reasoning_content not scored)"
+
 
 class RulerBenchmark(NemoSkillsBenchmark):
     """RULER at one context length; subclasses set ``id`` and ``max_seq_length``."""
@@ -120,8 +163,51 @@ class RulerBenchmark(NemoSkillsBenchmark):
             raise SystemExit(f"{self.id}: unknown RULER tasks {unknown}; known: {', '.join(TASKS)}")
         return tasks
 
+    def thinking(self) -> bool:
+        """Thinking on unless ``enable_thinking=false`` (the chat template's default is on)."""
+        return self.opt("enable_thinking", True)
+
+    def thinking_budget(self) -> int:
+        return self.opt("thinking_budget", DEFAULT_THINKING_BUDGET) if self.thinking() else 0
+
+    def data_format(self) -> str:
+        """ns prepare's format: ``chat`` for thinking, ns's ``default`` (answer prefix) otherwise."""
+        return "chat" if self.thinking() else "default"
+
+    def sample_length(self) -> int:
+        n = self.opt("sample_length", self.max_seq_length)
+        if not 0 < n <= self.max_seq_length:
+            raise SystemExit(f"{self.id}: sample_length={n} must be in 1..{self.max_seq_length}")
+        return n
+
     def setup_name(self) -> str:
-        return f"sage2_{self.max_seq_length}"
+        return f"sage2_{self.sample_length()}" + ("_chat" if self.data_format() == "chat" else "")
+
+    def tokens_to_generate(self, task: str) -> int:
+        """The task's generation budget: ns/RULER's answer budget plus the thinking
+        budget, or ``max_tokens`` for every task."""
+        s = self.sampling()
+        if s["max_tokens"] is not None:
+            return s["max_tokens"]
+        return TOKENS_TO_GENERATE[task.split("_")[0]] + self.thinking_budget()
+
+    def required_context(self) -> int:
+        """Served context for a full sample plus the largest generation beyond the
+        answer budget that RULER already left room for."""
+        extra = max(self.tokens_to_generate(t) - TOKENS_TO_GENERATE[t.split("_")[0]] for t in self.tasks())
+        return self.sample_length() + max(extra, 0)
+
+    def departures(self) -> list[str]:
+        out = []
+        if self.thinking():
+            out.append(
+                f"thinking on: ns --data_format chat (no answer-prefix prefill); tokens_to_generate = "
+                f"thinking_budget {self.thinking_budget()} + ns/RULER answer budget (ns/RULER: the answer "
+                "budget only, for non-reasoning generation); scored on the post-thinking content only"
+            )
+        if self.sample_length() != self.max_seq_length:
+            out.append(f"samples built at {self.sample_length()} tokens, not {self.max_seq_length}")
+        return out
 
     def ruler_dir(self) -> Path:
         return Path(self.opt("ruler_dir", RULER_DIR))
@@ -160,8 +246,9 @@ class RulerBenchmark(NemoSkillsBenchmark):
         spec = {
             "ns_commit": NS_COMMIT,
             "ruler_commit": RULER_COMMIT,
-            "max_seq_length": self.max_seq_length,
+            "max_seq_length": self.sample_length(),
             "template_tokens": TEMPLATE_TOKENS,
+            "data_format": self.data_format(),
             "num_samples": NUM_SAMPLES,
             "tasks": tasks,
             **self.tokenizer_fingerprint(),
@@ -214,8 +301,9 @@ class RulerBenchmark(NemoSkillsBenchmark):
         (shim / "pip").chmod(0o755)
         argv = [
             "--setup", self.setup_name(),
-            "--max_seq_length", str(self.max_seq_length),
+            "--max_seq_length", str(self.sample_length()),
             "--template_tokens", str(TEMPLATE_TOKENS),
+            "--data_format", self.data_format(),
             "--tmp_data_dir", str(tmp),
             "--tasks", *tasks,
             # passed through to RULER's prepare.py
@@ -234,9 +322,16 @@ class RulerBenchmark(NemoSkillsBenchmark):
     # -- 2. generation -------------------------------------------------------
 
     def task_generation_args(self, setup_dir: Path, task: str) -> list[str]:
-        """The task's ns GENERATION_ARGS (written by prepare), plus sampling."""
+        """The task's ns GENERATION_ARGS (written by prepare), plus sampling and
+        the generation budget (Hydra: the last override wins)."""
         module = runpy.run_path(str(setup_dir / task / "__init__.py"))
         args = shlex.split(module.get("GENERATION_ARGS", ""))
+        prefilled = any(a.startswith("++start_assistant_response_key=") for a in args)
+        if prefilled == (self.data_format() == "chat"):
+            raise SystemExit(
+                f"{self.id}: {setup_dir / task} is not ns's {self.data_format()!r} RULER format "
+                f"(thinking {'on' if self.thinking() else 'off'}); rebuild the data or set enable_thinking"
+            )
         s = self.sampling()
         args += [
             f"++tokenizer={self.tokenizer()}",
@@ -244,29 +339,76 @@ class RulerBenchmark(NemoSkillsBenchmark):
             f"++inference.top_p={_hydra(s['top_p'])}",
             f"++inference.top_k={s['top_k']}",
         ]
-        if s["max_tokens"] is not None:  # the task's tokens_to_generate otherwise
-            args.append(f"++inference.tokens_to_generate={s['max_tokens']}")
+        if self.data_format() == "chat":
+            args.append("++inference.endpoint_type=chat")
+        if s["max_tokens"] is not None or self.data_format() == "chat":  # ns's task value otherwise
+            args.append(f"++inference.tokens_to_generate={self.tokens_to_generate(task)}")
         if "enable_thinking" in self.config.options:
             args.append(f"++chat_template_kwargs.enable_thinking={str(self.opt('enable_thinking', True)).lower()}")
         return args + _passthrough(self.config.options, "ns.")
 
     def check_context(self, base_url: str, served: str) -> int | None:
-        """The served max_model_len must hold a full-length sample."""
+        """The served max_model_len must hold a full sample plus the thinking budget."""
         with contextlib.suppress(httpx.HTTPError, ValueError, KeyError):
             models = httpx.get(base_url.rstrip("/") + "/models", timeout=30).json()["data"]
             lens = [m.get("max_model_len") for m in models if m.get("id") == served] or [m.get("max_model_len") for m in models]
             n = next((x for x in lens if x), None)
-            if n is not None and n < self.max_seq_length:
+            need, extra = self.required_context(), self.required_context() - self.sample_length()
+            if n is not None and n < need:
+                msg = f"{self.id}: {served} is served with max_model_len={n} < {need}"
+                if not extra:
+                    raise SystemExit(f"{msg}; serve with --max-model-len {need}")
                 raise SystemExit(
-                    f"{self.id}: {served} is served with max_model_len={n} < {self.max_seq_length}; "
-                    f"serve with --max-model-len {self.max_seq_length}"
+                    f"{msg} ({self.sample_length()}-token samples + {extra} generated tokens beyond RULER's answer "
+                    f"budget). Serve with --max-model-len {need} if the model supports it; otherwise "
+                    f"--option sample_length={n - extra} (shorter samples: a departure), a smaller "
+                    "--option thinking_budget, or --option enable_thinking=false (ns's RULER)"
                 )
             return n
         return None
 
+    def check_generations(self, output: Path) -> None:
+        """Only post-thinking content is scored: a think tag in ``generation`` means
+        the reasoning was not split off, and ns's substring match would see it."""
+        tags = ("<think>", "</think>")
+        bad = [r.get("index") for r in _read_jsonl(output) if any(t in (r.get("generation") or "") for t in tags)]
+        if bad:
+            raise RuntimeError(
+                f"{self.id}: {output}: think tags in 'generation' for samples {bad[:10]}: the reasoning was not "
+                "split off (serve with the model's --reasoning-parser); not scoring thinking"
+            )
+
+    def thinking_record(self, out: Path, tasks: list[str]) -> dict[str, Any]:
+        """What was generated and scored: mode, budgets, cut-offs, token percentiles."""
+        per_task = {}
+        for t in tasks:
+            rows = [r for k in range(self.repeats) for r in _read_jsonl(out / t / f"output-rs{k}.jsonl")]
+            toks = sorted(int(r.get("num_generated_tokens") or 0) for r in rows)
+            cut = [r for r in rows if r.get("finish_reason") == "length"]
+            per_task[t] = {
+                "tokens_to_generate": self.tokens_to_generate(t),
+                "generations": len(rows),
+                # cut off before any content: nothing to score (0)
+                "length_no_content": sum(not (r.get("generation") or "").strip() for r in cut),
+                "length_with_content": sum(bool((r.get("generation") or "").strip()) for r in cut),
+                "with_reasoning": sum(bool(r.get("reasoning_content")) for r in rows),
+                "generated_tokens": _percentiles(toks),
+            }
+        return {
+            "enabled": self.thinking(),
+            "enable_thinking": self.config.options.get("enable_thinking", "unset (chat template default)"),
+            "budget": self.thinking_budget(),
+            "data_format": self.data_format(),
+            "endpoint": "chat" if self.data_format() == "chat" else "text (answer prefix prefilled)",
+            "scoring_source": SCORING_SOURCE,
+            "per_task": per_task,
+        }
+
     # -- entry point ---------------------------------------------------------
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
+        # Before building (128k) data for a server that cannot hold it.
+        max_model_len = None if self.gold else self.check_context(base_url, served_model_name)
         setup_dir, provenance = self.prepare_data()
         tasks = self.tasks()
         out = self.config.output_dir / "ruler"
@@ -279,17 +421,15 @@ class RulerBenchmark(NemoSkillsBenchmark):
         n = sum(len(_read_jsonl(p)) for p in inputs.values())
         log.info("%s: %d tasks, %d samples x %d repeats", self.id, len(tasks), n, self.repeats)
 
-        max_model_len = None
         with contextlib.ExitStack() as stack:
             if self.gold:
                 all_rows = [r for p in inputs.values() for r in _read_jsonl(p)]
                 base_url = stack.enter_context(RulerGoldServer(all_rows)).base_url
                 served_model_name = "gold"
-            else:
-                max_model_len = self.check_context(base_url, served_model_name)
             for t in tasks:
                 for k in range(self.repeats):
                     self._generate_task(setup_dir, t, inputs[t], base_url, served_model_name, k)
+                    self.check_generations(inputs[t].parent / f"output-rs{k}.jsonl")
 
         agg = self.aggregation()
         per_task, per_task_metrics = {}, {}
@@ -319,7 +459,11 @@ class RulerBenchmark(NemoSkillsBenchmark):
             "ns_benchmark": f"ruler.{self.setup_name()}",
             "ns_metric": {"aggregation": agg, "key": "accuracy", "raw": raw, "scale": self.value_scale, "score": "ruler_score"},
             "max_seq_length": self.max_seq_length,
+            "sample_length": self.sample_length(),
             "served_max_model_len": max_model_len,
+            "required_context": self.required_context(),
+            "thinking": self.thinking_record(out, tasks),
+            "departures": self.departures(),
             "tasks": tasks,
             "partial_task_set": set(tasks) != set(TASKS),
             "per_task": per_task,
@@ -350,6 +494,13 @@ class RulerBenchmark(NemoSkillsBenchmark):
         ]  # fmt: skip
         _run_ns(cmd, output, log_path=output.parent / f"output-rs{k}.log", what=f"{self.id} {task} rs{k}")
         log.info("%s %s repeat %d: generated %s", self.id, task, k, _status_line(output))
+
+
+def _percentiles(sorted_toks: list[int]) -> dict[str, int]:
+    if not sorted_toks:
+        return {"p50": 0, "p95": 0, "max": 0}
+    last = len(sorted_toks) - 1
+    return {"p50": sorted_toks[round(0.5 * last)], "p95": sorted_toks[round(0.95 * last)], "max": sorted_toks[-1]}
 
 
 def _reset_task_if_input_changed(task_dir: Path) -> None:

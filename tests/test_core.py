@@ -143,3 +143,13 @@ def test_cli_list(capsys):
     out = capsys.readouterr().out
     assert "[x] swebench-verified" in out
     assert "[x] birdbench" in out
+
+
+def test_dockerfile_extras_run_without_project_uv_config():
+    """docker/extras/<extra>.sh run from the project dir; UV_NO_CONFIG keeps a separate
+    env they build from inheriting this project's [tool.uv] overrides."""
+    from pathlib import Path
+
+    text = (Path(__file__).parents[1] / "docker" / "Dockerfile").read_text()
+    run = next(line for line in text.splitlines() if "/tmp/extras/${EXTRA}.sh" in line and line.startswith("RUN"))
+    assert "UV_NO_CONFIG=1 bash" in run

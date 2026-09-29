@@ -23,6 +23,13 @@ SciCode (``scicode``)
     sandbox is a no-op shim, so the evaluator's own ``pip install`` calls cannot
     change the pinned environment at run time.
 
+    Departure from ns (``prefill_fixes``, on by default): the harness-supplied code
+    of steps 13.6 and 62.1 is SciCode's original ``eval/data`` file (``class
+    Maxwell``; ``class Block`` and ``class EnlargedBlock``), not ns's lone
+    ``__init__``, which leaves 13.8-13.15 and 62's later steps unable to find the
+    class. SciCode's own harness has the same defect. See ``scicode_prefill.py``;
+    results.json lists each fix under ``prefill_fixes``.
+
 Gold (``--option answers=gold``): LiveCodeBench has no reference solutions, so
 five hand-written, hand-checked solutions (``LCB_GOLD``) run through the real
 prompt -> generate -> evaluate path; SciCode serves each subtask's
@@ -41,6 +48,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterator
 
+from sage2_evals.benchmarks import scicode_prefill
 from sage2_evals.benchmarks.nemo_skills import (
     NemoSkillsBenchmark,
     _free_port,
@@ -181,6 +189,25 @@ class SciCode(NemoSkillsBenchmark):
         # Only the validation problems ("dev") ship reference code.
         return "dev" if self.gold else super().split()
 
+    def fixes_prefill(self) -> bool:
+        return str(self.opt("prefill_fixes", True)).lower() not in ("false", "0", "no", "off")
+
+    def generation_module(self) -> str:
+        """ns's SciCode generation, behind scicode_prefill (restores the classes of
+        prefilled steps 13.6 and 62.1) unless ``prefill_fixes=false``."""
+        module = super().generation_module()
+        if self.fixes_prefill():
+            if module != scicode_prefill.NS_SCICODE_MODULE:
+                raise RuntimeError(f"{self.id}: prefill fixes wrap {scicode_prefill.NS_SCICODE_MODULE}, not {module}")
+            return "sage2_evals.benchmarks.scicode_prefill"
+        return module
+
+    def prefill_record(self) -> dict[str, Any]:
+        from nemo_skills.inference.eval.scicode_utils import prefilled_steps_code
+
+        fixes = scicode_prefill.plan(prefilled_steps_code)[1] if self.fixes_prefill() else []
+        return {"prefill_fixes": fixes, "prefill_fixes_enabled": self.fixes_prefill()}
+
     def sandbox_python(self) -> Path:
         python = Path(self.opt("sandbox_env", SANDBOX_ENV)) / "bin" / "python"
         if not python.exists():
@@ -282,6 +309,7 @@ class SciCode(NemoSkillsBenchmark):
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         result = super().run(base_url, served_model_name)
         result["sandbox"] = getattr(self, "_sandbox_report", {})
+        result.update(self.prefill_record())
         return result
 
     def _generate(self, input_file: Path, output: Path, base_url: str, served: str, k: int, sandbox_args) -> None:
