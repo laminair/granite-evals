@@ -32,9 +32,11 @@ RUN uv sync --locked --no-install-project --no-dev --extra serve
 
 ARG EXTRA=swebench
 
-# Family-specific system setup (docker/extras/README.md).
+# Family-specific system setup (docker/extras/README.md). UV_NO_CONFIG: the scripts
+# run from WORKDIR, and uv would otherwise apply this project's [tool.uv] settings
+# (override-dependencies numpy>=2) to any separate env they build.
 COPY docker/extras /tmp/extras
-RUN if [ -f "/tmp/extras/${EXTRA}.sh" ]; then bash -euxo pipefail "/tmp/extras/${EXTRA}.sh"; fi \
+RUN if [ -f "/tmp/extras/${EXTRA}.sh" ]; then UV_NO_CONFIG=1 bash -euxo pipefail "/tmp/extras/${EXTRA}.sh"; fi \
     && rm -rf /tmp/extras /var/lib/apt/lists/*
 
 RUN uv sync --locked --no-install-project --no-dev --extra serve --extra "${EXTRA}"
