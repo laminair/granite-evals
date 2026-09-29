@@ -84,6 +84,27 @@ class Benchmark(abc.ABC):
         return True
 
 
+def failure_policy(
+    benchmark_id: str, what: str, failed: int, total: int, max_frac: float, *, failed_key: str = ""
+) -> dict[str, Any]:
+    """The one rule for judged and infra-dependent benchmarks.
+
+    A failed item (judge error, unparseable judgement, infrastructure error,
+    402 budget exhaustion) is never scored as a model loss: the caller leaves
+    it out of the score, as upstream does, and resume retries it. This
+    reports ``<what>_failed`` (or ``failed_key``) and ``<what>_total``, flags
+    ``incomplete`` when any failed, and exits with an error when the failed
+    fraction exceeds ``max_frac`` (0 = any failure is fatal).
+    """
+    key = failed_key or f"{what}_failed"
+    if failed and (not total or failed / total > max_frac):
+        raise SystemExit(
+            f"{benchmark_id}: {key} {failed}/{total} is above the allowed fraction {max_frac}; "
+            "rerun to retry the failed ones"
+        )
+    return {key: failed, f"{what}_total": total, "incomplete": failed > 0}
+
+
 def register(cls: type[Benchmark]) -> type[Benchmark]:
     if cls.id in _REGISTRY:
         raise ValueError(f"duplicate benchmark id {cls.id!r}")

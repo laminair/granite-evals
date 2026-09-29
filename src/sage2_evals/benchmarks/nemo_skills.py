@@ -18,6 +18,10 @@ server the step already started (no Slurm, no NeMo-Run cluster config):
 3. judge (judge benchmarks only): ns's judge module (JUDGE_PIPELINE_ARGS, e.g.
    ``nemo_skills.inference.eval.arena_judge``) over the generations, against the
    judge endpoint, through a local proxy that records the judge's token usage.
+   A judgement ns cannot score (a failed call, no verdict) is left out of the
+   score, as ns does, counted in ``details.judge_invalid`` / ``judge_total``, and
+   re-judged on resume; above ``max_judge_invalid_frac`` the run fails, below it
+   the result is flagged ``incomplete``.
 4. metrics: ns's ``ComputeMetrics`` over all repeats. ``value`` is
    ``metrics["_all_"][<aggregation>][<ns_metric>]`` scaled to a fraction; the
    full ns metrics dict (all aggregations, subsets) goes to ``details``.
@@ -71,6 +75,7 @@ Options (``--option k=v``): ``temperature``, ``top_p``, ``top_k``,
 ``ns.chat_template_kwargs.enable_thinking=false``), and for judges
 ``judge_base_url``, ``judge_model`` (``self`` = the served model),
 ``judge_api_key_env``, ``judge_max_tokens``, ``judge_workers``,
+``max_judge_invalid_frac`` (default 0.05; 0 = any invalid judgement fails),
 ``judge.<key>=<value>`` (any ns override for the judge step).
 """
 
@@ -95,7 +100,7 @@ from typing import Any, ClassVar, Iterator
 import httpx
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, failure_policy, register
 
 log = logging.getLogger(__name__)
 
@@ -472,10 +477,10 @@ class NemoSkillsBenchmark(Benchmark):
         if ep["api_key_env"] and not key:
             raise SystemExit(f"{self.id}: judge key env {ep['api_key_env']} is empty (or use judge_model=self)")
         usage_log = self.config.output_dir / "judge" / "usage.jsonl"
+        files = [judged_dir / f"output-rs{k}.jsonl" for k in range(self.repeats)]
         with _MeteringProxy(self.judge_upstream(ep), key, usage_log) as proxy:
-            for k in range(self.repeats):
-                out = judged_dir / f"output-rs{k}.jsonl"
-                if out.exists():
+            for k, out in enumerate(files):
+                if out.exists() and not self._retry_invalid(out):
                     continue
                 cmd = [
                     sys.executable, "-m", self.judge_module(),
@@ -490,17 +495,27 @@ class NemoSkillsBenchmark(Benchmark):
                     f"++max_concurrent_requests={self.opt('judge_workers', self.config.workers)}",
                     *self.judge_overrides(),
                 ]  # fmt: skip
-                try:
-                    _run_ns(cmd, out, log_path=judged_dir / f"output-rs{k}.log", what=f"{self.id} judge rs{k}")
-                finally:
-                    if proxy.budget_exhausted:
-                        # Soft-failed judgments would score as losses: stop, and set the
-                        # half-judged file aside so no later run scores it.
-                        if out.exists():
-                            out.rename(out.with_name(out.name + ".budget-exhausted"))
-                        raise SystemExit(f"{self.id}: judge refused with HTTP 402, spend budget exhausted; stopping")
+                _run_ns(cmd, out, log_path=judged_dir / f"output-rs{k}.log", what=f"{self.id} judge rs{k}")
                 log.info("%s repeat %d: judged %s", self.id, k, _status_line(out))
-        usage = judge_usage(usage_log, n_examples=sum(_count_lines(judged_dir / f"output-rs{k}.jsonl") for k in range(self.repeats)))
+                if proxy.budget_exhausted and k + 1 < self.repeats:
+                    # Every later call would be refused too. The judged file stays: its
+                    # refused judgements are invalid, and re-judged on resume.
+                    raise SystemExit(
+                        f"{self.id}: judge refused with HTTP 402, spend budget exhausted after repeat {k}; "
+                        "rerun to resume"
+                    )
+        failed = total = 0
+        for out in files:
+            for row in _read_jsonl(out):
+                f, t = self.judge_failures(row)
+                failed, total = failed + f, total + t
+        policy = failure_policy(
+            self.id, "judge", failed, total, self.opt("max_judge_invalid_frac", 0.05), failed_key="judge_invalid"
+        )
+        if failed:
+            log.warning("%s: %d/%d judgements invalid, left out of the score; rerun to re-judge them",
+                        self.id, failed, total)  # fmt: skip
+        usage = judge_usage(usage_log, n_examples=sum(_count_lines(f) for f in files))
         log.info("%s: judge usage %s", self.id, json.dumps(usage))
         return {
             "judge_model": ep["model"],
@@ -510,7 +525,29 @@ class NemoSkillsBenchmark(Benchmark):
             "judge_module": self.judge_module(),
             "judge_args": self.judge_overrides(),
             "judge_usage": usage,
+            **policy,
+            "judge_budget_exhausted": proxy.budget_exhausted,
         }
+
+    def judge_failures(self, row: dict) -> tuple[int, int]:
+        """(invalid, total) judgements in one judged row. An invalid judgement is
+        one ns leaves out of the score (a failed call, no parseable verdict)."""
+        return 0, 0
+
+    def _retry_invalid(self, out: Path) -> bool:
+        """Set up a judged file's invalid rows for re-judging; False if it has none.
+
+        The valid rows go back to ns's resume file (``<out>-async``, each at its
+        ``_async_position``, generate.py skip_completed_samples) and the final
+        file is removed, so ns with ``++skip_filled`` judges only the rest."""
+        rows = _read_jsonl(out)
+        keep = [{**r, "_async_position": i} for i, r in enumerate(rows) if not self.judge_failures(r)[0]]
+        if len(keep) == len(rows):
+            return False
+        log.info("%s: re-judging %d rows of %s with invalid judgements", self.id, len(rows) - len(keep), out.name)
+        _write_jsonl(out.with_name(out.name + "-async"), keep)
+        out.unlink()
+        return True
 
     # -- 4. metrics ----------------------------------------------------------
 
@@ -951,6 +988,10 @@ _ARENA_HARD = "https://raw.githubusercontent.com/lmarena/arena-hard-auto/{}/data
 _ARENA_HARD_COMMIT = "196f6b826783b3da7310e361a805fa36f0be83f3"
 
 
+_ARENA_VERDICTS = ("A=B", "A>B", "A>>B", "B>A", "B>>A")
+"""The verdicts ns's get_battles_from_judgment scores (evaluator/arena.py:103-158)."""
+
+
 def _arena_url(ref: str, path: str) -> str:
     return _ARENA_HARD.format(ref) + path
 
@@ -977,6 +1018,16 @@ class ArenaHardV2(NemoSkillsBenchmark):
         )
     }
     official_judge = "gpt-4.1 (arena-hard-auto v2.0; NeMo-Skills default)"
+
+    def judge_failures(self, row: dict) -> tuple[int, int]:
+        """Both judgements of a row, parsed as ns does (arena_metrics.py:34-44):
+        anything but the five verdicts is an invalid score, which ns counts and
+        leaves out of the battles (evaluator/arena.py:127-129, :152-154)."""
+        from nemo_skills.evaluation.metrics.arena_metrics import ArenaMetrics
+
+        parse = ArenaMetrics()._get_judge_score
+        scores = [parse(row.get(key) or "") for key in ("judgement-gen-base", "judgement-base-gen")]
+        return sum(s not in _ARENA_VERDICTS for s in scores), len(scores)
 
     def compute_metrics(self, files: list[Path]) -> dict[str, Any]:
         """ns's Bradley-Terry fit needs both outcomes in the sample; a small or
