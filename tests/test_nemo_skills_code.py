@@ -240,3 +240,45 @@ def test_scicode_sandbox_server_runs(ns, tmp_path):
         )
         # the env's bin comes first on the sandbox's PATH: its pip shim answers
         assert r.status_code == 200 and r.json()["stdout"].split() == ["hi", "shim"]
+
+
+def test_scicode_sandbox_app_is_outside_the_job_venv(ns, tmp_path):
+    """flask puts the top of an --app file's package on sys.path, so the server runs
+    from a lone copy: the job venv's site-packages must not shadow the sandbox env's."""
+    b = bench("scicode", tmp_path)
+    app = b.sandbox_app()
+    assert app.is_file() and not (app.parent / "__init__.py").exists()
+    assert "site-packages" not in str(app)
+    assert "TerminalInteractiveShell" in app.read_text()
+
+
+def test_sandbox_env_drops_the_job_python_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTHONPATH", "/job/site-packages")
+    monkeypatch.setenv("PYTHONHOME", "/job")
+    monkeypatch.setenv("VIRTUAL_ENV", "/job/.venv")
+    env = nsc.sandbox_env(tmp_path / "bin" / "python")
+    assert not {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"} & set(env)
+    assert env["PYTHONNOUSERSITE"] == "1" and env["PATH"].startswith(f"{tmp_path / 'bin'}:")
+
+
+@pytest.mark.skipif(not Path(nsc.SANDBOX_ENV, "bin", "python").exists(), reason="no image sandbox env")
+def test_image_sandbox_runs_its_own_scientific_stack(ns, tmp_path):
+    """In the image: the real sandbox env serves, and code it runs gets the env's
+    Python 3.10 with numpy 1.26.4 / scipy 1.10.1 (not the job venv's)."""
+    if sys.platform != "linux":
+        pytest.skip("ns's sandbox server sets RLIMIT_AS, which only Linux allows")
+    b = bench("scicode", tmp_path)
+    deps = "import numpy as np\nfrom scipy.special import erfc\nimport scipy.linalg"
+    report = b.sandbox_report([{"required_dependencies": deps}])
+    assert report["packages"]["numpy"] == "1.26.4" and report["packages"]["scipy"] == "1.10.1"
+    assert report["import_failures"] == {} and report["python"].startswith("3.10.")
+    code = "import sys, numpy, scipy.integrate\nprint(tuple(sys.version_info[:2]), numpy.__version__, scipy.__version__)"
+    with b.ns_sandbox() as args:
+        port = args[-1].split("=")[1]
+        r = httpx.post(
+            f"http://127.0.0.1:{port}/execute",
+            json={"generated_code": code, "language": "python", "timeout": 60},
+            timeout=120,
+        )
+    assert r.status_code == 200, r.text
+    assert r.json()["stdout"].strip() == "(3, 10) 1.26.4 1.10.1", r.json()
