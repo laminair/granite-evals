@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextlib
 import hashlib
 import json
 import logging
@@ -38,6 +37,7 @@ from typing import Any
 
 from sage2_evals import data
 from sage2_evals.registry import Benchmark, register
+from sage2_evals.sandbox.nodelock import async_node_locks
 
 log = logging.getLogger(__name__)
 
@@ -151,20 +151,31 @@ EXCLUDED: dict[str, str] = {
     "git-multibranch": _SSHD,
 }
 
-# Tasks whose services listen on fixed ports. The enroot sandbox shares the
-# host network, so these run one at a time (per sage2-evals process).
-HOST_PORT_TASKS = frozenset(
-    {
-        "headless-terminal",
-        "hf-model-inference",
-        "install-windows-3.11",
-        "kv-store-grpc",
-        "nginx-request-logging",
-        "pypi-server",
-        "qemu-alpine-ssh",
-        "qemu-startup",
-    }
-)
+# Tasks whose services listen on fixed ports (from their instructions, tests
+# and solutions). The enroot sandbox shares the host network, so each trial
+# holds a node-wide lock per port (sandbox.nodelock): tasks on the same port
+# never overlap, in this process or in another job on the node.
+HOST_PORTS: dict[str, tuple[int, ...]] = {
+    "headless-terminal": (8000,),  # python -m http.server 8000
+    "hf-model-inference": (5000,),  # flask API
+    "install-windows-3.11": (80, 5901, 8080),  # nginx, QEMU VNC :1, noVNC
+    "kv-store-grpc": (5328,),
+    "nginx-request-logging": (8080,),
+    "pypi-server": (8080,),
+    "qemu-alpine-ssh": (2222, 6665),  # hostfwd ssh, QEMU telnet console
+    "qemu-startup": (2222, 6665),
+}
+HOST_PORT_TASKS = frozenset(HOST_PORTS)
+# The lock of a task known to use fixed ports whose ports aren't listed.
+HOST_PORT_KEY = "tbench-host-port"
+
+
+def port_locks(name: str) -> list[str]:
+    """Node lock keys of a task: ``port-<n>`` (shared with other benchmarks'
+    locks on the same port), or none for a task on no fixed port."""
+    if name not in HOST_PORT_TASKS:
+        return []
+    return [f"port-{p}" for p in HOST_PORTS.get(name, ())] or [HOST_PORT_KEY]
 
 # Exception types harbor itself doesn't retry (RetryConfig default): outcomes
 # of the agent or the tests, not of the infrastructure.
@@ -417,13 +428,10 @@ class TerminalBench21(Benchmark):
 
     async def _run_all(self, tasks: list[dict], agent: dict, image_errors: dict[str, str]) -> list[dict]:
         sem = asyncio.Semaphore(self.config.workers)
-        port_lock = asyncio.Lock()
 
         async def one(task: dict, k: int) -> dict:
-            async with sem:
-                lock = port_lock if task["name"] in HOST_PORT_TASKS else contextlib.nullcontext()
-                async with lock:
-                    return await self._trial(task, k, agent, image_errors)
+            async with sem, async_node_locks(port_locks(task["name"]), what=f"{task['name']} repeat {k}"):
+                return await self._trial(task, k, agent, image_errors)
 
         # Repeat-major, so a partial run has whole repeats done first.
         jobs = [one(t, k) for k in range(self.repeats) for t in tasks]
