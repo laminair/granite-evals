@@ -345,17 +345,18 @@ def test_ifbench_puts_the_pinned_nltk_data_first(tmp_path, monkeypatch):
     assert seen["NLTK_DATA"].split(":") == [chat_if.IFBENCH_NLTK_DATA, "/elsewhere"]
 
 
-# Every instruction of IFBench's test data through its verifier, as ns's evaluator
+# Every instruction of the pinned IFBench test data (newer than the IFBench checkout
+# ns pins, whose own data/ has 294 prompts) through its verifier, as ns's evaluator
 # runs them (cwd = the IFBench checkout, the job's python), with the exceptions
 # ns's patch would swallow (scored "not followed") reported instead. nltk.download is
 # a no-op here: the pinned data must be enough, and a build-time test must not
 # change it.
 IFBENCH_VERIFY = r"""
-import json
+import json, sys
 import nltk
 nltk.download = lambda *a, **k: True
 import instructions_registry as reg
-rows = [json.loads(line) for line in open("data/IFBench_test.jsonl")]
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 response = (
     "Birds sing at dawn. Do you hear them? I walked to the river with Maria and John, and the water was cold.\n\n"
     "* Peter met them in Paris on 3 May 2024.\n* They counted 42 boats, 7 bridges and 1 dog!\n\n"
@@ -384,11 +385,19 @@ def test_ifbench_verifiers_run_in_the_image(tmp_path):
     import subprocess
     import sys
 
+    import hashlib
+    import urllib.request
+
     if not (chat_if.IFBENCH_DIR / "run_eval.py").is_file():
         pytest.skip("no IFBench checkout (built by docker/extras/ifbench.sh)")
+    url, sha = chat_if.IFBench.pinned_urls[chat_if.IFBENCH_TEST_URL]
+    data = tmp_path / "IFBench_test.jsonl"
+    with urllib.request.urlopen(url, timeout=60) as f:
+        data.write_bytes(f.read())
+    assert hashlib.sha256(data.read_bytes()).hexdigest() == sha
     env = dict(os.environ, NLTK_DATA=chat_if.IFBENCH_NLTK_DATA, HOME=str(tmp_path))
     r = subprocess.run(
-        [sys.executable, "-c", IFBENCH_VERIFY], cwd=chat_if.IFBENCH_DIR, env=env,
+        [sys.executable, "-c", IFBENCH_VERIFY, str(data)], cwd=chat_if.IFBENCH_DIR, env=env,
         capture_output=True, text=True, timeout=900,
     )  # fmt: skip
     assert r.returncode == 0, r.stderr[-3000:]
