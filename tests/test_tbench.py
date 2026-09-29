@@ -139,6 +139,56 @@ def test_infra_errors_retry_and_are_not_persisted(tmp_path, monkeypatch, caplog)
     assert (tmp_path / "out" / "repeat-0" / ".attempts").is_dir()  # earlier attempts kept
 
 
+def test_default_exclusions_are_reported(tmp_path, monkeypatch):
+    """The sshd tasks leave n and are listed with their reason in results."""
+    b = bench(tmp_path, ["git-multibranch", "a", "configure-git-webserver"], agent="oracle")
+    b.repeats = 1
+
+    async def run_trial(self, task, k, agent, repeat_dir):
+        return fake_result(1.0)
+
+    monkeypatch.setattr(tb.TerminalBench21, "_run_trial", run_trial)
+    out = b.run("", "")
+    assert out["n"] == 1 and out["n_total"] == 3 and out["tasks"] == ["a"]
+    assert out["excluded"] == {"configure-git-webserver": tb._SSHD, "git-multibranch": tb._SSHD}
+
+
+def test_fixed_port_tasks_hold_node_locks(tmp_path, monkeypatch):
+    """Trials on one port never overlap, here or in another job on the node."""
+    from sage2_evals.sandbox import nodelock
+
+    monkeypatch.setenv("SAGE2_LOCK_DIR", str(tmp_path))
+    assert tb.port_locks("pypi-server") == ["port-8080"] and tb.port_locks("a") == []
+    assert tb.port_locks("qemu-startup") == ["port-2222", "port-6665"]
+    assert set(tb.HOST_PORTS) == tb.HOST_PORT_TASKS and tb.HOST_PORT_TASKS.isdisjoint(tb.EXCLUDED)
+    monkeypatch.setattr(tb, "HOST_PORT_TASKS", tb.HOST_PORT_TASKS | {"unlisted"})
+    assert tb.port_locks("unlisted") == [tb.HOST_PORT_KEY]
+
+    real = nodelock.NodeLock
+    monkeypatch.setattr(nodelock, "NodeLock", lambda key, poll_s=2.0: real(key, poll_s=0.01, abstract=False))
+    other_job = real("port-8080", abstract=False)
+    other_job.acquire()
+    names = ["nginx-request-logging", "pypi-server", "kv-store-grpc"]
+    b = bench(tmp_path / "b", names, agent="oracle")
+    b.repeats, b.config.workers = 1, 3
+    running, log = set(), []
+
+    async def run_trial(self, task, k, agent, repeat_dir):
+        running.add(task["name"])
+        log.append(sorted(running))
+        if task["name"] == "kv-store-grpc":
+            await asyncio.sleep(0.1)
+            other_job.release()  # the other job's 8080 trial ends
+        await asyncio.sleep(0.05)
+        running.discard(task["name"])
+        return fake_result(1.0)
+
+    monkeypatch.setattr(tb.TerminalBench21, "_run_trial", run_trial)
+    assert b.run("", "")["value"] == 1.0
+    assert log[0] == ["kv-store-grpc"]  # 8080 is held by the other job
+    assert not any({"nginx-request-logging", "pypi-server"} <= set(s) for s in log)
+
+
 def test_pinned_dataset_digest_is_checked(tmp_path, monkeypatch):
     root = make_dataset(tmp_path / "ds", ["a"])
     monkeypatch.setattr(tb, "load_tasks", lambda s, r, d: (root, [{"name": "a", "path": "tasks/a"}]))

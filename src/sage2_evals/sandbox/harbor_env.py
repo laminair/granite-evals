@@ -18,7 +18,7 @@ policy), commands fall back to one ``enroot start`` each, like EnrootSandbox,
 and leftover processes are killed by an environment marker on stop.
 
 The host network is shared (enroot has no network namespace): tasks that
-serve on fixed ports must not run concurrently (see benchmarks/tbench.py),
+serve on fixed ports hold node-wide locks on them (sandbox/nodelock.py),
 and ports below 1024 can't be bound.
 
 Files move by ``tar`` over the command's stdin/stdout, which works the same on

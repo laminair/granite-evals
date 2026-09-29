@@ -23,17 +23,12 @@ finished instance is skipped on restart, so granite.build retries resume.
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
-import errno
 import functools
 import hashlib
 import json
 import logging
 import os
 import re
-import socket
-import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -43,6 +38,7 @@ from typing import Any, ClassVar
 from sage2_evals import data
 from sage2_evals.registry import Benchmark, register
 from sage2_evals.sandbox import make_sandbox
+from sage2_evals.sandbox.nodelock import NodeLock, node_locks  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -570,78 +566,6 @@ def pro_fixed_resources(tests: dict[str, str]) -> list[str]:
             keys.update(f"port-{p}" for p in pattern.findall(text))
     keys.discard("port-0")  # redis-server --port 0: no TCP port
     return sorted(keys)
-
-
-class NodeLock:
-    """A mutex shared by every process on the node that sees the same network
-    namespace, named by ``key``.
-
-    On Linux it is an abstract unix socket bound to ``@sage2-lock-<key>``: the
-    name lives in the network namespace, which enroot shares with the host, so
-    it reaches across LSF jobs whose containers each have a private /tmp, and
-    the kernel frees it when its holder dies (no stale lock files). Elsewhere
-    (macOS, where sandboxes have their own network) it is an flock on a file in
-    ``SAGE2_LOCK_DIR`` or the temp dir."""
-
-    def __init__(self, key: str, *, poll_s: float = 2.0, abstract: bool | None = None):
-        self.key, self.poll_s = key, poll_s
-        self.abstract = sys.platform == "linux" if abstract is None else abstract
-        self._held = None
-
-    def _try(self):
-        if self.abstract:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                s.bind(f"\0sage2-lock-{self.key}")
-            except OSError as e:
-                s.close()
-                if e.errno == errno.EADDRINUSE:
-                    return None
-                raise
-            return s
-        import fcntl
-
-        path = Path(os.environ.get("SAGE2_LOCK_DIR") or tempfile.gettempdir()) / f"sage2-{self.key}.lock"
-        f = open(path, "a")  # noqa: SIM115 - held until release
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            f.close()
-            return None
-        return f
-
-    def acquire(self) -> float:
-        """Blocks until held; returns the seconds waited."""
-        start = last_log = time.monotonic()
-        while (held := self._try()) is None:
-            if time.monotonic() - last_log >= 60:
-                log.info("waiting for node lock %s (%.0f s)", self.key, time.monotonic() - start)
-                last_log = time.monotonic()
-            time.sleep(self.poll_s)
-        self._held = held
-        return time.monotonic() - start
-
-    def release(self) -> None:
-        if self._held is not None:
-            self._held.close()
-            self._held = None
-
-
-@contextlib.contextmanager
-def node_locks(keys: list[str], *, what: str = "", poll_s: float = 2.0):
-    """Holds a NodeLock per key (taken in sorted order, so two holders of
-    overlapping sets cannot deadlock); yields the seconds waited."""
-    locks = [NodeLock(k, poll_s=poll_s) for k in sorted(set(keys))]
-    waited = 0.0
-    try:
-        for lock in locks:
-            waited += lock.acquire()
-        if locks:
-            log.info("%s: holding node locks %s (waited %.0f s)", what, [l.key for l in locks], waited)  # noqa: E741
-        yield waited
-    finally:
-        for lock in reversed(locks):
-            lock.release()
 
 
 def _last_line(output: str) -> str:
