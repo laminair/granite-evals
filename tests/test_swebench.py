@@ -86,6 +86,66 @@ def test_patch_that_never_applies(bench, tmp_path, monkeypatch):
     assert "/bin/bash /eval.sh" not in fake.commands
 
 
+MIRROR = "https://mirror.example/maven2?a=1&b=2"
+
+
+def test_no_maven_mirror_unless_configured(bench, tmp_path, monkeypatch):
+    monkeypatch.delenv(sb_mod.MAVEN_MIRROR_ENV, raising=False)
+    fake = FakeSandbox()
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
+    bench._grade(INSTANCE, "diff --git a/x b/x\n", tmp_path)
+    assert sb_mod.MAVEN_SETTINGS_STAGED not in fake.files
+    assert sb_mod.MAVEN_SETTINGS_INSTALL not in fake.commands
+
+
+def test_maven_mirror_is_installed_before_the_eval_script(bench, tmp_path, monkeypatch):
+    monkeypatch.setenv(sb_mod.MAVEN_MIRROR_ENV, MIRROR)
+    fake = FakeSandbox()
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
+    assert bench._grade(INSTANCE, "diff --git a/x b/x\n", tmp_path)["resolved"] is True
+    assert fake.files[sb_mod.MAVEN_SETTINGS_STAGED] == sb_mod.maven_settings(MIRROR)
+    assert fake.commands.index(sb_mod.MAVEN_SETTINGS_INSTALL) < fake.commands.index("/bin/bash /eval.sh")
+
+
+def test_maven_settings_mirror_only_central():
+    import xml.etree.ElementTree as ET
+
+    ns = {"s": "http://maven.apache.org/SETTINGS/1.2.0"}
+    mirrors = ET.fromstring(sb_mod.maven_settings(MIRROR)).findall("s:mirrors/s:mirror", ns)
+    assert len(mirrors) == 1
+    assert mirrors[0].findtext("s:mirrorOf", namespaces=ns) == "central"
+    assert mirrors[0].findtext("s:url", namespaces=ns) == MIRROR
+
+
+@pytest.mark.parametrize("shipped", [False, True])
+def test_maven_mirror_install_keeps_a_settings_xml_the_image_ships(tmp_path, shipped):
+    import subprocess
+
+    staged = tmp_path / "staged.xml"
+    staged.write_text("<settings/>")
+    home = tmp_path / "home"
+    if shipped:
+        (home / ".m2").mkdir(parents=True)
+        (home / ".m2" / "settings.xml").write_text("<image/>")
+    cmd = sb_mod.MAVEN_SETTINGS_INSTALL.replace(sb_mod.MAVEN_SETTINGS_STAGED, str(staged))
+    subprocess.run(["bash", "-c", cmd], env={"HOME": str(home), "PATH": "/usr/bin:/bin"}, check=True)
+    assert (home / ".m2" / "settings.xml").read_text() == ("<image/>" if shipped else "<settings/>")
+    assert not staged.exists()
+
+
+def test_agent_sandbox_gets_the_maven_mirror_too(bench, tmp_path, monkeypatch):
+    from sage2_evals.sandbox import minisweagent_env
+
+    monkeypatch.setenv(sb_mod.MAVEN_MIRROR_ENV, MIRROR)
+    box = ProSandbox()
+    monkeypatch.setattr(minisweagent_env, "make_sandbox", lambda *a, **k: box)
+    monkeypatch.setattr(sb_mod, "_kill_marked", lambda marker: None)
+    _patch_agent(monkeypatch, RaisingAgent)
+    bench._generate(INSTANCE, tmp_path, "http://h/v1", "m", 0)
+    assert box.files[sb_mod.MAVEN_SETTINGS_STAGED] == sb_mod.maven_settings(MIRROR)
+    assert sb_mod.MAVEN_SETTINGS_INSTALL in [c for c, _ in box.commands]
+
+
 def test_grade_kills_what_its_sandbox_left_running(bench, tmp_path, monkeypatch):
     # e.g. an eval_script's mvn after its timeout: no PID namespace under enroot.
     envs, killed = [], []
