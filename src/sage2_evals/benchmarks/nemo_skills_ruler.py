@@ -135,7 +135,12 @@ longest completed generation 26369. The 3 of 65 that hit the cap were degenerate
 loops (re-quoting the haystack, a repeated "> ..." line), which a larger budget
 would not rescue."""
 
-SCORING_SOURCE = "generation: message content after the vLLM reasoning parser (reasoning_content not scored)"
+SCORING_SOURCES = {
+    # thinking on: ns's chat format on the chat endpoint
+    "chat": "generation: message content after the vLLM reasoning parser (reasoning_content not scored)",
+    # thinking off: ns's default format on the text endpoint (no reasoning parser runs)
+    "default": "generation: raw text completion after the prefilled answer prefix (text endpoint; no reasoning parser)",
+}
 
 
 class RulerBenchmark(NemoSkillsBenchmark):
@@ -400,9 +405,13 @@ class RulerBenchmark(NemoSkillsBenchmark):
             "budget": self.thinking_budget(),
             "data_format": self.data_format(),
             "endpoint": "chat" if self.data_format() == "chat" else "text (answer prefix prefilled)",
-            "scoring_source": SCORING_SOURCE,
+            "scoring_source": self.scoring_source(),
             "per_task": per_task,
         }
+
+    def scoring_source(self) -> str:
+        """What ns's RULER match reads as ``generation`` in this mode."""
+        return SCORING_SOURCES[self.data_format()]
 
     # -- entry point ---------------------------------------------------------
 

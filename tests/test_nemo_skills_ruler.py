@@ -286,7 +286,7 @@ def test_run_scores_with_ns_ruler_score(ns, tmp_path, monkeypatch):
         True,
         nsr.DEFAULT_THINKING_BUDGET,
         "chat",
-        nsr.SCORING_SOURCE,
+        nsr.SCORING_SOURCES["chat"],
     )
     assert th["per_task"]["vt"]["tokens_to_generate"] == nsr.DEFAULT_THINKING_BUDGET + 30
     assert th["per_task"]["vt"]["generated_tokens"] == {"p50": 12, "p95": 13, "max": 13}
@@ -313,6 +313,18 @@ def test_run_thinking_off_record(ns, tmp_path, monkeypatch):
     r = b.run("", "")
     assert r["thinking"]["enabled"] is False and r["thinking"]["budget"] == 0 and r["departures"] == []
     assert r["thinking"]["per_task"]["vt"]["tokens_to_generate"] == 30
+    assert r["thinking"]["scoring_source"] == nsr.SCORING_SOURCES["default"]
+    assert r["thinking"]["endpoint"] == "text (answer prefix prefilled)"
+
+
+def test_scoring_source_by_mode(tmp_path):
+    """Thinking on scores the post-parser message content; thinking off (text
+    endpoint, no reasoning parser) scores the raw completion."""
+    on = bench("ruler-64k", tmp_path)
+    off = bench("ruler-64k", tmp_path, options=OFF)
+    assert on.scoring_source() == nsr.SCORING_SOURCES["chat"] and "reasoning parser" in on.scoring_source()
+    assert off.scoring_source() == nsr.SCORING_SOURCES["default"]
+    assert "raw text completion" in off.scoring_source() and "no reasoning parser" in off.scoring_source()
 
 
 def test_run_task_subset(ns, tmp_path, monkeypatch):
