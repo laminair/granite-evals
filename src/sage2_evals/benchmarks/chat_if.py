@@ -15,13 +15,13 @@ behaviour, kept as is.
 
 "(IBM)" is read as IBM's language subset: the Granite 4.x supported languages
 that MMLU-ProX covers (the card lists en, de, es, fr, ja, pt, ar, cs, it, ko, nl,
-zh; MMLU-ProX has no Dutch), i.e. 11 languages x 658 questions. Neither the
+zh; MMLU-ProX has no Dutch), i.e. 11 languages x 588 test questions. Neither the
 card nor the blog defines it, so this is the most defensible reading, not a
 confirmed one; ``--option languages=all`` (or a comma list) changes it.
 
 The headline value is the mean over languages of each language's exact match
 (lm-eval's ``mmlu_prox_lite_{lang}`` group: size-weighted over subjects). All
-languages have 658 questions, so this is also the micro average.
+languages have the same 588 questions, so this is also the micro average.
 
 Generation follows the task configs (greedy, ``max_gen_toks: 2048``, the task's
 stop strings); ``--option temperature=/top_p=/max_tokens=`` override them and
