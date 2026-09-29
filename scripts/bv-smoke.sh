@@ -44,9 +44,14 @@ mkdir -p "$ROOT/images" "$ROOT/enroot-cache" "$ROOT/hf-home" "$RUN" \
     "$LOCAL/data" "$LOCAL/cache" "$LOCAL/runtime" "$LOCAL/temp" "$LOCAL/inner"
 # Every step may fail harmlessly (nothing to unmount on a cached image); under set -e
 # a failing step would otherwise end the trap and become the job's exit status.
-trap 'enroot remove -f "$NAME" >/dev/null 2>&1 || true
-      for m in "$LOCAL/flat/merged" "$LOCAL/flat/layers"; do fusermount3 -u "$m" 2>/dev/null || true; done
-      rm -rf "$LOCAL" || true' EXIT
+HEARTBEAT="" LOCK="" PARTIAL=""
+cleanup() {
+    [ -n "$HEARTBEAT" ] && { kill "$HEARTBEAT" 2>/dev/null; rm -rf "$LOCK" "$PARTIAL"; }
+    enroot remove -f "$NAME" >/dev/null 2>&1 || true
+    for m in "$LOCAL/flat/merged" "$LOCAL/flat/layers"; do fusermount3 -u "$m" 2>/dev/null || true; done
+    rm -rf "$LOCAL" || true
+}
+trap cleanup EXIT
 # Layer downloads are kept on /proj so a rerun doesn't fetch them again.
 export ENROOT_DATA_PATH=$LOCAL/data ENROOT_CACHE_PATH=$ROOT/enroot-layers \
     ENROOT_RUNTIME_PATH=$LOCAL/runtime ENROOT_TEMP_PATH=$LOCAL/temp \
@@ -98,12 +103,33 @@ flatten() {  # layered sqsh (dirs 0/ 1/ ...) -> flat sqsh, in place
     mv "$LOCAL/flat.sqsh" "$1"
 }
 
+# Concurrent jobs on one image: one imports, the rest wait for its $SQSH. The lock is
+# a directory (mkdir is atomic on GPFS across nodes) whose mtime the importer keeps
+# fresh; a lock not touched for LOCK_STALE_S belongs to a killed job and is taken over.
+# Each job writes its own .partial, so a killed import is never mistaken for a finished one.
+LOCK="$SQSH.lock"
+LOCK_STALE_S="${LOCK_STALE_S:-600}"
+while [ ! -s "$SQSH" ] && ! mkdir "$LOCK" 2>/dev/null; do
+    age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || date +%s) ))
+    if [ "$age" -gt "$LOCK_STALE_S" ]; then
+        echo "=== stale import lock ($(cat "$LOCK/owner" 2>/dev/null), ${age}s): taking over ==="
+        rm -rf "$LOCK"
+    else
+        echo "=== waiting for $(cat "$LOCK/owner" 2>/dev/null) to import $IMAGE ==="; sleep 30
+    fi
+done
 if [ ! -s "$SQSH" ]; then
+    echo "job=${LSB_JOBID:-$$} host=$(hostname)" > "$LOCK/owner"
+    PARTIAL="$SQSH.partial.${LSB_JOBID:-$$}"
+    ( while sleep 60; do touch "$LOCK"; done ) & HEARTBEAT=$!
+    # Holding the lock, any other .partial is a killed job's.
+    rm -f "$SQSH".partial.*
     echo "=== import $IMAGE ==="
-    enroot import -o "$SQSH.partial" "docker://${IMAGE%%/*}#${IMAGE#*/}" || [ -s "$SQSH.partial" ]
-    flatten "$SQSH.partial"
-    mv "$SQSH.partial" "$SQSH"
+    enroot import -o "$PARTIAL" "docker://${IMAGE%%/*}#${IMAGE#*/}" || [ -s "$PARTIAL" ]
+    flatten "$PARTIAL"
+    mv "$PARTIAL" "$SQSH"
     echo "=== imported: $(du -h "$SQSH" | cut -f1) ==="
+    kill "$HEARTBEAT"; rm -rf "$LOCK"; HEARTBEAT=""
 fi
 
 enroot create --name "$NAME" "$SQSH"
