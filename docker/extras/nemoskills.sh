@@ -29,6 +29,10 @@ apt-get install -y --no-install-recommends git-lfs unzip
 # packages SciCode and the server use, at the lock's versions. `pip` in it is a
 # no-op, so the evaluator's own pip calls cannot change it at run time.
 export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+# The build runs this from /opt/sage2-evals, whose pyproject.toml overrides numpy>=2
+# ([tool.uv] override-dependencies): uv pip would apply that here too, and
+# scipy 1.10.1 cannot load under numpy 2. These envs take no project config.
+export UV_NO_CONFIG=1
 uv venv --python 3.10 /opt/ns-sandbox
 uv pip install --python /opt/ns-sandbox/bin/python \
     flask==3.1.3 werkzeug==3.1.8 ipython==8.39.0 traitlets==5.14.3 psutil==7.2.2 \

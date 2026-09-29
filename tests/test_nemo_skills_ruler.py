@@ -209,3 +209,34 @@ def test_ns_ruler_evaluator_accepts_gold_answers(ns, tmp_path):
     evaluate("ruler", {"input_file": str(f), "match_type": "all"})
     got = [json.loads(line)["is_correct"] for line in f.read_text().splitlines()]
     assert got == [1.0, 0.0]
+
+
+# Imported only inside functions that the hf tokenizer path never calls.
+_RULER_LAZY = {"nemo", "google", "tiktoken", "manifest_utils", "constants", "template", "tokenizer"}
+
+
+@pytest.mark.skipif(not Path(nsr.RULER_DIR, "scripts", "data").is_dir(), reason="no image RULER checkout")
+def test_image_has_ruler_generator_imports():
+    """In the image: every module RULER's generators import at the top is installed
+    (the job's prepare runs them with this interpreter)."""
+    import ast
+    import importlib.util
+    import sys
+
+    root = Path(nsr.RULER_DIR, "scripts", "data")
+    local = {p.stem for p in root.rglob("*.py")}
+    missing = {}
+    for p in root.rglob("*.py"):
+        if p.name.startswith("download_"):  # build-time only (docker/extras/nemoskills.sh)
+            continue
+        for node in ast.parse(p.read_text()).body:
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else []
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            for n in names:
+                top = n.split(".")[0]
+                if top in local or top in _RULER_LAZY or top in sys.stdlib_module_names:
+                    continue
+                if importlib.util.find_spec(top) is None:
+                    missing.setdefault(top, []).append(str(p.relative_to(root)))
+    assert not missing, missing
