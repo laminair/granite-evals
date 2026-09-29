@@ -20,7 +20,7 @@ WORKERS="${WORKERS:-2}"
 # Empty = the dataset the benchmark pins.
 DATASET="${DATASET:-}"
 OPTIONS="${OPTIONS:-}"
-EXTRA_ARGS="${EXTRA_ARGS:-}"  # further `sage2-evals run` arguments, e.g. --max-model-len 32768
+EXTRA_ARGS="${EXTRA_ARGS:-}"  # further `sage2-evals run` arguments, e.g. --max-model-len 32768; split on spaces, no quote removal (values with shell characters go in OPTIONS)
 ROOT="${ROOT:-/proj/data-eng/hew/sage2}"
 # Judge / user-simulator key: an env file the user keeps in their home (mode 600),
 # e.g. SAGE2_JUDGE_API_KEY=...; passed into the container by name, never printed.
@@ -38,7 +38,8 @@ ENV_ARGS=(--env SAGE2_SPEND_LEDGER="$SPEND_LEDGER" --env SAGE2_SPEND_BUDGET_USD=
 HF_TOKEN_FILE="${HF_TOKEN_FILE:-$HOME/.cache/huggingface/token}"
 if [ -z "${HF_TOKEN:-}" ] && [ -r "$HF_TOKEN_FILE" ]; then HF_TOKEN=$(<"$HF_TOKEN_FILE"); export HF_TOKEN; fi
 echo "hf token: $([ -n "${HF_TOKEN:-}" ] && echo set || echo none)"
-for v in SAGE2_JUDGE_API_KEY SAGE2_USER_API_KEY HF_TOKEN; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
+# SAGE2_MAVEN_MIRROR: a Maven Central mirror for SWE-bench Java instances (see swebench.py).
+for v in SAGE2_JUDGE_API_KEY SAGE2_USER_API_KEY HF_TOKEN SAGE2_MAVEN_MIRROR; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
 RUN="${RUN:-$ROOT/runs/smoke-${LSB_JOBID:-$$}}"
 
 echo "=== $(hostname) job=${LSB_JOBID:-local} image=$IMAGE model=$MODEL ==="
@@ -142,8 +143,10 @@ enroot create --name "$NAME" "$SQSH"
 
 MOUNTS=(--mount "$ROOT:$ROOT" --mount "$LOCAL/inner:/scratch")
 case "$MODEL" in /*) MOUNTS+=(--mount "$MODEL:$MODEL") ;; esac
-OPTS=""
-for kv in $OPTIONS; do OPTS="$OPTS --option $kv"; done
+# Passed to the inner shell as arguments, so a value like instances='a|b(c)' stays one word.
+RUN_ARGS=(--model "$MODEL" --output-dir "$RUN" --limit "$LIMIT" --repeats "$REPEATS" --workers "$WORKERS")
+[ -n "$DATASET" ] && RUN_ARGS+=(--dataset "$DATASET")
+for kv in $OPTIONS; do RUN_ARGS+=(--option "$kv"); done
 
 # The GPU env granite.build's SkyPilot LSF provider also sets; it makes enroot's
 # nvidia hook mount the job's GPUs.
@@ -159,15 +162,14 @@ enroot start --rw "${MOUNTS[@]}" \
     --env ENROOT_CACHE_PATH=/scratch/cache \
     --env ENROOT_RUNTIME_PATH=/scratch/runtime \
     --env ENROOT_TEMP_PATH=/scratch/temp \
-    "$NAME" bash -c "
+    "$NAME" bash -c '
         set -eo pipefail
         # enroot passes the host PATH through; same line as the granite.build step.
-        export PATH=/opt/sage2-evals/.venv/bin:\$PATH
+        export PATH=/opt/sage2-evals/.venv/bin:$PATH
         mkdir -p /scratch/data /scratch/cache /scratch/runtime /scratch/temp
         enroot version
-        sage2-evals run $BENCHMARK --model $MODEL --output-dir $RUN \
-            --limit $LIMIT --repeats $REPEATS --workers $WORKERS \
-            ${DATASET:+--dataset $DATASET} $OPTS $EXTRA_ARGS 2>&1 | tee $RUN/sage2.log
-    "
+        log=$1; shift
+        sage2-evals run "$@" 2>&1 | tee "$log"
+    ' _ "$RUN/sage2.log" "$BENCHMARK" "${RUN_ARGS[@]}" $EXTRA_ARGS
 echo "=== results: $RUN/results.json ==="
 cat "$RUN/results.json"
