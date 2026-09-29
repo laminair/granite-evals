@@ -288,6 +288,25 @@ def test_env_enroot_passes_no_harness_secrets(env, monkeypatch):
     assert got["ENROOT_DATA_PATH"] == "/scratch/data" and got["NVIDIA_VISIBLE_DEVICES"] == "void"
 
 
+def test_leftover_daemons_are_killed_by_root(monkeypatch):
+    """Processes that drop the marker (nginx workers) are found by their root."""
+    roots = {"10": "/scratch/data/sage2-x", "11": "/", "12": "/scratch/data/sage2-x"}
+    killed = []
+
+    def readlink(path):
+        pid = path.split("/")[2]
+        if pid not in roots:
+            raise OSError(path)
+        return roots[pid]
+
+    monkeypatch.setattr(harbor_env.os, "listdir", lambda p: [*roots, "self", "99999"])
+    monkeypatch.setattr(harbor_env.os, "readlink", readlink)
+    monkeypatch.setattr(harbor_env.os, "kill", lambda pid, sig: killed.append(pid))
+    assert harbor_env._kill_rooted("/scratch/data/sage2-x") == 2 and killed == [10, 12]
+    monkeypatch.setenv("ENROOT_DATA_PATH", "/scratch/data")
+    assert harbor_env.enroot_rootfs("sage2-x") == "/scratch/data/sage2-x"
+
+
 def test_no_paid_endpoints(tmp_path, monkeypatch):
     """Terminus 2 talks only to the served model: nothing to meter."""
     b = bench(tmp_path, ["a"])

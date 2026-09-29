@@ -93,17 +93,46 @@ def _read_environ(pid: int) -> dict[str, str]:
     return env
 
 
-def _kill_marked(marker: str) -> None:
+def _kill_marked(marker: str) -> int:
     """SIGKILL every process of ours whose environment carries ``marker``."""
     needle = f"{MARKER}={marker}".encode()
+    killed = 0
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or int(entry) == os.getpid():
             continue
         try:
             if needle in Path(f"/proc/{entry}/environ").read_bytes().split(b"\0"):
                 os.kill(int(entry), signal.SIGKILL)
+                killed += 1
         except (OSError, ProcessLookupError):
             continue
+    return killed
+
+
+def _kill_rooted(rootfs: str) -> int:
+    """SIGKILL every process of ours whose root directory is ``rootfs``: the
+    daemons a task starts that drop the environment marker (nginx workers
+    clear their environment), which would otherwise outlive the task and keep
+    the batch job alive."""
+    killed = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            if os.readlink(f"/proc/{entry}/root") == rootfs:
+                os.kill(int(entry), signal.SIGKILL)
+                killed += 1
+        except (OSError, ProcessLookupError):
+            continue
+    return killed
+
+
+def enroot_rootfs(name: str) -> str:
+    """Where ``enroot create --name name`` puts the container's root filesystem."""
+    data = os.environ.get("ENROOT_DATA_PATH") or os.path.join(
+        os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "enroot"
+    )
+    return os.path.join(data, name)
 
 
 def dockerfile_workdir(environment_dir: Path) -> str | None:
@@ -229,7 +258,12 @@ class SandboxEnvironment(BaseEnvironment):
     async def stop(self, delete: bool) -> None:
         await self._stop_keeper()
         if self._sandbox is not None:
-            await asyncio.to_thread(_kill_marked, self._sandbox.name)
+            name = self._sandbox.name
+            killed = await asyncio.to_thread(_kill_marked, name)
+            if self._backend == "enroot":
+                killed += await asyncio.to_thread(_kill_rooted, enroot_rootfs(name))
+            if killed:
+                log.info("%s: killed %d leftover processes of %s", self.environment_name, killed, name)
             await asyncio.to_thread(self._sandbox.close)
             self._sandbox = None
         if self._scratch:
