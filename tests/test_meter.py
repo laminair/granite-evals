@@ -77,6 +77,19 @@ def test_options_are_metered_and_spend_is_ledgered(upstream, tmp_path, monkeypat
     assert meter.report(ledger)["by_benchmark"] == {"b": 0.02}
 
 
+def test_roles_on_one_gateway_are_accounted_apart(upstream, tmp_path, monkeypatch):
+    # tau's user simulator and judge share the gateway URL.
+    ledger = tmp_path / "spend.jsonl"
+    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(ledger))
+    options = {"user_base_url": upstream, "judge_base_url": upstream}
+    with meter.Meters(options, {"benchmark": "b"}) as meters:
+        assert options["user_base_url"] != options["judge_base_url"]
+        _chat(options["user_base_url"]), _chat(options["user_base_url"]), _chat(meter.metered(upstream, "judge"))
+        spend = meters.summary()
+    assert {e["role"]: e["calls"] for e in spend["endpoints"]} == {"user": 2, "judge": 1}
+    assert meter.report(ledger)["by_role"] == {"user": pytest.approx(0.02), "judge": pytest.approx(0.01)}
+
+
 def test_budget_is_shared_through_the_ledger(upstream, tmp_path, monkeypatch):
     ledger = tmp_path / "spend.jsonl"
     # Another job has already spent $49.49 of $50; the reserve leaves room for one call.
