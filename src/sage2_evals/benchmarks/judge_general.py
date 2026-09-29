@@ -1060,6 +1060,16 @@ class GDPval(JudgedBenchmark):
                                   provider thinking fields (JudgedBenchmark.judge_extra_body)
       judge_orders=2             1 = model as A only; 2 = both orders
       elo_anchor=1000             Elo-style value of the expert
+      max_failed_frac=0.05        fail the run above this fraction of failed tasks (0 = any)
+
+    A task whose agent, sandbox or judge call raised (error:*), or whose judge
+    gave no valid verdict in any order (judge_invalid), is a failure, not a
+    loss: it is left out of the Elo and win rates and retried on resume (the
+    agent's saved run is reused, so only the judging is redone). GDPval ships
+    no automated grader to follow here; this matches the other judged
+    benchmarks. The run reports tasks_failed / tasks_total over the tasks not
+    excluded, fails above max_failed_frac and is flagged incomplete otherwise.
+    A task the model gave up on (no_submission) is still a loss.
     """
 
     id = "gdpval"
@@ -1114,7 +1124,9 @@ class GDPval(JudgedBenchmark):
         tdir.mkdir(parents=True, exist_ok=True)
         report_path = tdir / "report.json"
         if report_path.exists():
-            return json.loads(report_path.read_text())
+            report = json.loads(report_path.read_text())
+            if report["status"] != "judge_invalid":  # judge_invalid is re-judged
+                return report
         base = {"task_id": tid, "sector": task["sector"], "occupation": task["occupation"]}
         try:
             expert = [(Path(p).name, self._fetch(source, revision, p).read_bytes()) for p in task["deliverable_files"]]
@@ -1243,6 +1255,14 @@ class GDPval(JudgedBenchmark):
     def _aggregate(self, reports, tasks, judge: Judge, source, revision) -> dict[str, Any]:
         graded = [r for r in reports if r["status"] in ("judged", "no_submission")]
         n = len(graded)
+        failed = sum(r["status"] == "judge_invalid" or r["status"].startswith("error:") for r in reports)
+        total = sum(not r["status"].startswith("excluded:") for r in reports)
+        policy = failure_policy(self.id, "tasks", failed, total, self.opt("max_failed_frac", 0.05))
+        if failed:
+            log.warning("gdpval: %d/%d tasks failed (agent, sandbox or judge), left out; rerun to retry them",
+                        failed, total)
+        if total and not n:
+            raise SystemExit("gdpval: no task was graded")
         score = sum(r["score"] for r in graded)
         anchor = self.opt("elo_anchor", 1000.0)
         usage = [u for r in reports for u in r.get("judge_usage", [])]
@@ -1261,6 +1281,7 @@ class GDPval(JudgedBenchmark):
             "wins_or_ties_rate": sum(r["score"] >= 0.5 for r in graded) / n if n else 0.0,
             "deliverables": "expert" if self.expert_mode else "model",
             "statuses": _count(r["status"] for r in reports),
+            **policy,
             "tasks": [t["task_id"] for t in tasks],
             "per_sector": {
                 s: round(sum(r["score"] for r in graded if r["sector"] == s)

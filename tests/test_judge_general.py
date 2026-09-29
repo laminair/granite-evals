@@ -645,6 +645,51 @@ def test_gdpval_broken_task_does_not_sink_the_run(tmp_path, monkeypatch, gdp_env
         raise RuntimeError("sandbox died")
 
     monkeypatch.setattr(jg.GDPval, "_agent", boom)
-    out = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "VERDICT: A")).run("http://p/v1", "s")
-    assert out["statuses"]["error:RuntimeError"] == 1 and out["n"] == 0
+    # the other tasks are excluded, so t1 failing is 1/1 failed: the run fails, not a 0
+    with pytest.raises(SystemExit, match="tasks_failed 1/1"):
+        make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "VERDICT: A")).run("http://p/v1", "s")
+    with pytest.raises(SystemExit, match="no task was graded"):
+        make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "VERDICT: A"),
+                 max_failed_frac="1").run("http://p/v1", "s")
     assert not (tmp_path / "run/tasks/t1/report.json").exists()  # retried on resume
+
+
+def test_gdpval_failed_task_is_left_out_not_a_loss(tmp_path, monkeypatch, gdp_env):
+    async def agent(self, task, refs, out_dir, base_url, served):
+        if task["task_id"] == "t1b":
+            raise RuntimeError("sandbox died")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "memo.docx").write_bytes(_docx_bytes("MODEL memo"))
+        return {"finished": True, "note": "Done.", "paths": ["memo.docx"], "turns": 3,
+                "token_usage": {"input": 1, "output": 1, "reasoning": 0}, "failed_outputs": []}
+
+    tasks = GDP_TASKS + [{**GDP_TASKS[0], "task_id": "t1b"}]
+    monkeypatch.setattr(data, "load_split", lambda *a, **k: [dict(t) for t in tasks])
+    monkeypatch.setattr(jg.GDPval, "_agent", agent)
+    out = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(model_prefers("MODEL memo")),
+                   max_failed_frac="0.5").run("http://p/v1", "s")
+    assert out["win_rate"] == 1.0 and out["n"] == 1 and out["statuses"]["error:RuntimeError"] == 1
+    assert (out["tasks_failed"], out["tasks_total"], out["incomplete"]) == (1, 2, True)
+
+
+def test_gdpval_judge_invalid_is_a_failure_and_rejudged_on_resume(tmp_path, monkeypatch, gdp_env):
+    agents = []
+
+    async def fake_agent(self, task, refs, out_dir, base_url, served):
+        agents.append(task["task_id"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "memo.docx").write_bytes(_docx_bytes("MODEL memo"))
+        return {"finished": True, "note": "Done.", "paths": ["memo.docx"], "turns": 3,
+                "token_usage": {"input": 1, "output": 1, "reasoning": 0}, "failed_outputs": []}
+
+    monkeypatch.setattr(jg.GDPval, "_agent", fake_agent)
+    with pytest.raises(SystemExit, match="tasks_failed 1/1"):
+        make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "no verdict here")).run("http://p/v1", "s")
+    report = json.loads((tmp_path / "run/tasks/t1/report.json").read_text())
+    assert report["status"] == "judge_invalid" and "score" not in report
+    judge = fake_judge(model_prefers("MODEL memo"))
+    out = make_gdp(tmp_path, monkeypatch, gdp_env, judge).run("http://p/v1", "s")
+    # re-judged with the saved deliverables; the agent is not run again
+    assert agents == ["t1"] and len(judge._client.requests) == 2
+    assert out["statuses"]["judged"] == 1 and out["win_rate"] == 1.0
+    assert (out["tasks_failed"], out["tasks_total"], out["incomplete"]) == (0, 1, False)
