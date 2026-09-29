@@ -43,6 +43,16 @@ has no spaces or shell characters and survives bv-smoke's space-split OPTIONS
 and its inner ``bash -c``: ``stop=%3C/s%3E,Q:`` is ``["</s>", "Q:"]``, ``%2C``
 is a comma, ``%20`` a space. The stops the task actually used (per language)
 are recorded in results.json as ``generation_kwargs``.
+Per request, the samples record what the server said about the generation
+(``sage2_request``: ``finish_reason`` "length" or "stop", vLLM's
+``stop_reason``, i.e. the stop string that matched, or None for EOS,
+``completion_tokens``, which include the thinking, and the length of the
+reasoning the parser split off). They come from ``repeat-<k>/requests.jsonl``,
+appended as responses arrive, so a resumed run keeps them for cached
+responses. results.json summarises them per repeat (``requests``). Only
+lm-eval's concurrent path records them (``--workers`` > 1, the default 64);
+with one worker the rows say None.
+
 The served model's reasoning parser keeps the thinking out of ``content``, which
 is what the regex sees. A thought cut off at ``max_tokens`` leaves no content
 and scores as wrong, like in the reference protocol.
@@ -59,6 +69,7 @@ without a model and must score 1.0.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -205,6 +216,86 @@ def gold_response(lang: str, answer: str) -> str:
     return LANG_LIBS[lang][5].format(answer)
 
 
+REQUESTS_LOG = "requests.jsonl"
+_response_meta: contextvars.ContextVar[list | None] = contextvars.ContextVar("sage2_response_meta", default=None)
+
+
+def response_meta(out: dict) -> list[dict]:
+    """Per choice of one chat completion: how the generation ended and how
+    long it was."""
+    usage = out.get("usage") or {}
+    metas = []
+    for choice in out.get("choices") or []:
+        msg = choice.get("message") or {}
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        metas.append({
+            "finish_reason": choice.get("finish_reason"),
+            "stop_reason": choice.get("stop_reason"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "reasoning_chars": len(reasoning),
+            "content_chars": len(msg.get("content") or ""),
+        })  # fmt: skip
+    return metas
+
+
+def request_key(args) -> str:
+    """lm-eval's cache key of a generate_until request, ``(context, gen_kwargs)``:
+    the same for the request the LM sends and the sample row that logs it."""
+    from lm_eval.api.model import hash_args
+
+    return hash_args("generate_until", args)
+
+
+def load_requests_log(path: Path) -> dict[str, dict]:
+    """``requests.jsonl`` by request key; the latest record wins (a retried
+    error is replaced by its answer)."""
+    out: dict[str, dict] = {}
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                out[rec.pop("key")] = rec
+    return out
+
+
+def summarize_requests(samples: dict[str, list[dict]]) -> dict[str, Any]:
+    """Counts of finish_reason (and of stop_reason for the stopped ones),
+    finish_reason of the no-content answers, and completion token stats,
+    over the scored rows (``custom-extract``, one per question). Rows with no
+    record count as "unrecorded"."""
+    finish: dict[str, int] = {}
+    stops: dict[str, int] = {}
+    no_content: dict[str, int] = {}
+    tokens: list[int] = []
+    for rows in samples.values():
+        for row in rows:
+            if row.get("filter") != FILTER:
+                continue
+            meta = row.get("sage2_request")
+            reason = str(meta.get("finish_reason")) if meta else "unrecorded"
+            finish[reason] = finish.get(reason, 0) + 1
+            if meta and meta.get("finish_reason") == "stop":
+                sr = meta.get("stop_reason")
+                label = "eos" if sr is None else str(sr)
+                stops[label] = stops.get(label, 0) + 1
+            resp = row["resps"][0][0] if row.get("resps") else ""
+            if sample_status(resp, "") == "no_content":
+                no_content[reason] = no_content.get(reason, 0) + 1
+            if meta and isinstance(meta.get("completion_tokens"), int):
+                tokens.append(meta["completion_tokens"])
+    return {
+        "finish_reason": finish,
+        "stop_reason": stops,
+        "no_content_finish_reason": no_content,
+        "completion_tokens": {
+            "n": len(tokens),
+            "mean": round(sum(tokens) / len(tokens), 1) if tokens else None,
+            "max": max(tokens) if tokens else None,
+        },
+    }
+
+
 def _chat_lm_class():
     """lm-eval's local-chat-completions, made robust: bounded retries per
     request inside the call, then an error marker instead of an exception (one
@@ -212,10 +303,27 @@ def _chat_lm_class():
     from lm_eval.models.openai_completions import LocalChatCompletion
 
     class Sage2ChatCompletions(LocalChatCompletion):
-        def __init__(self, *args, benchmark_id: str = "", **kwargs):
+        def __init__(self, *args, benchmark_id: str = "", requests_log: Path | None = None, **kwargs):
             super().__init__(*args, **kwargs)
             self.benchmark_id = benchmark_id
+            self.requests_log = requests_log
             self.done = self.errors = 0
+
+        def parse_generations(self, outputs, **kwargs):
+            sink = _response_meta.get()
+            if sink is not None:
+                for out in outputs if isinstance(outputs, list) else [outputs]:
+                    sink.extend(response_meta(out))
+            return super().parse_generations(outputs, **kwargs)
+
+        def _log_requests(self, cache_keys, metas: list[dict]) -> None:
+            """One requests.jsonl line per request (async path: one request
+            per call)."""
+            if self.requests_log is None or not cache_keys:
+                return
+            with self.requests_log.open("a") as f:
+                for args, meta in zip(cache_keys, metas, strict=False):
+                    f.write(json.dumps({"key": request_key(args), **meta}, ensure_ascii=False) + "\n")
 
         def _progress(self) -> None:
             if self.done % PROGRESS_EVERY == 0:
@@ -225,11 +333,14 @@ def _chat_lm_class():
             last: BaseException | None = None
             attempts = max(1, self.max_retries)
             for attempt in range(attempts):
+                sink: list[dict] = []
+                token = _response_meta.set(sink)
                 try:
                     out = await super().amodel_call(
                         session, sem, messages, generate=generate, cache_keys=cache_keys,
                         ctxlens=ctxlens, gen_kwargs=gen_kwargs, **kwargs,
                     )  # fmt: skip
+                    self._log_requests(cache_keys, sink)
                     self.done += 1
                     self._progress()
                     return out
@@ -237,6 +348,9 @@ def _chat_lm_class():
                     last = e
                     if attempt + 1 < attempts:
                         await asyncio.sleep(min(RETRY_BACKOFF_S * 2**attempt, 30))
+                finally:
+                    _response_meta.reset(token)
+            self._log_requests(cache_keys, [{"finish_reason": "error", "error": repr(last)}] * len(cache_keys or []))
             log.warning("%s: request failed after %d attempts: %r", self.benchmark_id, self.max_retries, last)
             self.done += 1
             self.errors += 1
@@ -365,7 +479,7 @@ class MMLUProXLite(Benchmark):
             kw["chat_template_kwargs"] = {"enable_thinking": False}
         return kw
 
-    def make_lm(self, base_url: str, served: str, seed: int):
+    def make_lm(self, base_url: str, served: str, seed: int, requests_log: Path | None = None):
         if self.gold:
             return _gold_lm_class()()
         return _chat_lm_class()(
@@ -378,6 +492,7 @@ class MMLUProXLite(Benchmark):
             tokenizer_backend=None,
             seed=seed,
             benchmark_id=self.id,
+            requests_log=requests_log,
         )
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
@@ -420,7 +535,7 @@ class MMLUProXLite(Benchmark):
         cache_dir.mkdir(parents=True, exist_ok=True)
         started = time.time()
         results = simple_evaluate(
-            model=self.make_lm(base_url, served, seed=self.config.seed + 1234 + k),
+            model=self.make_lm(base_url, served, seed=self.config.seed + 1234 + k, requests_log=repeat_dir / REQUESTS_LOG),
             tasks=[self.task_spec(tasks, source, revision)],
             task_manager=TaskManager(),
             samples=samples,
@@ -437,18 +552,24 @@ class MMLUProXLite(Benchmark):
                 log.warning("%s repeat %d: %d failed requests dropped from the cache for retry", self.id, k, dropped)
         self._write(repeat_dir, results)
         summary = summarize(results["samples"])
+        if not self.gold:
+            summary["requests"] = summarize_requests(results["samples"])
         summary["generation_kwargs"] = effective_generation_kwargs(results.get("configs") or {})
         summary["duration_s"] = round(time.time() - started, 1)
         return summary
 
     def _write(self, repeat_dir: Path, results: dict) -> None:
-        """Per-example artifacts: ``samples/<task>.jsonl`` and lm-eval's
+        """Per-example artifacts: ``samples/<task>.jsonl`` (each row with its
+        ``sage2_request`` record, None if the log has none) and lm-eval's
         per-task/group results as ``lm_eval_results.json``."""
         sdir = repeat_dir / "samples"
         sdir.mkdir(exist_ok=True)
+        records = load_requests_log(repeat_dir / REQUESTS_LOG)
         for task, rows in results["samples"].items():
             with (sdir / f"{task}.jsonl").open("w") as f:
                 for row in rows:
+                    if records and row.get("arguments"):
+                        row["sage2_request"] = records.get(request_key(row["arguments"][0]))
                     f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         keep = {key: results.get(key) for key in ("results", "groups", "configs", "versions", "n-shot", "n-samples", "config")}
         (repeat_dir / "lm_eval_results.json").write_text(json.dumps(keep, indent=2, ensure_ascii=False, default=str))

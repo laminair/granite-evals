@@ -321,6 +321,105 @@ def test_requests_carry_the_generation_kwargs_and_results_record_them(tmp_path, 
     assert all(not gk.get("do_sample") for gk in FakeChatLM.gen_kwargs)  # cacheable, so resumable
 
 
+def _completion(question: str) -> dict:
+    """A vLLM-shaped chat completion, by question: q0 stops on a stop string,
+    q1 runs into max_tokens inside the thought (content None), q2 fails,
+    others end on EOS."""
+    if "question 0 " in question:
+        return {"choices": [{"index": 0, "finish_reason": "stop", "stop_reason": "Q:",
+                             "message": {"content": "", "reasoning_content": "think Q"}}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 300}}  # fmt: skip
+    if "question 1 " in question:
+        return {"choices": [{"index": 0, "finish_reason": "length", "stop_reason": None,
+                             "message": {"content": None, "reasoning_content": "x" * 50}}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 8192}}  # fmt: skip
+    if "question 2 " in question:
+        raise RuntimeError("server down")
+    return {"choices": [{"index": 0, "finish_reason": "stop", "stop_reason": None,
+                         "message": {"content": "the answer is (A)", "reasoning_content": "hm"}}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 1000}}  # fmt: skip
+
+
+def _fake_http(monkeypatch, sent: list, respond=_completion):
+    """Replace only the HTTP round trip of lm-eval's TemplateAPI.amodel_call:
+    the payload is built and the response parsed by the real code."""
+    from lm_eval.models.api_models import TemplateAPI
+
+    async def call(self, session, sem, messages, *, generate=True, cache_keys=None, ctxlens=None, gen_kwargs=None, **kw):
+        import copy
+
+        payload = self._create_payload(self.create_message(messages), generate=True, gen_kwargs=copy.deepcopy(gen_kwargs), seed=self._seed)
+        sent.append(payload)
+        answers = self.parse_generations(outputs=respond(payload["messages"][-1]["content"]))
+        answers = [a if a is not None else "LMEVAL_MODEL_NONE_ANSWER_PLACEHOLDER" for a in answers]
+        for res, key in zip(answers, cache_keys or [], strict=False):
+            self.cache_hook.add_partial("generate_until", key, res)
+        return answers
+
+    monkeypatch.setattr(TemplateAPI, "amodel_call", call)
+    monkeypatch.setattr(chat_if, "RETRY_BACKOFF_S", 0.0)
+
+
+def test_samples_and_results_record_finish_reason_and_tokens(tmp_path, dataset_dir, monkeypatch):
+    pytest.importorskip("lm_eval")
+    sent: list = []
+    _fake_http(monkeypatch, sent)
+    b = _bench(tmp_path, dataset_dir, limit=8, max_retries="2")  # q0..q3 x en,de
+    b.config.workers = 4
+    out = b.run("http://x/v1", "m")
+    assert len(sent) == 8 + 2  # q2 x 2 languages retried once each
+    req = out["per_repeat"][0]["requests"]
+    assert req["finish_reason"] == {"stop": 4, "length": 2, "error": 2}
+    assert req["stop_reason"] == {"Q:": 2, "eos": 2}
+    assert req["no_content_finish_reason"] == {"stop": 2, "length": 2}
+    assert req["completion_tokens"] == {"n": 6, "mean": round((2 * 300 + 2 * 8192 + 2 * 1000) / 6, 1), "max": 8192}
+    # q3's English "the answer is" does not match the German regex.
+    assert out["per_repeat"][0]["statuses"] == {"no_content": 4, "error": 2, "answered": 1, "no_answer": 1}
+
+    def rows():
+        sdir = tmp_path / "out/repeat-0/samples"
+        return [json.loads(x) for f in sorted(sdir.glob("*.jsonl")) for x in f.read_text().splitlines()]
+
+    by_q = {(r["doc"]["question"], r["filter"]): r["sage2_request"] for r in rows()}
+    q0 = by_q[("[en] question 0 about biology?", "custom-extract")]
+    assert q0 == {"finish_reason": "stop", "stop_reason": "Q:", "completion_tokens": 300, "prompt_tokens": 900,
+                  "reasoning_chars": 7, "content_chars": 0}  # fmt: skip
+    assert by_q[("[de] question 1 about business?", "custom-extract")]["finish_reason"] == "length"
+    assert by_q[("[de] question 2 about chemistry?", "custom-extract")]["finish_reason"] == "error"
+
+    # Resume: the cached answers keep their records; the failed ones are
+    # retried and their new records replace the error ones.
+    sent.clear()
+    ok = _completion("question 9 ")
+    _fake_http(monkeypatch, sent, respond=lambda q: ok)
+    out2 = _bench(tmp_path, dataset_dir, limit=8).run("http://x/v1", "m")
+    assert len(sent) == 2
+    req2 = out2["per_repeat"][0]["requests"]
+    assert req2["finish_reason"] == {"stop": 6, "length": 2}
+    assert req2["completion_tokens"]["n"] == 8
+    assert all(r["sage2_request"] for r in rows())
+
+
+def test_gold_has_no_request_records(tmp_path, dataset_dir):
+    pytest.importorskip("lm_eval")
+    out = _bench(tmp_path, dataset_dir, answers="gold").run("", "")
+    assert "requests" not in out["per_repeat"][0]
+    rows = (tmp_path / "out/repeat-0/samples/mmlu_prox_lite_en_math.jsonl").read_text().splitlines()
+    assert "sage2_request" not in json.loads(rows[0])
+
+
+def test_response_meta_and_request_key():
+    pytest.importorskip("lm_eval")
+    from lm_eval.api.model import hash_args
+
+    assert chat_if.response_meta({"choices": [{"finish_reason": "stop", "message": {"content": "ab", "reasoning": "xyz"}}]}) == [
+        {"finish_reason": "stop", "stop_reason": None, "completion_tokens": None, "prompt_tokens": None,
+         "reasoning_chars": 3, "content_chars": 2},
+    ]  # fmt: skip
+    args = ("ctx", {"until": ["Q:"], "max_gen_toks": 8192})
+    assert chat_if.request_key(args) == hash_args("generate_until", args)
+
+
 def test_chat_lm_turns_exhausted_retries_into_an_error_marker(monkeypatch):
     pytest.importorskip("lm_eval")
     import asyncio
