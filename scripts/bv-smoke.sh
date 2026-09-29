@@ -33,7 +33,12 @@ SPEND_BUDGET_USD="${SPEND_BUDGET_USD:-50}"
 mkdir -p "$(dirname "$SPEND_LEDGER")"
 ENV_ARGS=(--env SAGE2_SPEND_LEDGER="$SPEND_LEDGER" --env SAGE2_SPEND_BUDGET_USD="$SPEND_BUDGET_USD"
     --env LSB_JOBID="${LSB_JOBID:-}")  # the ledger's job column
-for v in SAGE2_JUDGE_API_KEY SAGE2_USER_API_KEY; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
+# Gated HF datasets (gpqa): HF_TOKEN from the environment or JUDGE_ENV, else the
+# account's `hf auth login` token. Only ever an env var: HF_HOME is on the shared ROOT.
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-$HOME/.cache/huggingface/token}"
+if [ -z "${HF_TOKEN:-}" ] && [ -r "$HF_TOKEN_FILE" ]; then HF_TOKEN=$(<"$HF_TOKEN_FILE"); export HF_TOKEN; fi
+echo "hf token: $([ -n "${HF_TOKEN:-}" ] && echo set || echo none)"
+for v in SAGE2_JUDGE_API_KEY SAGE2_USER_API_KEY HF_TOKEN; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
 RUN="${RUN:-$ROOT/runs/smoke-${LSB_JOBID:-$$}}"
 
 echo "=== $(hostname) job=${LSB_JOBID:-local} image=$IMAGE model=$MODEL ==="
