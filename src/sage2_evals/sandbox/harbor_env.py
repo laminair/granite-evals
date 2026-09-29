@@ -114,14 +114,24 @@ def _kill_rooted(rootfs: str) -> int:
     daemons a task starts that drop the environment marker (nginx workers
     clear their environment), which would otherwise outlive the task and keep
     the batch job alive."""
-    # The kernel reports the resolved path.
-    rootfs = os.path.realpath(rootfs)
+    # Compare by inode: enroot pivots into the rootfs in its own mount
+    # namespace, so readlink() of /proc/<pid>/root from outside it gives "/"
+    # (checked on BlueVela), while stat() follows it to the directory itself.
+    try:
+        st = os.stat(rootfs)
+    except OSError:
+        return 0
+    want = (st.st_dev, st.st_ino)
+    host = os.stat("/")
+    if want == (host.st_dev, host.st_ino):  # never every process on the node
+        return 0
     killed = 0
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or int(entry) == os.getpid():
             continue
         try:
-            if os.readlink(f"/proc/{entry}/root") == rootfs:
+            root = os.stat(f"/proc/{entry}/root")
+            if (root.st_dev, root.st_ino) == want:
                 os.kill(int(entry), signal.SIGKILL)
                 killed += 1
         except (OSError, ProcessLookupError):
