@@ -10,6 +10,8 @@ set (``dev_20240627``: 1534 questions over 11 SQLite databases):
   database's SQL dump, INSERT runs cut to 10, as its ``prepare.py`` builds it);
   no evidence ("external knowledge"), as NeMo-Skills (``--option evidence=true``
   prefixes it to the question instead);
+- sampling: NeMo-Skills' birdbench GENERATION_ARGS (max_tokens 10000,
+  temperature 0.6, top_p 0.95, top_k 20), each overridable by ``--option``;
 - extraction: NeMo-Skills' ``BirdEvaluator._extract_answer`` (last ```sql block);
 - scoring: BIRD's execution accuracy, ``set(pred rows) == set(gold rows)``, the
   predicted then the gold query on one connection within one 30 s budget, a
@@ -22,6 +24,12 @@ set (``dev_20240627``: 1534 questions over 11 SQLite databases):
 ``--option sql=gold`` scores the gold SQL against itself (no model), checking
 data, databases and scoring end to end. Per-question results are written under
 ``<output_dir>/repeat-<k>/<question_id>.json`` and reused on restart.
+
+A question whose request fails (after the client's retries) is not a wrong
+answer: it is left out of the accuracy, counted in ``details.questions_failed``
+/ ``questions_total``, and retried on restart. Above ``--option
+max_failed_frac`` (default 0.05; 0 = any failure) the run fails; below it the
+result is flagged ``incomplete``.
 """
 
 from __future__ import annotations
@@ -40,7 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, failure_policy, register
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +58,9 @@ DEV_DIR = "dev_20240627"
 PROMPT_CONFIG = "generic/text_to_sql"
 TIMEOUT_S = 30.0  # BIRD's meta_time_out, NeMo-Skills' BirdEvaluatorConfig.timeout
 DIFFICULTIES = ("simple", "moderate", "challenging")
+NS_SAMPLING = {"max_tokens": 10000, "temperature": 0.6, "top_p": 0.95, "top_k": 20}
+"""NeMo-Skills' birdbench GENERATION_ARGS (nemo_skills/dataset/birdbench/__init__.py:18-26):
+tokens_to_generate, temperature, top_p, top_k."""
 
 
 @register
@@ -78,11 +89,15 @@ class BirdBench(Benchmark):
         return not self.gold
 
     def sampling(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for key, cast in (("temperature", float), ("top_p", float), ("max_tokens", int)):
-            if key in self.config.options:
-                out[key] = cast(self.config.options[key])
-        return out
+        """NS_SAMPLING, each overridable by an option (``top_k<=0`` = not sent)."""
+        return {key: self.opt(key, default) for key, default in NS_SAMPLING.items()}
+
+    def request_args(self) -> dict[str, Any]:
+        """sampling() as chat-completion arguments: top_k is a vLLM extension, sent
+        in extra_body and only when positive, as ns does (inference/model/vllm.py:114-127)."""
+        args = self.sampling()
+        top_k = args.pop("top_k")
+        return {**args, "extra_body": {"top_k": top_k}} if top_k > 0 else args
 
     # -- entry point -------------------------------------------------------
 
@@ -108,12 +123,20 @@ class BirdBench(Benchmark):
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
                 recs = list(pool.map(one, questions))
-            per_repeat.append(summarize(recs) | {"repeat": k})
-            log.info("%s repeat %d: %d/%d correct", self.id, k, per_repeat[-1]["correct"], len(recs))
+            scored = [r for r in recs if not r["status"].startswith("error:")]
+            per_repeat.append(summarize(scored) | {"repeat": k, "failed": len(recs) - len(scored)})
+            log.info("%s repeat %d: %d/%d correct, %d failed", self.id, k, per_repeat[-1]["correct"], len(scored),
+                     len(recs) - len(scored))  # fmt: skip
 
+        failed = sum(r["failed"] for r in per_repeat)
+        policy = failure_policy(self.id, "questions", failed, len(questions) * self.repeats,
+                                self.opt("max_failed_frac", 0.05))  # fmt: skip
+        if any(r["n"] == 0 for r in per_repeat):
+            raise SystemExit(f"{self.id}: a repeat has no scored question; rerun to retry the failed ones")
         return {
             "value": sum(r["accuracy"] for r in per_repeat) / len(per_repeat),
-            "n": len(questions),
+            "n": min(r["n"] for r in per_repeat),  # fewest scored in a repeat: failed questions are left out
+            **policy,
             "dataset": DEV_ZIP_URL,
             "dataset_revision": self.dataset_revision,
             "split": f"{DEV_DIR}/dev.json",
@@ -121,7 +144,7 @@ class BirdBench(Benchmark):
             "evidence": self.opt("evidence", False),
             "timeout_s": timeout,
             "prompt_config": PROMPT_CONFIG,
-            "sampling": self.sampling() or "checkpoint generation_config",
+            "sampling": {} if self.gold else self.sampling(),
             "per_repeat": per_repeat,
         }
 
@@ -141,7 +164,7 @@ class BirdBench(Benchmark):
                                         "sql_context": schemas[q["db_id"]]})
                 t0 = time.time()
                 resp = client.chat.completions.create(
-                    model=served, messages=messages, seed=self.config.seed + k, **self.sampling())
+                    model=served, messages=messages, seed=self.config.seed + k, **self.request_args())
                 msg = resp.choices[0].message
                 text = msg.content or ""
                 rec = {
