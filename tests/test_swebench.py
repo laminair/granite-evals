@@ -144,6 +144,54 @@ def test_agent_sandbox_gets_the_maven_mirror_too(bench, tmp_path, monkeypatch):
     bench._generate(INSTANCE, tmp_path, "http://h/v1", "m", 0)
     assert box.files[sb_mod.MAVEN_SETTINGS_STAGED] == sb_mod.maven_settings(MIRROR)
     assert sb_mod.MAVEN_SETTINGS_INSTALL in [c for c, _ in box.commands]
+    assert sb_mod.GRADLE_INIT_INSTALL in [c for c, _ in box.commands]
+
+
+def test_gradle_init_script_is_installed_with_the_maven_settings(bench, tmp_path, monkeypatch):
+    monkeypatch.setenv(sb_mod.MAVEN_MIRROR_ENV, MIRROR)
+    fake = FakeSandbox()
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
+    bench._grade(INSTANCE, "diff --git a/x b/x\n", tmp_path)
+    assert fake.files[sb_mod.GRADLE_INIT_STAGED] == sb_mod.gradle_init_script(MIRROR)
+    assert fake.commands.index(sb_mod.GRADLE_INIT_INSTALL) < fake.commands.index("/bin/bash /eval.sh")
+
+
+def test_no_gradle_init_script_unless_configured(bench, tmp_path, monkeypatch):
+    monkeypatch.delenv(sb_mod.MAVEN_MIRROR_ENV, raising=False)
+    fake = FakeSandbox()
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
+    bench._grade(INSTANCE, "diff --git a/x b/x\n", tmp_path)
+    assert sb_mod.GRADLE_INIT_STAGED not in fake.files
+
+
+def test_gradle_init_script_quotes_the_mirror_and_matches_central_by_host():
+    script = sb_mod.gradle_init_script("https://m.example/maven2?a='1'\\x")
+    assert "def sage2Mirror = 'https://m.example/maven2?a=\\'1\\'\\\\x'" in script
+    for host in sb_mod.MAVEN_CENTRAL_HOSTS:
+        assert f"'{host}'" in script
+    assert "buildscript.repositories" in script and "dependencyResolutionManagement" in script
+
+
+@pytest.mark.parametrize("gradle_user_home", [None, "gh"])
+@pytest.mark.parametrize("shipped", [False, True])
+def test_gradle_init_install_keeps_an_image_script_and_honours_gradle_user_home(tmp_path, shipped, gradle_user_home):
+    import subprocess
+
+    staged = tmp_path / "staged.gradle"
+    staged.write_text("// sage2")
+    home = tmp_path / "home"
+    env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+    initd = home / ".gradle" / "init.d"
+    if gradle_user_home:
+        env["GRADLE_USER_HOME"] = str(tmp_path / gradle_user_home)
+        initd = tmp_path / gradle_user_home / "init.d"
+    if shipped:
+        initd.mkdir(parents=True)
+        (initd / "sage2-maven-mirror.gradle").write_text("// image")
+    cmd = sb_mod.GRADLE_INIT_INSTALL.replace(sb_mod.GRADLE_INIT_STAGED, str(staged))
+    subprocess.run(["bash", "-c", cmd], env=env, check=True)
+    assert (initd / "sage2-maven-mirror.gradle").read_text() == ("// image" if shipped else "// sage2")
+    assert not staged.exists()
 
 
 def test_grade_kills_what_its_sandbox_left_running(bench, tmp_path, monkeypatch):

@@ -47,10 +47,11 @@ EVAL_TIMEOUT_S = 1800
 
 MAVEN_MIRROR_ENV = "SAGE2_MAVEN_MIRROR"
 """URL of a Maven Central mirror for the instance sandboxes (unset: none).
-The Java images (druid, gson, javaparser) resolve a few artifacts at test
-time, e.g. surefire's junit provider, which their images do not ship; where
-repo.maven.apache.org refuses the node's egress IP (HTTP 429 on every
-request), those tests fail on the environment, not the patch."""
+The Java images resolve a few artifacts at test time, e.g. surefire's junit
+provider (Maven: druid, gson, javaparser) or dependencies the Gradle cache
+lacks (lucene, rxjava); where repo.maven.apache.org refuses the node's egress
+IP (HTTP 429 on every request), those tests fail on the environment, not the
+patch. Maven gets a settings.xml mirror, Gradle an init script."""
 MAVEN_SETTINGS_STAGED = "/tmp/sage2-maven-settings.xml"
 # cp -n: a settings.xml the image ships wins.
 MAVEN_SETTINGS_INSTALL = (
@@ -77,6 +78,46 @@ def maven_settings(mirror: str) -> str:
     )
 
 
+GRADLE_INIT_STAGED = "/tmp/sage2-gradle-mirror.gradle"
+# Gradle runs every script in init.d; cp -n: one the image ships under that name wins.
+GRADLE_INIT_INSTALL = (
+    'd="${GRADLE_USER_HOME:-$HOME/.gradle}/init.d" && mkdir -p "$d" && '
+    f'cp -n {GRADLE_INIT_STAGED} "$d/sage2-maven-mirror.gradle"; rm -f {GRADLE_INIT_STAGED}'
+)
+MAVEN_CENTRAL_HOSTS = ("repo.maven.apache.org", "repo1.maven.org")
+
+
+def gradle_init_script(mirror: str) -> str:
+    """A Gradle init script that points every Maven Central repository (by host:
+    ``mavenCentral()`` or an explicit URL) at ``mirror``, in project, buildscript
+    and settings repositories; other repositories are left alone. Groovy DSL,
+    ``all`` rather than ``configureEach`` so old Gradle versions run it too."""
+    quoted = "'" + mirror.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    hosts = ", ".join(f"'{h}'" for h in MAVEN_CENTRAL_HOSTS)
+    return f"""// sage2-evals: Maven Central -> {MAVEN_MIRROR_ENV}
+def sage2Mirror = {quoted}
+def sage2Redirect = {{ repos ->
+    repos.all {{ r ->
+        if (r instanceof MavenArtifactRepository && r.url != null && [{hosts}].contains(r.url.host)) {{
+            r.url = sage2Mirror
+        }}
+    }}
+}}
+allprojects {{
+    sage2Redirect(buildscript.repositories)
+    sage2Redirect(repositories)
+}}
+if (gradle.gradleVersion.tokenize('.')[0].toInteger() >= 6) {{
+    settingsEvaluated {{ s ->
+        sage2Redirect(s.pluginManagement.repositories)
+        if (s.hasProperty('dependencyResolutionManagement')) {{
+            sage2Redirect(s.dependencyResolutionManagement.repositories)
+        }}
+    }}
+}}
+"""
+
+
 def maven_mirror() -> str:
     return os.environ.get(MAVEN_MIRROR_ENV, "").strip()
 
@@ -85,6 +126,8 @@ def _install_maven_mirror(sb) -> None:
     if mirror := maven_mirror():
         sb.write_file(MAVEN_SETTINGS_STAGED, maven_settings(mirror))
         sb.execute(MAVEN_SETTINGS_INSTALL, timeout=60)
+        sb.write_file(GRADLE_INIT_STAGED, gradle_init_script(mirror))
+        sb.execute(GRADLE_INIT_INSTALL, timeout=60)
 
 
 class SWEBench(Benchmark):
