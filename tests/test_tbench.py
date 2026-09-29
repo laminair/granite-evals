@@ -2,6 +2,7 @@
 (no containers, no model)."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import shlex
@@ -62,6 +63,8 @@ def test_metadata():
     assert cls.metric == "pass@1[avg-of-8] resolve rate" and cls.default_repeats == 8
     assert len(cls.dataset_revision) == 40
     assert tb.HOST_PORT_TASKS.isdisjoint(tb.EXCLUDED)
+    assert len(tb.TASK_DIGESTS) == tb.N_TASKS
+    assert hashlib.sha256(",".join(sorted(tb.TASK_DIGESTS.values())).encode()).hexdigest() == tb.TASKS_DIGEST
 
 
 def test_oracle_needs_no_server(tmp_path):
@@ -146,9 +149,25 @@ def test_pinned_dataset_digest_is_checked(tmp_path, monkeypatch):
 
 def test_task_digests_are_harbor_content_hashes(tmp_path):
     root = make_dataset(tmp_path / "ds", ["a", "b"])
-    d1 = tb.task_digests(root / "tasks", ["a", "b"])
+    dirs = {n: root / "tasks" / n for n in ("a", "b")}
+    d1 = tb.task_digests(dirs)
     (root / "tasks" / "a" / "instruction.md").write_text("changed\n")
-    assert tb.task_digests(root / "tasks", ["b", "a"]) != d1
+    assert tb.task_digests(dirs) != d1
+    assert "" not in tb.task_digest_map(dirs).values()
+
+
+def test_pinned_check_hashes_registry_paths(tmp_path, monkeypatch):
+    """The check hashes the tasks where registry.json puts them (tasks/<name>)."""
+    root = make_dataset(tmp_path / "ds", ["a", "b"])
+    dirs = {n: root / "tasks" / n for n in ("a", "b")}
+    got = tb.task_digest_map(dirs)
+    monkeypatch.setattr(tb, "TASK_DIGESTS", got)
+    monkeypatch.setattr(tb, "TASKS_DIGEST", tb.task_digests(dirs))
+    monkeypatch.setattr(tb, "load_tasks", lambda s, r: (root, [{"name": n, "path": f"tasks/{n}"} for n in ("a", "b")]))
+    monkeypatch.setattr(tb.TerminalBench21, "_run_trial", lambda *a: None)
+    b = tb.TerminalBench21(RunConfig(model="m", output_dir=tmp_path / "out", options={"agent": "oracle", "sandbox": "podman"}))
+    b.repeats = 0
+    assert b.run("", "")["tasks_digest"] == tb.TASKS_DIGEST
 
 
 def test_terminus_config(tmp_path, monkeypatch):
