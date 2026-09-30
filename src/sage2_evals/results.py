@@ -7,6 +7,7 @@ report can join them without knowing any benchmark's internals.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import time
@@ -16,6 +17,8 @@ from typing import Any
 
 from sage2_evals import __version__
 from sage2_evals.registry import Benchmark
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 RESULTS_FILE = "results.json"
@@ -102,4 +105,10 @@ def read_generation(benchmark: Benchmark) -> dict[str, Any]:
     if wrong:
         diff = ", ".join(f"{k}: generated {g!r}, scoring {s!r}" for k, (g, s) in wrong.items())
         raise SystemExit(f"{benchmark.id}: {path} was generated with other settings ({diff})")
+    # Options may differ on purpose (a scoring timeout, another judge), so only warn:
+    # a generation-side one (agent=gold, sampling) makes the score describe other outputs.
+    generated = record.get("options") or {}
+    if changed := sorted(k for k in {*generated, *config.options} if generated.get(k) != config.options.get(k)):
+        log.warning("%s: options differ from the generation's: %s", benchmark.id,
+                    ", ".join(f"{k} {generated.get(k)!r} -> {config.options.get(k)!r}" for k in changed))
     return record

@@ -76,6 +76,12 @@ def test_score_needs_a_matching_generation(tmp_path):
                   "--limit", "3", "--phase", "score"])  # fmt: skip
 
 
+def test_score_warns_on_other_options(tmp_path, caplog):
+    _run(tmp_path, "--phase", "generate", "--option", "agent=gold")
+    _run(tmp_path, "--phase", "score", "--option", "timeout=9")
+    assert "agent 'gold' -> None, timeout None -> '9'" in caplog.text
+
+
 def test_score_never_generates(tmp_path):
     _run(tmp_path, "--phase", "generate")
     (tmp_path / "gen" / "1.txt").unlink()
