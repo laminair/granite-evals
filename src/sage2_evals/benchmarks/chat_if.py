@@ -598,6 +598,9 @@ class IFBench(NemoSkillsBenchmark):
     are followed by the response or one of IFBench's loose variants of it:
     first/last line or markdown ``*`` removed), mean over 2 generations.
 
+    Splits like every NeMo-Skills benchmark: ``--phase generate`` writes the
+    responses, ``--phase score`` runs the verifiers on them (CPU only).
+
     No gold mode: IFBench has no reference responses."""
 
     id = "ifbench"
@@ -624,7 +627,8 @@ class IFBench(NemoSkillsBenchmark):
         # IFBench's verifiers call nltk.download() when they are built, and nltk
         # searches ~/nltk_data before the image's pinned copy: a download there (or
         # data already in the job's home) would replace it. NLTK_DATA goes first on
-        # nltk's search path, in the run_eval subprocess too.
-        paths = [p for p in os.environ.get("NLTK_DATA", "").split(os.pathsep) if p]
-        os.environ["NLTK_DATA"] = os.pathsep.join([IFBENCH_NLTK_DATA, *(p for p in paths if p != IFBENCH_NLTK_DATA)])
+        # nltk's search path, in the run_eval subprocess too. Only scoring uses it.
+        if self.scoring:
+            paths = [p for p in os.environ.get("NLTK_DATA", "").split(os.pathsep) if p]
+            os.environ["NLTK_DATA"] = os.pathsep.join([IFBENCH_NLTK_DATA, *(p for p in paths if p != IFBENCH_NLTK_DATA)])
         return super().run(base_url, served_model_name)

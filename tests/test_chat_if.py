@@ -1,6 +1,7 @@
 """chat-if family tests: fakes only (no GPU, no network, no server)."""
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -526,6 +527,55 @@ def test_ifbench_puts_the_pinned_nltk_data_first(tmp_path, monkeypatch):
     monkeypatch.setenv("NLTK_DATA", f"/elsewhere:{chat_if.IFBENCH_NLTK_DATA}")
     chat_if.IFBench(RunConfig(model="m", output_dir=tmp_path)).run("", "")
     assert seen["NLTK_DATA"].split(":") == [chat_if.IFBENCH_NLTK_DATA, "/elsewhere"]
+
+
+def _ifbench_phase(tmp_path, monkeypatch, phase, events):
+    """IFBench on 2 prompts with ns's generation and evaluator faked: the evaluator
+    grades each marked file (prompt 0 followed, prompt 1 not)."""
+    from sage2_evals.benchmarks import nemo_skills as nsb
+
+    prepared = tmp_path / "prepared.jsonl"
+    nsb._write_jsonl(prepared, [{"key": str(i), "prompt": f"p{i}", "instruction_id_list": ["a"]} for i in range(2)])
+
+    def fake_generate(cmd, out, *, log_path, what):
+        events.append(("generate", cmd[-1]))
+        rows = nsb._read_jsonl(prepared)
+        nsb._write_jsonl(out, [{**r, "response": "r", "num_generated_tokens": 3} for r in rows])
+
+    def fake_evaluate(self, output, args, what):
+        if not output.exists():
+            raise self.not_generated(what)
+        if nsb._unscored(output).exists():
+            events.append(("evaluate", nsb._eval_overrides(args), os.environ["NLTK_DATA"].split(os.pathsep)[0]))
+            ev = [{"follow_all_instructions": i == 0, "follow_instruction_list": [i == 0]} for i in range(2)]
+            nsb._write_jsonl(output, [{**r, "loose_eval": e, "strict_eval": e} for r, e in zip(nsb._read_jsonl(output), ev)])
+            nsb._unscored(output).unlink()
+
+    monkeypatch.setattr(nsb, "_run_ns", fake_generate)
+    monkeypatch.setattr(nsb.NemoSkillsBenchmark, "_evaluate", fake_evaluate)
+    b = chat_if.IFBench(RunConfig(model="m", output_dir=tmp_path, phase=phase))
+    monkeypatch.setattr(b, "prepare_data", lambda: (prepared, {"sha256": "x"}))
+    return b.run("http://127.0.0.1:9/v1" if phase == "generate" else "", "m")
+
+
+def test_ifbench_generate_then_score(tmp_path, monkeypatch):
+    pytest.importorskip("nemo_skills")
+    monkeypatch.setenv("NLTK_DATA", "/elsewhere")
+    g = _ifbench_phase(tmp_path, monkeypatch, "generate", events := [])
+    assert g["n"] == 2 and "value" not in g and events == [("generate", "++eval_type=null")] * 2
+    assert os.environ["NLTK_DATA"] == "/elsewhere"  # only scoring needs the pinned nltk data
+    s = _ifbench_phase(tmp_path, monkeypatch, "score", events := [])
+    graded = ("evaluate", ["++eval_type=ifbench"], chat_if.IFBENCH_NLTK_DATA)
+    assert events == [graded, graded] and (s["value"], s["n"]) == (pytest.approx(0.5), 2)
+    assert _ifbench_phase(tmp_path, monkeypatch, "score", events := [])["value"] == pytest.approx(0.5)
+    assert events == []  # re-scored from the graded files
+    (tmp_path / "generation" / "output-rs1.jsonl").unlink()
+    with pytest.raises(RuntimeError, match="no generation for repeat 1"):
+        _ifbench_phase(tmp_path, monkeypatch, "score", [])
+
+
+def test_ifbench_is_splittable_mmlu_prox_is_not():
+    assert chat_if.IFBench.splittable and not chat_if.MMLUProXLite.splittable
 
 
 # Every instruction of the pinned IFBench test data (newer than the IFBench checkout

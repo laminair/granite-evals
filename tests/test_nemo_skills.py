@@ -333,3 +333,97 @@ def test_arena_budget_exhausted_stops_and_keeps_the_file(ns, tmp_path, monkeypat
         b._judge_all(tmp_path / "generation", tmp_path / "judged", up.base_url, "g")
     assert (tmp_path / "judged" / "output-rs0.jsonl").exists() and len(calls) == 2  # stopped before rs1
     assert not (tmp_path / "judged" / "output-rs1.jsonl").exists()
+
+
+# -- phases --------------------------------------------------------------------
+
+
+def test_eval_overrides_keep_only_the_evaluation():
+    args = ["++prompt_config=x", "++eval_type=math", "++eval_config.timeout=5", "+eval_config.a.b=1", "++inference.top_k=-1"]
+    assert nsb._eval_overrides(args) == ["++eval_type=math", "++eval_config.timeout=5", "+eval_config.a.b=1"]
+
+
+def test_phase_support(tmp_path):
+    assert all(registry.get(bid).splittable for bid in IDS)
+    assert not bench("arena-hard-v2", tmp_path).score_needs_server()
+    assert bench("arena-hard-v2", tmp_path, options={"judge_model": "self"}).score_needs_server()
+    assert not bench("aime25", tmp_path, options={"judge_model": "self"}).score_needs_server()  # no judge
+
+
+def _rows(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_aime25_gold_generate_then_score(ns, tmp_path, monkeypatch):
+    """Generate leaves the files ungraded and marked; score grades them with ns's
+    batch evaluation, without a model, to the same rows as --phase all."""
+    kw = {"limit": 3, "repeats": 2, "workers": 3, "options": {"answers": "gold"}}
+    split = tmp_path / "split"
+    r = bench("aime25", split, phase="generate", **kw).run("", "")
+    assert r["n"] == 3 and "value" not in r and r["statuses"] == {"stop": 6}
+    gen = split / "generation" / "output-rs0.jsonl"
+    assert all("symbolic_correct" not in row for row in _rows(gen))
+    assert nsb._unscored(gen).exists()
+
+    monkeypatch.setattr(nsb, "_run_ns", lambda *a, **k: pytest.fail("score phase generated"))
+    monkeypatch.setattr(nsb, "_GoldServer", lambda *a, **k: pytest.fail("score phase served"))
+    s = bench("aime25", split, phase="score", **kw).run("", "gold")
+    assert (s["value"], s["n"], s["statuses"]) == (1.0, 3, {"stop": 6})
+    assert not nsb._unscored(gen).exists()
+    graded = _rows(gen)
+    mtime = gen.stat().st_mtime_ns
+    assert bench("aime25", split, phase="score", **kw).run("", "gold")["value"] == 1.0  # re-runnable
+    assert gen.stat().st_mtime_ns == mtime  # already graded: left as is
+    monkeypatch.undo()
+
+    a = bench("aime25", tmp_path / "all", **kw).run("", "")
+    assert {k: v for k, v in a.items() if k not in ("ns_metrics",)} == {k: v for k, v in s.items() if k not in ("ns_metrics",)}
+    # the same rows but for timings (key order aside)
+    timing = ("interleaved_eval_single_time_s", "generation_start_time", "generation_end_time", "generation_time")
+    in_gen = _rows(tmp_path / "all" / "generation" / "output-rs0.jsonl")
+    assert [{k: v for k, v in r.items() if k not in timing} for r in graded] == [
+        {k: v for k, v in r.items() if k not in timing} for r in in_gen
+    ]
+    assert not nsb._unscored(tmp_path / "all" / "generation" / "output-rs0.jsonl").exists()
+
+
+def test_score_without_generation(ns, tmp_path):
+    kw = {"limit": 2, "repeats": 2, "options": {"answers": "gold"}}
+    with pytest.raises(RuntimeError, match="no generation for input"):
+        bench("aime25", tmp_path, phase="score", **kw).run("", "gold")
+    bench("aime25", tmp_path, phase="generate", **kw).run("", "")
+    (tmp_path / "generation" / "output-rs1.jsonl").unlink()
+    with pytest.raises(RuntimeError, match="no generation for repeat 1"):
+        bench("aime25", tmp_path, phase="score", **kw).run("", "gold")
+    with pytest.raises(SystemExit, match="differs from what was generated"):
+        bench("aime25", tmp_path, phase="score", **{**kw, "limit": 1}).run("", "gold")
+    assert (tmp_path / "generation" / "output-rs0.jsonl").exists()  # score never discards
+
+
+def test_phase_all_grades_a_marked_file(ns, tmp_path):
+    """A file left by an interrupted generate phase is graded by --phase all too."""
+    kw = {"limit": 2, "repeats": 1, "options": {"answers": "gold"}}
+    bench("aime25", tmp_path, phase="generate", **kw).run("", "")
+    assert bench("aime25", tmp_path, **kw).run("", "")["value"] == 1.0
+    assert not nsb._unscored(tmp_path / "generation" / "output-rs0.jsonl").exists()
+
+
+def test_arena_generate_needs_no_judge(ns, tmp_path, monkeypatch):
+    prepared = tmp_path / "prepared.jsonl"
+    nsb._write_jsonl(prepared, [{"question": f"q{i}", "category": "hard_prompt"} for i in range(3)])
+    cmds = []
+
+    def fake_generate(cmd, out, *, log_path, what):
+        cmds.append(cmd)
+        args = dict(a[2:].split("=", 1) for a in cmd if a.startswith("++"))
+        nsb._write_jsonl(out, [{**r, "generation": "g"} for r in nsb._read_jsonl(nsb.Path(args["input_file"]))])
+
+    monkeypatch.setattr(nsb, "_run_ns", fake_generate)
+    monkeypatch.setattr(nsb.NemoSkillsBenchmark, "_judge_all", lambda *a, **k: pytest.fail("judged in generate"))
+    monkeypatch.setattr(nsb, "_MeteringProxy", lambda *a, **k: pytest.fail("judge endpoint in generate"))
+    b = bench("arena-hard-v2", tmp_path, phase="generate")
+    monkeypatch.setattr(b, "prepare_data", lambda: (prepared, {"sha256": "x"}))
+    r = b.run("http://127.0.0.1:9/v1", "m")
+    assert r["n"] == 3 and "value" not in r
+    assert len(cmds) == 1 and cmds[0][-1] == "++eval_type=null"
+    assert len(_rows(tmp_path / "generation" / "output-rs0.jsonl")) == 3

@@ -43,6 +43,11 @@ task budgets). results.json records ``thinking`` (mode, budget, per-task
 ``tokens_to_generate``, data format, scoring source, cut-off counts and token
 percentiles) and ``departures``.
 
+Phases: ``--phase generate`` checks the served context, builds the data (the
+tokenizer) and generates each task with ns's evaluation off; ``--phase score``
+runs ns's RULER match, the think-tag check and the metrics on those files, on
+the data generate built (no tokenizer, no model).
+
 Options: ``tokenizer`` (default: ``--model``), ``enable_thinking``,
 ``thinking_budget``, ``sample_length`` (default ``max_seq_length``), ``tasks``
 (comma-separated subset, for debugging; the headline then averages only those),
@@ -84,10 +89,12 @@ from sage2_evals.benchmarks.nemo_skills import (
     _status_line,
     _statuses,
     _merge_counts,
+    _check_input,
     _write_jsonl,
     log,
 )
 from sage2_evals.registry import register
+from sage2_evals.results import GENERATION_FILE
 
 RULER_REPO = "https://github.com/NVIDIA/RULER"
 RULER_COMMIT = "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a"
@@ -155,6 +162,7 @@ class RulerBenchmark(NemoSkillsBenchmark):
     dataset_revision = RULER_COMMIT
     harness_packages = (*NemoSkillsBenchmark.harness_packages, "wonderwords", "nltk", "transformers")
     max_seq_length: ClassVar[int]
+    splittable = True
 
     # -- config ------------------------------------------------------------
 
@@ -246,7 +254,7 @@ class RulerBenchmark(NemoSkillsBenchmark):
         if self.config.dataset and Path(self.config.dataset).is_dir():
             setup_dir = Path(self.config.dataset)
             return setup_dir, {"source": "local", "path": str(setup_dir), **self._task_files(setup_dir, tasks)}
-        if self.tokenizer() in ("", "none"):
+        if self.tokenizer() in ("", "none") and self.generating:
             raise SystemExit(f"{self.id}: RULER data are built for a tokenizer: pass --model or --option tokenizer=")
         spec = {
             "ns_commit": NS_COMMIT,
@@ -256,13 +264,17 @@ class RulerBenchmark(NemoSkillsBenchmark):
             "data_format": self.data_format(),
             "num_samples": NUM_SAMPLES,
             "tasks": tasks,
-            **self.tokenizer_fingerprint(),
+            **(self.tokenizer_fingerprint() if self.generating else {}),
         }
         spec_hash = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
         ddir = self.config.output_dir / "ns-data" / "ruler"
         setup_dir = ddir / self.setup_name()
         prov_path = setup_dir / "sage2-provenance.json"
-        if prov_path.exists() and json.loads(prov_path.read_text()).get("spec_hash") == spec_hash:
+        if not self.generating:  # score grades the data generate built (no tokenizer needed)
+            if not prov_path.exists():
+                raise self.not_generated(f"RULER data {setup_dir}")
+            prov = json.loads(prov_path.read_text())
+        elif prov_path.exists() and json.loads(prov_path.read_text()).get("spec_hash") == spec_hash:
             prov = json.loads(prov_path.read_text())
         else:
             json_shas = self.check_ruler_source()
@@ -409,6 +421,11 @@ class RulerBenchmark(NemoSkillsBenchmark):
             "per_task": per_task,
         }
 
+    def _generated_detail(self, key: str) -> Any:
+        """A value the generate phase recorded (generation.json details)."""
+        path = self.config.output_dir / GENERATION_FILE
+        return json.loads(path.read_text()).get("details", {}).get(key) if path.exists() else None
+
     def scoring_source(self) -> str:
         """What ns's RULER match reads as ``generation`` in this mode."""
         return SCORING_SOURCES[self.data_format()]
@@ -417,7 +434,9 @@ class RulerBenchmark(NemoSkillsBenchmark):
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         # Before building (128k) data for a server that cannot hold it.
-        max_model_len = None if self.gold else self.check_context(base_url, served_model_name)
+        max_model_len = self.check_context(base_url, served_model_name) if self.generating and not self.gold else None
+        if not self.generating:
+            max_model_len = self._generated_detail("served_max_model_len")
         setup_dir, provenance = self.prepare_data()
         tasks = self.tasks()
         out = self.config.output_dir / "ruler"
@@ -425,20 +444,44 @@ class RulerBenchmark(NemoSkillsBenchmark):
         for t in tasks:
             rows = data.take(_read_jsonl(setup_dir / t / "test.jsonl"), self.config.limit, key="index")
             inputs[t] = out / t / "input.jsonl"
-            _write_jsonl(inputs[t], rows)
-            _reset_task_if_input_changed(out / t)
+            if self.generating:
+                _write_jsonl(inputs[t], rows)
+                _reset_task_if_input_changed(out / t)
+            else:
+                _check_input(self, out / t / "input.sha256", rows)
         n = sum(len(_read_jsonl(p)) for p in inputs.values())
         log.info("%s: %d tasks, %d samples x %d repeats", self.id, len(tasks), n, self.repeats)
 
         with contextlib.ExitStack() as stack:
-            if self.gold:
+            if self.gold and self.generating:
                 all_rows = [r for p in inputs.values() for r in _read_jsonl(p)]
                 base_url = stack.enter_context(RulerGoldServer(all_rows)).base_url
                 served_model_name = "gold"
             for t in tasks:
                 for k in range(self.repeats):
-                    self._generate_task(setup_dir, t, inputs[t], base_url, served_model_name, k)
-                    self.check_generations(inputs[t].parent / f"output-rs{k}.jsonl")
+                    output = inputs[t].parent / f"output-rs{k}.jsonl"
+                    if self.generating:
+                        self._generate_task(setup_dir, t, inputs[t], base_url, served_model_name, k)
+                    if self.scoring:
+                        self.check_generations(output)
+                        self._evaluate(output, self.task_generation_args(setup_dir, t), what=f"{t} repeat {k} ({output})")
+        if not self.scoring:
+            files = [out / t / f"output-rs{k}.jsonl" for t in tasks for k in range(self.repeats)]
+            return {
+                "n": n,
+                "ns_benchmark": f"ruler.{self.setup_name()}",
+                "sample_length": self.sample_length(),
+                "served_max_model_len": max_model_len,
+                "required_context": self.required_context(),
+                "thinking": self.thinking_record(out, tasks),
+                "departures": self.departures(),
+                "tasks": tasks,
+                "statuses": _merge_counts(_statuses(f) for f in files),
+                "data_provenance": provenance,
+                "answers": "gold" if self.gold else "model",
+                "sampling": self.sampling(),
+                "generation_args": {t: self.task_generation_args(setup_dir, t) for t in tasks},
+            }
 
         agg = self.aggregation()
         per_task, per_task_metrics = {}, {}
@@ -501,6 +544,7 @@ class RulerBenchmark(NemoSkillsBenchmark):
             f"++inference.random_seed={self.config.seed + k}",
             *self.task_generation_args(setup_dir, task),
         ]  # fmt: skip
+        cmd = self._defer_eval(cmd, output)
         _run_ns(cmd, output, log_path=output.parent / f"output-rs{k}.log", what=f"{self.id} {task} rs{k}")
         log.info("%s %s repeat %d: generated %s", self.id, task, k, _status_line(output))
 

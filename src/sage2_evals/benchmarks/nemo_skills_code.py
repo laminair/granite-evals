@@ -11,7 +11,9 @@ LiveCodeBench v6 (``livecodebench-v6``)
     ``nemoskills`` extra) in the job container. Upstream it reloads the test cases
     from HF at an unpinned ref when no ``test_file`` is given, so prepare keeps all
     columns and the evaluator gets a ``test_file`` with the selected problems' full
-    rows; the generation input drops the (large) test-case columns.
+    rows; the generation input drops the (large) test-case columns. The test file
+    is rewritten from the prepared data in every phase (``--phase score`` grades
+    with it).
 
 SciCode (``scicode``)
     ns's ``test`` split (65 problems, 288 evaluated subtasks), the "with background"
@@ -21,7 +23,8 @@ SciCode (``scicode``)
     versions ns's sandbox image ends up with) and the SciCode test data at
     ``/data/test_data.h5`` (sha256-verified at image build). ``pip`` inside the
     sandbox is a no-op shim, so the evaluator's own ``pip install`` calls cannot
-    change the pinned environment at run time.
+    change the pinned environment at run time. Only grading uses the sandbox:
+    ``--phase generate`` neither starts nor checks it.
 
     Departure from ns (``prefill_fixes``, on by default): the harness-supplied code
     of steps 13.6 and 62.1 is SciCode's original ``eval/data`` file (``class
@@ -303,12 +306,14 @@ class SciCode(NemoSkillsBenchmark):
 
     def load_rows(self, path: Path) -> list[dict]:
         rows = super().load_rows(path)
-        self._sandbox_report = self.sandbox_report(rows)
+        if self.scoring:  # the sandbox grades; generation does not use it
+            self._sandbox_report = self.sandbox_report(rows)
         return rows
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         result = super().run(base_url, served_model_name)
-        result["sandbox"] = getattr(self, "_sandbox_report", {})
+        if self.scoring:
+            result["sandbox"] = getattr(self, "_sandbox_report", {})
         result.update(self.prefill_record())
         return result
 

@@ -377,3 +377,83 @@ def test_image_has_ruler_generator_imports():
                 if importlib.util.find_spec(top) is None:
                     missing.setdefault(top, []).append(str(p.relative_to(root)))
     assert not missing, missing
+
+
+# -- phases --------------------------------------------------------------------
+
+
+def _fake_ns(calls):
+    """Stands in for ns generation: answers even samples right; grades them with
+    ns's RULER match in-process unless the generation runs with eval_type=null."""
+    from nemo_skills.evaluation.evaluator import evaluate
+
+    def run(cmd, out, *, log_path, what):
+        calls.append(what)
+        args = dict(a[2:].split("=", 1) for a in cmd if a.startswith("++"))  # the last override wins
+        rows = nsb._read_jsonl(Path(args["input_file"]))
+        gen = [
+            {**r, "generation": " ".join(r["expected_answer"]) if r["index"] % 2 == 0 else "x", "reasoning_content": "r",
+             "finish_reason": "stop", "num_generated_tokens": 10 + r["index"]}
+            for r in rows
+        ]  # fmt: skip
+        nsb._write_jsonl(out, gen)
+        if args["eval_type"] != "null":
+            evaluate(args["eval_type"], {"input_file": str(out), "match_type": args["eval_config.match_type"]})
+
+    return run
+
+
+def _prepared(monkeypatch):
+    """prepare_data's cache as the generate phase leaves it (no RULER build)."""
+
+    def run_prepare(b, ddir, tasks):
+        _setup(ddir, tasks=tasks).rename(ddir / b.setup_name())
+
+    monkeypatch.setattr(nsr.RulerBenchmark, "check_ruler_source", lambda b: {})
+    monkeypatch.setattr(nsr.RulerBenchmark, "_run_prepare", run_prepare)
+
+
+def test_run_generate_then_score(ns, tmp_path, monkeypatch):
+    kw = {"limit": 4, "options": {"tasks": "vt,qa_1"}}
+    _prepared(monkeypatch)
+    monkeypatch.setattr(nsr, "_run_ns", _fake_ns(calls := []))
+    monkeypatch.setattr(nsr.RulerBenchmark, "check_context", lambda b, url, served: 131072 + nsr.DEFAULT_THINKING_BUDGET)
+    out = tmp_path / "split"
+    g = bench("ruler-128k", out, phase="generate", **kw).run("http://127.0.0.1:9/v1", "m")
+    assert g["n"] == 8 and "value" not in g and g["served_max_model_len"] == 131072 + nsr.DEFAULT_THINKING_BUDGET
+    assert g["thinking"]["scoring_source"] == nsr.SCORING_SOURCES["chat"] and set(g["generation_args"]) == {"vt", "qa_1"}
+    vt = out / "ruler" / "vt" / "output-rs0.jsonl"
+    assert all("is_correct" not in r for r in nsb._read_jsonl(vt)) and nsb._unscored(vt).exists()
+    (out / "generation.json").write_text(json.dumps({"details": g}))  # as the CLI records it
+
+    for name in ("_run_ns", "RulerGoldServer"):
+        monkeypatch.setattr(nsr, name, lambda *a, **k: pytest.fail("score phase generated"))
+    for name in ("check_context", "tokenizer_fingerprint", "_run_prepare"):
+        monkeypatch.setattr(nsr.RulerBenchmark, name, lambda *a, **k: pytest.fail(f"score phase ran {a}"))
+    s = bench("ruler-128k", out, phase="score", **kw).run("", "m")
+    assert (s["value"], s["n"]) == (pytest.approx(0.5), 8) and not nsb._unscored(vt).exists()
+    assert s["served_max_model_len"] == g["served_max_model_len"]
+    assert s["thinking"]["per_task"]["vt"]["generated_tokens"] == {"p50": 12, "p95": 13, "max": 13}
+    monkeypatch.undo()
+
+    _prepared(monkeypatch)
+    monkeypatch.setattr(nsr, "_run_ns", _fake_ns(calls_all := []))
+    monkeypatch.setattr(nsr.RulerBenchmark, "check_context", lambda b, url, served: 131072 + nsr.DEFAULT_THINKING_BUDGET)
+    a = bench("ruler-128k", tmp_path / "all", **kw).run("http://127.0.0.1:9/v1", "m")
+    strip = ("data_provenance", "generation_args")  # paths under each output dir
+    assert {k: v for k, v in a.items() if k not in strip} == {k: v for k, v in s.items() if k not in strip}
+    assert len(calls_all) == len(calls) == 2
+
+
+def test_score_without_generation(ns, tmp_path, monkeypatch):
+    kw = {"limit": 2, "options": {"tasks": "vt,cwe", "answers": "gold"}}
+    with pytest.raises(RuntimeError, match="no generation for RULER data"):
+        bench("ruler-64k", tmp_path, phase="score", **kw).run("", "gold")
+    _prepared(monkeypatch)
+    monkeypatch.setattr(nsr, "_run_ns", _fake_ns([]))
+    bench("ruler-64k", tmp_path, phase="generate", **kw).run("", "")
+    (tmp_path / "ruler" / "cwe" / "output-rs0.jsonl").unlink()
+    with pytest.raises(RuntimeError, match="no generation for cwe repeat 0"):
+        bench("ruler-64k", tmp_path, phase="score", **kw).run("", "gold")
+    with pytest.raises(SystemExit, match="differs from what was generated"):
+        bench("ruler-64k", tmp_path, phase="score", **{**kw, "limit": 1}).run("", "gold")

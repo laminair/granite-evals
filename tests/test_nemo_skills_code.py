@@ -380,3 +380,74 @@ def test_prefill_record(ns, tmp_path):
         "prefill_fixes": [],
         "prefill_fixes_enabled": False,
     }
+
+
+# -- phases --------------------------------------------------------------------
+
+
+def test_lcb_score_grades_with_the_tests_file(ns, tmp_path):
+    b = bench("livecodebench-v6", tmp_path, phase="score")
+    overrides = nsb._eval_overrides(b.generation_args([]))
+    assert overrides == ["++eval_type=livecodebench", f"++eval_config.test_file={tmp_path / 'lcb-tests.jsonl'}"]
+    b.load_rows(_write(tmp_path / "in.jsonl", _lcb_rows()))
+    assert len(nsb._read_jsonl(b.tests_file())) == 3  # rewritten in the score phase too
+
+
+def _scicode_split(tmp_path, monkeypatch, phase, events):
+    """A SciCode run on 2 fake problems: fake generation, fake sandbox, a fake
+    evaluator that grades each marked file as ns's would (eval_status)."""
+    import contextlib
+
+    prepared = _write(tmp_path / "prepared.jsonl", [{"problem_id": str(i), "sub_steps": []} for i in range(2)])
+
+    def fake_generate(cmd, out, *, log_path, what):
+        events.append(("generate", cmd[-1]))
+        graded = {} if cmd[-1] == "++eval_type=null" else {"eval_status": [{"process_status": "completed"}]}
+        rows = [{"problem_id": str(i), "generation": "g", "num_generated_tokens": 1, **graded} for i in range(2)]
+        nsb._write_jsonl(out, rows)
+
+    @contextlib.contextmanager
+    def fake_sandbox(self):
+        events.append(("sandbox",))
+        yield ["++sandbox.port=1"]
+
+    def fake_evaluate(self, output, args, what):
+        if not output.exists():
+            raise self.not_generated(what)
+        if nsb._unscored(output).exists():
+            events.append(("evaluate", output.name))
+            rows = [{**r, "eval_status": [{"process_status": "completed"}]} for r in nsb._read_jsonl(output)]
+            nsb._write_jsonl(output, rows)
+            nsb._unscored(output).unlink()
+
+    monkeypatch.setattr(nsb, "_run_ns", fake_generate)
+    monkeypatch.setattr(nsc.SciCode, "ns_sandbox", fake_sandbox)
+    monkeypatch.setattr(nsc.SciCode, "sandbox_report", lambda self, rows: events.append(("report",)) or {"ok": True})
+    monkeypatch.setattr(nsb.NemoSkillsBenchmark, "_evaluate", fake_evaluate)
+    b = bench("scicode", tmp_path, phase=phase)
+    monkeypatch.setattr(b, "prepare_data", lambda: (prepared, {"sha256": "x"}))
+    return b.run("http://127.0.0.1:9/v1" if phase != "score" else "", "m")
+
+
+def test_scicode_generate_then_score(ns, tmp_path, monkeypatch):
+    events = []
+    g = _scicode_split(tmp_path, monkeypatch, "generate", events)
+    assert events == [("generate", "++eval_type=null")] * 2  # no sandbox, no report
+    assert g["n"] == 2 and "value" not in g and "sandbox" not in g and g["prefill_fixes_enabled"]
+    events.clear()
+    (tmp_path / "generation" / "output-rs1.jsonl").unlink()
+    with pytest.raises(RuntimeError, match="no generation for repeat 1"):
+        _scicode_split(tmp_path, monkeypatch, "score", events)
+    assert events == [("report",), ("sandbox",), ("evaluate", "output-rs0.jsonl")]  # graded what is there
+    _scicode_split(tmp_path, monkeypatch, "generate", events := [])
+    assert events == [("generate", "++eval_type=null")]  # only the missing repeat
+    s = _scicode_split(tmp_path, monkeypatch, "score", events := [])
+    assert events == [("report",), ("sandbox",), ("evaluate", "output-rs1.jsonl")]  # rs0 kept its grades
+    assert (s["value"], s["n"], s["sandbox"]) == (1.0, 2, {"ok": True}) and s["prefill_fixes_enabled"]
+
+
+def test_scicode_phase_all_unchanged(ns, tmp_path, monkeypatch):
+    r = _scicode_split(tmp_path, monkeypatch, "all", events := [])
+    # ns evaluates inside generation, with the sandbox up
+    assert events == [("report",), ("sandbox",), ("generate", "++sandbox.port=1"), ("generate", "++sandbox.port=1")]
+    assert (r["value"], r["sandbox"]) == (1.0, {"ok": True})

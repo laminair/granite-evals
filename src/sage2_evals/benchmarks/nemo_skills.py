@@ -31,6 +31,14 @@ Everything is under ``<output_dir>`` and ns resumes a partial output file
 soft failure (``++server.enable_soft_fail``): an empty, wrong answer with
 ``finish_reason: error``, counted in ``details.statuses``.
 
+Phases (``registry``). ``--phase generate`` is step 2 with ns's evaluation off
+(``++eval_type=null``); each such file has an ``output-rs<k>.jsonl.unscored``
+marker. ``--phase score`` runs ns's batch evaluation on marked files (the
+``eval_type`` / ``eval_config`` generation would have used, as ns generate runs it
+after generating), then steps 3-4, with the sandbox but no model; a repeat with
+no output file fails the run (``not_generated``). ``--phase all`` evaluates inside
+generation as before, and grades any marked file it finds.
+
 Adding a NeMo-Skills benchmark (siblings: start here)
 -----------------------------------------------------
 Subclass ``NemoSkillsBenchmark`` and ``@register`` it; class attributes do the rest::
@@ -121,6 +129,7 @@ class NemoSkillsBenchmark(Benchmark):
 
     extra = "nemoskills"
     harness_packages = ("nemo-skills", "litellm", "math-verify")
+    splittable = True
 
     ns_benchmark: ClassVar[str]
     ns_split: ClassVar[str] = ""
@@ -165,6 +174,9 @@ class NemoSkillsBenchmark(Benchmark):
 
     def needs_server(self) -> bool:
         return not self.gold
+
+    def score_needs_server(self) -> bool:
+        return self.uses_judge() and self.opt("judge_model", JUDGE_MODEL) == "self"
 
     # -- the ns dataset module ------------------------------------------------
 
@@ -280,19 +292,34 @@ class NemoSkillsBenchmark(Benchmark):
         rows = self.load_rows(prepared)
         out = self.config.output_dir
         input_file = out / "input.jsonl"
-        _write_jsonl(input_file, rows)
-        self._reset_if_input_changed(input_file)
+        self._write_input(input_file, rows)
         log.info("%s: %d examples x %d repeats", self.id, len(rows), self.repeats)
 
         gen_dir, judged_dir = out / "generation", out / "judged"
+        gen_files = [gen_dir / f"output-rs{k}.jsonl" for k in range(self.repeats)]
         with contextlib.ExitStack() as stack:
-            if self.gold:
-                base_url = stack.enter_context(_GoldServer(rows, self.gold_generation)).base_url
-                served_model_name = "gold"
-            sandbox_args = stack.enter_context(self.ns_sandbox()) if self.uses_sandbox() else []
-            for k in range(self.repeats):
-                self._generate(input_file, gen_dir / f"output-rs{k}.jsonl", base_url, served_model_name, k, sandbox_args)
-                log.info("%s repeat %d: generated %s", self.id, k, _status_line(gen_dir / f"output-rs{k}.jsonl"))
+            # ns's code evaluators (SciCode) run in the sandbox: scoring only.
+            sandbox_args = stack.enter_context(self.ns_sandbox()) if self.uses_sandbox() and self.scoring else []
+            if self.generating:
+                if self.gold:
+                    base_url = stack.enter_context(_GoldServer(rows, self.gold_generation)).base_url
+                    served_model_name = "gold"
+                for k, f in enumerate(gen_files):
+                    self._generate(input_file, f, base_url, served_model_name, k, sandbox_args)
+                    log.info("%s repeat %d: generated %s", self.id, k, _status_line(f))
+            if not self.scoring:
+                return {
+                    "n": len(rows),
+                    "ns_benchmark": self.ns_benchmark,
+                    "data_provenance": provenance,
+                    "answers": "gold" if self.gold else "model",
+                    "sampling": self.sampling(),
+                    "generation_args": self.generation_args(sandbox_args=[]),
+                    "statuses": _merge_counts(_statuses(f) for f in gen_files),
+                    "generation_tokens": _token_stats(gen_dir, self.repeats),
+                }
+            for k, f in enumerate(gen_files):
+                self._evaluate(f, self.generation_args(sandbox_args=[]), what=f"repeat {k} ({f})")
             judge_details = {}
             if self.uses_judge():
                 judge_details = self._judge_all(gen_dir, judged_dir, base_url, served_model_name)
@@ -329,6 +356,14 @@ class NemoSkillsBenchmark(Benchmark):
             **judge_details,
             "ns_metrics": _jsonable(metrics),
         }
+
+    def _write_input(self, input_file: Path, rows: list[dict]) -> None:
+        """The generation input; the score phase only checks that it is what was generated."""
+        if self.generating:
+            _write_jsonl(input_file, rows)
+            self._reset_if_input_changed(input_file)
+        else:
+            _check_input(self, self.config.output_dir / "input.sha256", rows)
 
     def _reset_if_input_changed(self, input_file: Path) -> None:
         """A rerun with another --limit or dataset must not reuse old outputs."""
@@ -391,7 +426,40 @@ class NemoSkillsBenchmark(Benchmark):
             f"++inference.random_seed={self.config.seed + k}",
             *self.generation_args(sandbox_args),
         ]  # fmt: skip
+        cmd = self._defer_eval(cmd, output)
         _run_ns(cmd, output, log_path=output.parent / f"output-rs{k}.log", what=f"{self.id} generate rs{k}")
+
+    def _defer_eval(self, cmd: list[str], output: Path) -> list[str]:
+        """The generate phase generates without ns's evaluation, and marks the file
+        unscored before it starts (a resumed half-generated file keeps its mark:
+        its early rows were never evaluated)."""
+        marker = _unscored(output)
+        if self.phase != "generate" and not marker.exists():
+            return cmd
+        output.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return [*cmd, "++eval_type=null"]  # after every other override: the last one wins
+
+    def _evaluate(self, output: Path, args: list[str], what: str) -> None:
+        """Grade a file generated without ns's evaluation: ns's batch evaluation with
+        the ``eval_type`` / ``eval_config`` of the generation ``args``, as ns generate
+        runs it after generating (``run_batch_evaluation``; a per-answer evaluator
+        like math's gives the same fields in batch). An unmarked file was graded
+        inside generation and is left as is."""
+        if not output.exists():
+            raise self.not_generated(what)
+        marker = _unscored(output)
+        if not marker.exists():
+            return
+        cmd = [sys.executable, "-c", "from sage2_evals.benchmarks.nemo_skills import _evaluate_main; _evaluate_main()"]
+        cmd += [str(output), *_eval_overrides(args)]
+        log_path = output.with_name(output.stem + "-eval.log")
+        log.info("%s evaluate %s: %s", self.id, output.name, shlex.join(cmd))
+        with log_path.open("ab") as logf:
+            r = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, env=_ns_env())
+        if r.returncode:
+            raise RuntimeError(f"{self.id}: ns evaluation of {output} exited {r.returncode}; see {log_path}")
+        marker.unlink()
 
     def gold_generation(self, row: dict) -> str:
         """The oracle response for ``answers=gold``: the reference answer in the
@@ -646,6 +714,48 @@ def _run_ns(cmd: list[str], output: Path, *, log_path: Path, what: str) -> None:
             return
         log.warning("%s: exit %d, see %s", what, r.returncode, log_path)
     raise RuntimeError(f"{what} failed {GENERATION_ATTEMPTS} times; see {log_path}")
+
+
+def _evaluate_main() -> None:
+    """ns's batch evaluation of one generation file (argv[1]), as ns generate runs it
+    after generating: ``eval_type`` / ``eval_config`` from the ``++`` overrides
+    (argv[2:]), composed by Hydra onto ns's generation config as ns generate does."""
+    from hydra import compose, initialize
+    from nemo_skills.evaluation.evaluator import evaluate
+    from nemo_skills.inference import generate  # noqa: F401  registers base_generation_config
+    from omegaconf import OmegaConf
+
+    output, overrides = sys.argv[1], sys.argv[2:]
+    with initialize(version_base=None):
+        cfg = compose(config_name="base_generation_config", overrides=overrides)
+    if cfg.eval_type is None:
+        return
+    # A DictConfig, as ns generate passes it (class evaluators read attributes).
+    eval_config = OmegaConf.create({**OmegaConf.to_container(cfg.eval_config, resolve=True), "input_file": output})
+    evaluate(cfg.eval_type, eval_config)
+
+
+def _eval_overrides(args: list[str]) -> list[str]:
+    """The ``eval_type`` / ``eval_config`` overrides among ns generation args."""
+    keys = [a.lstrip("+").split("=", 1)[0] for a in args]
+    return [a for a, k in zip(args, keys) if k == "eval_type" or k.split(".")[0] == "eval_config"]
+
+
+def _unscored(output: Path) -> Path:
+    """The marker of a generation file ns has not evaluated yet (``_defer_eval``)."""
+    return output.with_name(output.name + ".unscored")
+
+
+def _check_input(benchmark: Benchmark, stamp: Path, rows: list[dict]) -> None:
+    """The score phase grades the input that was generated, or nothing."""
+    digest = hashlib.sha256("".join(json.dumps(r) + "\n" for r in rows).encode()).hexdigest()
+    if not stamp.exists():
+        raise benchmark.not_generated(f"input {stamp.parent}")
+    if stamp.read_text().strip() != digest:
+        raise SystemExit(
+            f"{benchmark.id}: the input in {stamp.parent} differs from what was generated "
+            "(other options or data?); score with the generate phase's options"
+        )
 
 
 def _ns_env() -> dict[str, str]:
