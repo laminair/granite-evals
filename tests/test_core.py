@@ -38,6 +38,36 @@ def test_enroot_sandbox_keeps_tmp_between_commands(tmp_path, monkeypatch):
     assert not sb.tmp.exists()
 
 
+def test_enroot_sandbox_localhost_is_ipv4(tmp_path, monkeypatch):
+    # Shared host network: localhost -> ::1 reaches nothing a task bound on IPv4.
+    monkeypatch.setenv("ENROOT_TEMP_PATH", str(tmp_path))
+    monkeypatch.setattr(enroot, "ensure_squashfs", lambda image: tmp_path / "x.sqsh")
+    monkeypatch.setattr(enroot.subprocess, "run", lambda *a, **k: None)
+    sb = enroot.EnrootSandbox("img:latest")
+    sb.start()
+    argv = sb._exec_argv("true", "/", {})
+    mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "--mount"]
+    assert mounts == [f"{sb.tmp}:/tmp", f"{sb.hosts}:/etc/hosts"]
+    assert "127.0.0.1" in sb.hosts.read_text()
+    sb.close()
+    assert not sb.hosts.exists()
+
+
+def test_ipv4_localhost():
+    bluevela = (
+        "127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4\n"
+        "::1         localhost localhost.localdomain localhost6 localhost6.localdomain6\n"
+        "10.0.0.5 node5 # compute\n"
+    )
+    assert enroot.ipv4_localhost(bluevela) == (
+        "127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4\n"
+        "::1 localhost.localdomain localhost6 localhost6.localdomain6\n"
+        "10.0.0.5 node5 # compute\n"
+    )
+    assert enroot.ipv4_localhost("::1 localhost\n") == "127.0.0.1 localhost\n"
+    assert enroot.ipv4_localhost("") == "127.0.0.1 localhost\n"
+
+
 def test_enroot_sandbox_kills_its_leftovers_before_remove(tmp_path, monkeypatch):
     # No PID namespace: a daemon that rewrites its environment (redis-server) would
     # outlive the sandbox and answer the next task on its port.

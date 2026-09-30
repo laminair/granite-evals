@@ -10,6 +10,14 @@ mounts), and each command is its own ``start``, so a sandbox gets a host
 directory (under ``ENROOT_TEMP_PATH``) bound over /tmp instead: files written
 there by one command are still there for the next.
 
+Sandboxes share the host's network namespace. On BlueVela the host's
+/etc/hosts maps ``localhost`` to ::1 as well as 127.0.0.1, so clients that
+take the first address (Node) connect to ::1, while task servers that bind
+IPv4 only (NodeBB's test forum) refuse them. Docker containers, where the
+tasks were written, usually have no IPv6, so there ``localhost`` means
+127.0.0.1. Each sandbox gets /etc/hosts bound to a copy of the host's with
+``localhost`` dropped from the IPv6 lines.
+
 Sandboxes get no GPUs: enroot passes our environment through, and in a GPU
 job NVIDIA_VISIBLE_DEVICES would make its nvidia hook look for
 nvidia-container-cli, which the image doesn't have.
@@ -130,8 +138,26 @@ def enroot_rootfs(name: str) -> str:
     return os.path.join(data, name)
 
 
+def ipv4_localhost(hosts: str) -> str:
+    """``hosts`` with the name ``localhost`` dropped from its IPv6 lines."""
+    out = []
+    for line in hosts.splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) > 1 and ":" in fields[0] and "localhost" in fields[1:]:
+            names = [n for n in fields[1:] if n != "localhost"]
+            line = " ".join([fields[0], *names]) if names else ""
+        if line:
+            out.append(line)
+    if not any(
+        (f := ln.split("#", 1)[0].split()) and f[0] == "127.0.0.1" and "localhost" in f[1:] for ln in out
+    ):
+        out.insert(0, "127.0.0.1 localhost")
+    return "\n".join(out) + "\n"
+
+
 class EnrootSandbox(Sandbox):
     tmp: Path | None = None
+    hosts: Path | None = None
 
     def start(self) -> None:
         sqsh = ensure_squashfs(self.image)
@@ -139,6 +165,13 @@ class EnrootSandbox(Sandbox):
         os.makedirs(base, exist_ok=True)
         self.tmp = Path(tempfile.mkdtemp(prefix=f"{self.name}-tmp-", dir=base))
         self.tmp.chmod(0o1777)
+        try:
+            host_hosts = Path("/etc/hosts").read_text()
+        except OSError:
+            host_hosts = ""
+        self.hosts = Path(f"{self.tmp}.hosts")
+        self.hosts.write_text(ipv4_localhost(host_hosts))
+        self.hosts.chmod(0o644)
         subprocess.run(
             [ENROOT, "create", "--name", self.name, str(sqsh)],
             check=True,
@@ -150,6 +183,8 @@ class EnrootSandbox(Sandbox):
         argv = [ENROOT, "start", "--root", "--rw"]
         if self.tmp:
             argv += ["--mount", f"{self.tmp}:/tmp"]
+        if self.hosts:
+            argv += ["--mount", f"{self.hosts}:/etc/hosts"]
         for key, value in env.items():
             argv += ["--env", f"{key}={value}"]
         return argv + [self.name, "bash", "-c", f"cd {shlex.quote(cwd)} && {command}"]
@@ -172,3 +207,5 @@ class EnrootSandbox(Sandbox):
         )
         if self.tmp:
             shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.hosts:
+            self.hosts.unlink(missing_ok=True)
