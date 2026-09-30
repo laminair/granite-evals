@@ -147,8 +147,8 @@ enroot create --name "$NAME" "$SQSH"
 MOUNTS=(--mount "$ROOT:$ROOT" --mount "$LOCAL/inner:/scratch")
 case "$MODEL" in /*) MOUNTS+=(--mount "$MODEL:$MODEL") ;; esac
 # Passed to the inner shell as arguments, so a value like instances='a|b(c)' stays one word.
-RUN_ARGS=(--model "$MODEL" --output-dir "$RUN" --limit "$LIMIT" --repeats "$REPEATS" --workers "$WORKERS"
-    --phase "$PHASE")
+RUN_ARGS=(--model "$MODEL" --output-dir "$RUN" --limit "$LIMIT" --repeats "$REPEATS" --workers "$WORKERS")
+[ "$PHASE" != all ] && RUN_ARGS+=(--phase "$PHASE")  # images built before phases have no --phase
 [ -n "$DATASET" ] && RUN_ARGS+=(--dataset "$DATASET")
 for kv in $OPTIONS; do RUN_ARGS+=(--option "$kv"); done
 
