@@ -343,7 +343,7 @@ def test_eval_overrides_keep_only_the_evaluation():
     assert nsb._eval_overrides(args) == ["++eval_type=math", "++eval_config.timeout=5", "+eval_config.a.b=1"]
 
 
-def test_phase_support(tmp_path):
+def test_phase_support(ns, tmp_path):
     assert all(registry.get(bid).splittable for bid in IDS)
     assert not bench("arena-hard-v2", tmp_path).score_needs_server()
     assert bench("arena-hard-v2", tmp_path, options={"judge_model": "self"}).score_needs_server()
