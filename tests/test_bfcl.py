@@ -2,6 +2,8 @@
 the MCP web-search backend, with fakes (no model, no network)."""
 
 import json
+import subprocess
+import sys
 
 import httpx
 import pytest
@@ -325,19 +327,18 @@ def test_score_with_a_missing_generation_fails(tmp_path, monkeypatch):
         bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path / "out", limit=2, phase="score")).run("", "m")
 
 
-def test_child_score_phase_evaluates_saved_results_only(tmp_path, harness_env, monkeypatch):
-    """The real child in the score phase: no search patch, no generation, BFCL's
-    evaluation on the saved result file (endpoint unreachable: never called)."""
+def test_child_score_phase_evaluates_saved_results_only(tmp_path, harness_env):
+    """The real child in the score phase: no search, no generation, BFCL's evaluation
+    on the saved result file (endpoint and search server unreachable: never called).
+    A subprocess, as in a run: bfcl_eval fixes its paths from BFCL_PROJECT_ROOT at import."""
     root = tmp_path / "bfcl"
     cfg = {"served_model_name": "m", "categories": ["simple_python"], "limit": 1, "num_threads": 1,
            "sampling": {}, "search_mcp_url": "http://127.0.0.1:9/mcp", "include_input_log": False, "phase": "score"}
     root.mkdir(exist_ok=True)
     (root / bfcl.CHILD_CONFIG).write_text(json.dumps(cfg))
-    monkeypatch.setattr(bfcl, "MCPSearch", None)  # constructing it would fail the test
-    with pytest.raises(SystemExit) as e:
-        bfcl.child_main(str(root / bfcl.CHILD_CONFIG))
-    assert e.value.code == bfcl.MISSING_EXIT
+    child = [sys.executable, "-m", "sage2_evals.benchmarks.bfcl", str(root / bfcl.CHILD_CONFIG)]
+    assert subprocess.run(child, check=False).returncode == bfcl.MISSING_EXIT
     _write_results(root, ["simple_python_0"])
-    bfcl.child_main(str(root / bfcl.CHILD_CONFIG))
+    subprocess.run(child, check=True)
     assert bfcl.read_category_scores(root / "score" / bfcl.REGISTRY_NAME)["simple_python"]["total_count"] == 1
     assert (root / "score" / "data_overall.csv").exists()
