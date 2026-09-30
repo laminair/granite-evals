@@ -21,6 +21,12 @@ banking is scored separately (web/leaderboard/src/components/Leaderboard.jsx).
 Everything is written under ``<output_dir>/<domain>/trial-<k>/<task>.json``;
 finished simulations are skipped on restart.
 
+Phases: ``--phase generate`` runs the conversations (agent and user simulator)
+and saves each ungraded (status ``generated``); ``--phase score`` grades the
+saved ones with the harness's ``evaluate_simulation``, as the live run does
+(DB, env assertions, actions, communicate; NL assertions via the judge), and
+never simulates: a missing simulation is a failed one (``error:not_generated``).
+
 A simulation that fails (an exception, the harness's infrastructure_error) is
 not a model failure: as the harness does, it is left out of pass^k and the
 average reward, and it is not saved, so a restart retries it. Each domain
@@ -69,6 +75,11 @@ DEFAULT_TRIALS = 4
 DEFAULT_GATEWAY = "https://ete-litellm.ai-models.vpc-int.res.ibm.com/v1"
 DEFAULT_SIM_MODEL = "aws/claude-sonnet-5"
 SELF = "self"
+# Domains with tasks graded on NL assertions (an LLM judge): retail, and one
+# banking_knowledge task (task_102) at TAU2_COMMIT.
+NL_DOMAINS = frozenset({"retail", "banking_knowledge"})
+# Status of a saved simulation not graded yet (--phase generate).
+GENERATED = "generated"
 
 
 # -- data ------------------------------------------------------------------
@@ -345,6 +356,7 @@ class Tau3(Benchmark):
     harness_packages = ("tau2", "litellm")
     dataset = TAU2_REPO
     dataset_revision = TAU2_COMMIT
+    splittable = True
     domains: ClassVar[tuple[str, ...]]
 
     def opt(self, key: str, default: Any) -> Any:
@@ -363,6 +375,11 @@ class Tau3(Benchmark):
     def needs_server(self) -> bool:
         return not self.gold
 
+    def score_needs_server(self) -> bool:
+        """``judge_model=self`` grades NL assertions with the served model."""
+        return (not self.gold and self.opt("judge_model", DEFAULT_SIM_MODEL) == SELF
+                and bool(NL_DOMAINS & set(self.domains)))
+
     # -- endpoints -----------------------------------------------------------
 
     def agent_endpoint(self, base_url: str, served: str) -> Endpoint:
@@ -377,9 +394,12 @@ class Tau3(Benchmark):
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": flag}}
         return Endpoint(f"hosted_vllm/{served}", kwargs, served, True)
 
-    def llm_endpoint(self, role: str, base_url: str, served: str, *, temperature: float) -> Endpoint:
+    def llm_endpoint(self, role: str, base_url: str, served: str, *, temperature: float,
+                     called: bool = True) -> Endpoint:
         """``<role>_model`` / ``<role>_base_url`` / ``<role>_api_key_env`` (role =
-        user or judge); ``<role>_model=self`` is the served model at base_url."""
+        user or judge); ``<role>_model=self`` is the served model at base_url.
+        ``called=False``: only recorded (the score phase's user simulator), so
+        no key and no meter."""
         model = self.opt(f"{role}_model", DEFAULT_SIM_MODEL)
         kwargs: dict[str, Any] = {"temperature": self.opt(f"{role}_temperature", temperature)}
         if effort := self.opt(f"{role}_reasoning_effort", ""):
@@ -390,6 +410,10 @@ class Tau3(Benchmark):
             return Endpoint(f"hosted_vllm/{served}", {**kwargs, "api_base": base_url, "api_key": "EMPTY"}, served, True)
         key_env = self.opt(f"{role}_api_key_env", f"SAGE2_{role.upper()}_API_KEY")
         key = os.environ.get(key_env, "")
+        if not called:
+            given = self.config.options.get(f"{role}_base_url")
+            return Endpoint(f"openai/{model}", {**kwargs, "api_base": given or DEFAULT_GATEWAY, "api_key": key},
+                            model, False)
         if not key:
             raise SystemExit(
                 f"{self.id}: {role}_model={model} needs an API key in ${key_env} "
@@ -425,13 +449,16 @@ class Tau3(Benchmark):
         tasks, source, revision = self.load_tasks()
         install_hooks()
         budget_exhausted.clear()
-        needs_judge = not self.gold and any(
+        # The judge grades; the agent and user simulator only converse (in the
+        # score phase they are recorded, never called).
+        needs_judge = self.scoring and not self.gold and any(
             "NL_ASSERTION" in _basis(t) for ts in tasks.values() for t in ts
         )
         agent = user = judge = None
         if not self.gold:
             agent = self.agent_endpoint(base_url, served_model_name)
-            user = self.llm_endpoint("user", base_url, served_model_name, temperature=0.0)
+            user = self.llm_endpoint("user", base_url, served_model_name, temperature=0.0,
+                                     called=self.generating)
             if needs_judge:
                 judge = self.llm_endpoint("judge", base_url, served_model_name, temperature=0.0)
         seed = DEFAULT_SEED + self.config.seed
@@ -450,8 +477,9 @@ class Tau3(Benchmark):
             r = self._simulation(d, t, k, seeds[k], agent, user, judge)
             with lock:
                 done[0] += 1
-                log.info("%s %s trial %d: %s reward=%.2f %s (%d/%d)",
-                         self.id, d, k, r["task_id"], r["reward"], r["status"], done[0], len(jobs))
+                reward = "-" if r["reward"] is None else f"{r['reward']:.2f}"
+                log.info("%s %s trial %d: %s reward=%s %s (%d/%d)",
+                         self.id, d, k, r["task_id"], reward, r["status"], done[0], len(jobs))
             return r
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
@@ -460,6 +488,8 @@ class Tau3(Benchmark):
             # The simulations cut short are not saved: a rerun with budget retries them.
             raise SystemExit(f"{self.id}: the paid API budget is exhausted (HTTP 402); "
                              f"{sum(map(is_failed, records))} simulations not run, nothing scored")
+        if not self.scoring:
+            return self._generated(records, tasks, source, revision, seed, seeds, agent, user)
 
         per_domain = {}
         max_frac = self.opt("max_failed_frac", 0.05)
@@ -508,6 +538,30 @@ class Tau3(Benchmark):
             "tasks": {d: [t.id for t in ts] for d, ts in tasks.items()},
         }
 
+    def _generated(self, records, tasks, source, revision, seed, seeds, agent, user) -> dict[str, Any]:
+        """The generate phase's outcome: simulations saved for --phase score. A
+        failed one is not saved; the score phase counts it as failed."""
+        saved = [r for r in records if not is_failed(r)]
+        usage = {role: sum_usage([r["usage"][role] for r in records]) for role in ("agent", "user_sim")}
+        return {
+            "n": len({(r["domain"], r["task_id"]) for r in saved}),  # tasks with a saved simulation
+            "simulations_generated": len(saved),
+            "simulations_failed": len(records) - len(saved),
+            "simulations_total": len(records),
+            "dataset": source,
+            "dataset_revision": revision,
+            "harness": {"repo": TAU2_REPO, "commit": TAU2_COMMIT, "version": "1.0.1"},
+            "trials": self.repeats,
+            "seed": seed,
+            "trial_seeds": seeds,
+            "mode": "gold" if self.gold else "model",
+            "agent": agent.record() if agent else None,
+            "user_simulator": user.record() if user else None,
+            "user_sim_usage": usage["user_sim"],
+            "agent_usage": usage["agent"],
+            "tasks": {d: [t.id for t in ts] for d, ts in tasks.items()},
+        }
+
     def retrieval_config(self) -> str:
         return self.opt("retrieval_config", "bm25_grep")
 
@@ -515,44 +569,61 @@ class Tau3(Benchmark):
 
     def _simulation(self, domain, task, trial, seed, agent, user, judge) -> dict:
         path = self.config.output_dir / domain / f"trial-{trial}" / task_filename(task.id)
-        if path.exists():
-            rec = json.loads(path.read_text())
-            return {k: v for k, v in rec.items() if k != "simulation"}
-        path.parent.mkdir(parents=True, exist_ok=True)
+        saved = json.loads(path.read_text()) if path.exists() else None
+        # Done: graded, or generated and this phase does not grade.
+        if saved is not None and not (self.scoring and saved["status"] == GENERATED):
+            return {k: v for k, v in saved.items() if k != "simulation"}
         base = {"domain": domain, "task_id": task.id, "trial": trial, "seed": seed}
+        if saved is None and not self.generating:
+            # The score phase never simulates: counted as a failed simulation.
+            return {**base, "reward": 0.0, "status": "error:not_generated",
+                    "termination_reason": None, "usage": _zero_usage()}
+        path.parent.mkdir(parents=True, exist_ok=True)
         if budget_exhausted.is_set():
             return {**base, "reward": 0.0, "status": "error:budget_exhausted",
-                    "termination_reason": None, "usage": _zero_usage()}
-        _ctx.usage = _zero_usage()
+                    "termination_reason": None, "usage": saved["usage"] if saved else _zero_usage()}
+        # Grading a saved simulation adds its judge calls to the generation's usage.
+        _ctx.usage = saved["usage"] if saved else _zero_usage()
         _ctx.judge = judge
         started = time.time()
         try:
-            if self.gold:
+            if saved is not None:
+                sim = self._load_simulation(saved["simulation"])
+                sim.reward_info = self._grade(domain, task, sim)
+            elif self.gold:
                 sim = self._gold(domain, task)
+                if self.scoring:
+                    sim.reward_info = self._grade(domain, task, sim)
             else:
                 sim = self._simulate(domain, task, seed, agent, user)
             usage = _ctx.usage
         except Exception as e:  # one broken simulation must not sink the run
             log.exception("%s: %s %s trial %d failed", self.id, domain, task.id, trial)
-            # Not persisted: an infrastructure error is retried on resume.
+            # Not persisted: an infrastructure error is retried on resume (a
+            # grading error keeps the saved simulation, to be graded again).
             return {**base, "reward": 0.0, "status": f"error:{type(e).__name__}",
                     "termination_reason": None, "usage": _ctx.usage}
         finally:
             _ctx.usage, _ctx.judge = None, None
-        reward_info = sim.reward_info
-        reward = float(reward_info.reward) if reward_info else 0.0
         termination = getattr(sim.termination_reason, "value", str(sim.termination_reason))
+        duration = time.time() - started + (saved.get("duration_s", 0.0) if saved else 0.0)
         rec = {
             **base,
-            "reward": reward,
-            "status": "success" if is_success(reward) else "fail",
+            "reward": None,
+            "status": GENERATED,
             "termination_reason": termination,
-            "duration_s": round(time.time() - started, 1),
+            "duration_s": round(duration, 1),
             "num_messages": len(sim.messages or []),
             "usage": usage,
-            "reward_info": reward_info.model_dump(mode="json") if reward_info else None,
+            "reward_info": None,
         }
+        if self.scoring:
+            reward_info = sim.reward_info
+            rec["reward"] = float(reward_info.reward) if reward_info else 0.0
+            rec["status"] = "success" if is_success(rec["reward"]) else "fail"
+            rec["reward_info"] = reward_info.model_dump(mode="json") if reward_info else None
         if termination == "infrastructure_error":
+            rec["reward"] = 0.0
             rec["status"] = "error:budget_exhausted" if budget_exhausted.is_set() else "error:infrastructure"
             return rec  # not persisted: retried on resume
         path.write_text(json.dumps({**rec, "simulation": sim.model_dump(mode="json")}, indent=1))
@@ -579,13 +650,29 @@ class Tau3(Benchmark):
         )
 
     def _simulate(self, domain, task, seed, agent, user):
+        """The conversation, graded (--phase all, as the harness runs it) or
+        not (--phase generate: run_single_task's layers minus the evaluation,
+        which ``_grade`` does later exactly as run_simulation would)."""
+        import uuid
+
         from tau2.evaluator.evaluator import EvaluationType
         from tau2.runner.batch import run_single_task
+        from tau2.runner.build import build_orchestrator
         from tau2.runner.progress import run_with_retry
 
         config = self.run_config(domain, agent, user)
+
+        def converse():
+            orchestrator = build_orchestrator(config, task, seed=seed, simulation_id=str(uuid.uuid4()))
+            sim = orchestrator.run()
+            sim.policy = orchestrator.environment.get_policy()  # as run_simulation
+            return sim
+
+        def graded():
+            return run_single_task(config, task, seed=seed, evaluation_type=EvaluationType.ALL)
+
         return run_with_retry(
-            lambda: run_single_task(config, task, seed=seed, evaluation_type=EvaluationType.ALL),
+            graded if self.scoring else converse,
             task=task,
             trial=0,
             seed=seed,
@@ -594,14 +681,30 @@ class Tau3(Benchmark):
             console_display=False,
         )
 
+    def _grade(self, domain, task, sim):
+        """The harness's live grading (runner/simulation.py run_simulation) of a
+        text simulation: same task, env kwargs, solo_mode and replay; the gold
+        trajectory with every non-LLM check."""
+        from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
+        from tau2.runner.build import _build_env_kwargs
+
+        env_kwargs = _build_env_kwargs(self.run_config(domain, None, None), task)
+        kind = EvaluationType.ALL_IGNORE_BASIS if self.gold else EvaluationType.ALL
+        return evaluate_simulation(sim, task, kind, solo_mode=False, domain=domain, env_kwargs=env_kwargs or None)
+
+    @staticmethod
+    def _load_simulation(dump: dict):
+        from tau2.data_model.simulation import SimulationRun
+
+        return SimulationRun.model_validate(dump)
+
     def _gold(self, domain, task):
         """A trajectory that performs the task's reference actions, then says
-        its communicate_info; graded with every non-LLM check."""
+        its communicate_info (graded by ``_grade``)."""
         import uuid
 
         from tau2.data_model.message import AssistantMessage, ToolCall, UserMessage
         from tau2.data_model.simulation import SimulationRun, TerminationReason
-        from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
         from tau2.registry import registry
         from tau2.runner.build import _build_env_kwargs
         from tau2.utils.utils import get_now
@@ -627,14 +730,10 @@ class Tau3(Benchmark):
         info = (criteria.communicate_info if criteria else None) or []
         messages.append(AssistantMessage(role="assistant", content=" ".join(info) or "Done."))
         now = get_now()
-        sim = SimulationRun(
+        return SimulationRun(
             id=str(uuid.uuid4()), task_id=task.id, timestamp=now, start_time=now, end_time=now,
             duration=0.0, termination_reason=TerminationReason.AGENT_STOP, messages=messages,
         )
-        sim.reward_info = evaluate_simulation(
-            sim, task, EvaluationType.ALL_IGNORE_BASIS, solo_mode=False, domain=domain, env_kwargs=env_kwargs,
-        )
-        return sim
 
 
 def _basis(task) -> set[str]:

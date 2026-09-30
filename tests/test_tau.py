@@ -207,6 +207,180 @@ def test_given_base_url_is_metered_once(tmp_path, monkeypatch):
         assert list(meters._meters) == [("https://gw.example/v1", "user")]
 
 
+# -- phases (fake harness) ------------------------------------------------------
+
+
+class _RI:
+    def __init__(self, reward):
+        self.reward = reward
+
+    def model_dump(self, mode):
+        return {"reward": self.reward}
+
+
+class _Sim:
+    """A SimulationRun stand-in: what _simulation reads and saves."""
+
+    termination_reason = "user_stop"
+
+    def __init__(self, task_id, reward_info=None):
+        self.task_id, self.reward_info, self.messages = task_id, reward_info, ["m1", "m2"]
+
+    def model_dump(self, mode):
+        return {"task_id": self.task_id, "reward_info": self.reward_info and self.reward_info.model_dump(mode)}
+
+
+class _NLTask(_T):
+    class evaluation_criteria:  # noqa: N801
+        reward_basis = ["NL_ASSERTION"]
+
+
+def _phase_bench(tmp_path, monkeypatch, phase, bid="tau3-retail", **options):
+    """10 retail tasks graded on NL assertions x 2 trials; the model, the user
+    simulator and the grader are fakes that record their calls."""
+    b = _bench(bid, tmp_path, repeats=2, phase=phase, options=options)
+    calls = {"simulate": [], "grade": [], "gold": []}
+    monkeypatch.setattr(b, "load_tasks", lambda: ({d: [_NLTask(i) for i in range(10)] for d in b.domains},
+                                                  tau.TAU2_REPO, "c"))
+    monkeypatch.setattr(tau, "install_hooks", lambda: None)
+
+    def simulate(domain, task, seed, agent, user):
+        calls["simulate"].append((domain, task.id))
+        # --phase all: graded by the harness in the run; generate: not graded
+        return _Sim(task.id, _RI(1.0 if int(task.id) % 2 == 0 else 0.0) if b.scoring else None)
+
+    def grade(domain, task, sim):
+        calls["grade"].append((domain, task.id, b.gold))
+        assert sim.task_id == task.id and sim.reward_info is None
+        return _RI(1.0 if b.gold or int(task.id) % 2 == 0 else 0.0)
+
+    def gold(domain, task):
+        calls["gold"].append((domain, task.id))
+        return _Sim(task.id)
+
+    monkeypatch.setattr(b, "_simulate", simulate)
+    monkeypatch.setattr(b, "_grade", grade)
+    monkeypatch.setattr(b, "_gold", gold)
+    monkeypatch.setattr(b, "_load_simulation", lambda dump: _Sim(dump["task_id"], None))
+    return b, calls
+
+
+def _saved(tmp_path, domain="retail"):
+    return [json.loads(p.read_text()) for p in sorted((tmp_path / domain).rglob("*.json"))]
+
+
+def test_generate_saves_ungraded_simulations_without_a_judge(tmp_path, monkeypatch):
+    monkeypatch.delenv("SAGE2_JUDGE_API_KEY", raising=False)
+    b, calls = _phase_bench(tmp_path, monkeypatch, "generate", user_model="self")
+    out = b.run("http://vllm/v1", "served")
+    assert "value" not in out and out["n"] == 10 and out["simulations_generated"] == 20
+    assert len(calls["simulate"]) == 20 and not calls["grade"]
+    saved = _saved(tmp_path)
+    assert len(saved) == 20
+    assert all(r["status"] == tau.GENERATED and r["reward"] is None and r["reward_info"] is None for r in saved)
+    assert all(r["simulation"]["reward_info"] is None for r in saved)
+    # rerun: nothing is simulated again
+    b2, calls2 = _phase_bench(tmp_path, monkeypatch, "generate", user_model="self")
+    assert b2.run("http://vllm/v1", "served")["simulations_generated"] == 20 and not calls2["simulate"]
+
+
+def test_score_grades_saved_simulations_without_the_model(tmp_path, monkeypatch):
+    b, _ = _phase_bench(tmp_path, monkeypatch, "generate", user_model="self")
+    b.run("http://vllm/v1", "served")
+    # the user simulator's key is not needed to score; the judge's is
+    monkeypatch.delenv("SAGE2_USER_API_KEY", raising=False)
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "k")
+    b, calls = _phase_bench(tmp_path, monkeypatch, "score")
+    out = b.run("", "served")
+    assert not calls["simulate"] and len(calls["grade"]) == 20
+    assert out["value"] == 0.5 and out["n"] == 10 and out["simulations_failed"] == 0
+    assert out["judge"]["model"] == tau.DEFAULT_SIM_MODEL and out["user_simulator"]["model"] == tau.DEFAULT_SIM_MODEL
+    saved = _saved(tmp_path)
+    assert {r["status"] for r in saved} == {"success", "fail"}
+    assert all(r["reward_info"] == {"reward": r["reward"]} for r in saved)
+    # rerun: nothing is graded again
+    b2, calls2 = _phase_bench(tmp_path, monkeypatch, "score")
+    assert b2.run("", "served")["value"] == 0.5 and not calls2["grade"]
+
+
+def test_score_and_all_agree(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "k")
+    b, _ = _phase_bench(tmp_path / "all", monkeypatch, "all", user_model="self")
+    whole = b.run("http://vllm/v1", "served")
+    b, _ = _phase_bench(tmp_path / "split", monkeypatch, "generate", user_model="self")
+    b.run("http://vllm/v1", "served")
+    b, _ = _phase_bench(tmp_path / "split", monkeypatch, "score", user_model="self")
+    split = b.run("", "served")
+    assert split["value"] == whole["value"] and split["domains"] == whole["domains"]
+
+
+def test_score_counts_a_missing_simulation_as_failed(tmp_path, monkeypatch):
+    b, _ = _phase_bench(tmp_path, monkeypatch, "generate", user_model="self")
+    b.run("http://vllm/v1", "served")
+    next((tmp_path / "retail" / "trial-1").glob("*.json")).unlink()
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "k")
+    b, calls = _phase_bench(tmp_path, monkeypatch, "score")
+    out = b.run("", "served")  # 1/20 missing: at the default max_failed_frac 0.05
+    assert not calls["simulate"] and len(calls["grade"]) == 19
+    assert out["incomplete"] and out["domains"]["retail"]["statuses"]["error:not_generated"] == 1
+    assert len(_saved(tmp_path)) == 19  # score writes no simulation
+    b, _ = _phase_bench(tmp_path, monkeypatch, "score", max_failed_frac="0")
+    with pytest.raises(SystemExit, match="simulations_failed 1/20"):
+        b.run("", "served")
+
+
+def test_a_grading_error_keeps_the_generation(tmp_path, monkeypatch):
+    b, _ = _phase_bench(tmp_path, monkeypatch, "generate", user_model="self")
+    b.run("http://vllm/v1", "served")
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "k")
+    b, _ = _phase_bench(tmp_path, monkeypatch, "score", max_failed_frac="1")
+    monkeypatch.setattr(b, "_grade", lambda d, t, s: 1 / 0 if t.id == "3" else _RI(1.0))
+    out = b.run("", "served")
+    assert out["domains"]["retail"]["statuses"]["error:ZeroDivisionError"] == 2
+    assert sum(r["status"] == tau.GENERATED for r in _saved(tmp_path)) == 2  # graded on the next run
+    b, calls = _phase_bench(tmp_path, monkeypatch, "score")
+    assert b.run("", "served")["simulations_failed"] == 0 and len(calls["grade"]) == 2
+
+
+def test_all_grades_a_generated_simulation_without_simulating_it(tmp_path, monkeypatch):
+    b, _ = _phase_bench(tmp_path, monkeypatch, "generate", user_model="self")
+    b.run("http://vllm/v1", "served")
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "k")
+    b, calls = _phase_bench(tmp_path, monkeypatch, "all", user_model="self")
+    assert b.run("http://vllm/v1", "served")["value"] == 0.5
+    assert not calls["simulate"] and len(calls["grade"]) == 20
+
+
+def test_all_is_graded_in_the_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "k")
+    b, calls = _phase_bench(tmp_path, monkeypatch, "all", user_model="self")
+    out = b.run("http://vllm/v1", "served")
+    assert out["value"] == 0.5 and len(calls["simulate"]) == 20 and not calls["grade"]
+    assert out["judge"]["model"] == tau.DEFAULT_SIM_MODEL
+
+
+def test_gold_in_every_phase(tmp_path, monkeypatch):
+    b, calls = _phase_bench(tmp_path / "all", monkeypatch, "all", bid="tau3-bench", agent="gold")
+    assert not b.needs_server() and not b.score_needs_server()
+    assert b.run("", "")["value"] == 1.0 and len(calls["gold"]) == 60 == len(calls["grade"])
+    b, calls = _phase_bench(tmp_path / "split", monkeypatch, "generate", bid="tau3-bench", agent="gold")
+    assert b.run("", "")["n"] == 30 and len(calls["gold"]) == 60 and not calls["grade"]
+    b, calls = _phase_bench(tmp_path / "split", monkeypatch, "score", bid="tau3-bench", agent="gold")
+    out = b.run("", "")
+    assert out["value"] == 1.0 and set(out["domains"]) == set(tau.CORE_DOMAINS)
+    assert not calls["gold"] and len(calls["grade"]) == 60 and all(g for _, _, g in calls["grade"])
+
+
+def test_score_needs_server_only_for_a_self_judge_on_nl_domains(tmp_path):
+    def needs(bid, **options):
+        return _bench(bid, tmp_path, options=options).score_needs_server()
+
+    assert needs("tau3-bench", judge_model="self") and needs("tau3-banking-knowledge", judge_model="self")
+    assert not needs("tau3-airline", judge_model="self") and not needs("tau3-telecom", judge_model="self")
+    assert not needs("tau3-retail") and not needs("tau3-retail", judge_model="self", agent="gold")
+    assert all(registry.get(bid).splittable for bid in SUITE)
+
+
 # -- end to end with the harness -----------------------------------------------
 
 
@@ -352,3 +526,45 @@ def test_gold_scores_every_task(tmp_path):
     for bid in ("tau3-airline", "tau3-telecom", "tau3-banking-knowledge"):
         b = _bench(bid, tmp_path / bid, limit=3, repeats=1, dataset=str(_data_dir()), options={"agent": "gold"})
         assert b.run("", "")["value"] == 1.0
+
+
+@harness
+def test_generate_then_score_matches_all(tmp_path, fake_llm, monkeypatch):
+    """The live grading and the after-the-fact grading of the same kind of
+    conversation (the fake is deterministic) give the same reward_info; the
+    judge is called only when scoring."""
+    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "judge-key")
+    monkeypatch.setenv("SAGE2_USER_API_KEY", "user-key")
+    opts = {"user_base_url": fake_llm, "user_model": "user-model", "judge_base_url": fake_llm,
+            "judge_model": "judge-model", "max_retries": "0"}
+    everything = _bench("tau3-retail", tmp_path, dataset=str(_data_dir()), options=dict(opts)).load_tasks()[0]
+    task = next(t for t in everything["retail"]
+                if "NL_ASSERTION" in tau._basis(t) and t.evaluation_criteria.nl_assertions)
+    opts["tasks"] = "^" + re.escape(task.id) + "$"
+
+    def bench(out, phase):
+        return _bench("tau3-retail", out, limit=1, repeats=1, dataset=str(_data_dir()), options=dict(opts),
+                      phase=phase)
+
+    whole = bench(tmp_path / "all", "all").run(fake_llm, "granite")
+    _FakeLLM.calls = []
+    gen = bench(tmp_path / "split", "generate").run(fake_llm, "granite")
+    assert gen["n"] == 1 and not [c for c in _FakeLLM.calls if c["model"] == "judge-model"]
+    _FakeLLM.calls = []
+    split = bench(tmp_path / "split", "score").run("", "granite")
+    assert [c["model"] for c in _FakeLLM.calls] == ["judge-model"]
+    assert split["domains"]["retail"]["pass_hat_1"] == whole["domains"]["retail"]["pass_hat_1"]
+
+    def reward_info(out):
+        return json.loads(next((out / "retail" / "trial-0").glob("*.json")).read_text())["reward_info"]
+
+    assert reward_info(tmp_path / "split") == reward_info(tmp_path / "all")
+
+
+@harness
+def test_gold_generate_then_score(tmp_path):
+    for bid in ("tau3-airline", "tau3-banking-knowledge"):
+        out = tmp_path / bid
+        kw = dict(limit=3, repeats=1, dataset=str(_data_dir()), options={"agent": "gold"})
+        assert _bench(bid, out, phase="generate", **kw).run("", "")["n"] == 3
+        assert _bench(bid, out, phase="score", **kw).run("", "")["value"] == 1.0
