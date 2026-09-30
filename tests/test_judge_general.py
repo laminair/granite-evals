@@ -423,6 +423,60 @@ def test_profbench_max_effort_judge_verdict_is_the_content_only(tmp_path, monkey
     assert probe["criteria_judged"] == 1 and probe["judge_max_criteria"] == 1
 
 
+def _phase(bench, phase):
+    bench.config.phase = phase
+    return bench
+
+
+@needs_upstream
+def test_profbench_generate_then_score(tmp_path, monkeypatch, pb_env):
+    monkeypatch.delenv("SAGE2_JUDGE_API_KEY", raising=False)  # generating needs no judge key
+    gen = _phase(jg.ProfBench(RunConfig(model="m", output_dir=tmp_path, workers=2)), "generate")
+    assert gen.needs_server() and not gen.score_needs_server()
+    out = gen.run("http://p/v1", "s")
+    assert (out["n"], out["generations_failed"], out["statuses"]) == (8, 0, {"ok": 8}) and "value" not in out
+    assert len(pb_env.policy) == 8 and not list(tmp_path.glob("samples/*/*/judgments*.json"))
+    pb_env.policy.clear()
+    judge = fake_judge(rubric_judge)
+    scored = _phase(make_pb(tmp_path, monkeypatch, judge), "score").run("", "s")
+    assert pb_env.policy == [] and scored["n"] == 8 and scored["judge_usage"]["calls"] == 12
+    # the same reports judged by --phase all give the same result
+    whole = make_pb(tmp_path / "all", monkeypatch, fake_judge(rubric_judge)).run("http://p/v1", "s")
+    assert whole["value"] == scored["value"] and whole["scores"] == scored["scores"]
+    # score again: resumes, nothing is judged twice
+    again = _phase(make_pb(tmp_path, monkeypatch, fake_judge(lambda r: pytest.fail("judged again"))), "score")
+    assert again.run("", "s")["value"] == scored["value"]
+
+
+@needs_upstream
+def test_profbench_score_without_a_generation_is_a_failed_sample(tmp_path, monkeypatch, pb_env):
+    _phase(jg.ProfBench(RunConfig(model="m", output_dir=tmp_path, options={"samples": "1"})), "generate").run("http://p/v1", "s")
+    (tmp_path / "samples" / "Phys-0" / "0" / "response.json").unlink()
+    pb_env.policy.clear()
+    bench = _phase(make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge), samples="1"), "score")
+    with pytest.raises(SystemExit, match="criteria_failed 1/3"):
+        bench.run("", "s")
+    out = _phase(make_pb(tmp_path, monkeypatch, fake_judge(rubric_judge), samples="1", max_failed_frac="0.5"),
+                 "score").run("", "s")
+    assert pb_env.policy == [] and out["n"] == 1 and out["statuses"] == {"ok": 1, "not_generated": 1}
+    assert not (tmp_path / "samples" / "Phys-0" / "0" / "response.json").exists()  # never generated in score
+
+
+@needs_upstream
+def test_profbench_human_gold_in_both_phases(tmp_path, monkeypatch, pb_env):
+    opts = {"responses": "o3", "judge_model": "human"}
+    gen = _phase(jg.ProfBench(RunConfig(model="none", output_dir=tmp_path, options=opts)), "generate")
+    assert not gen.needs_server() and not gen.score_needs_server()
+    assert gen.run("", "none")["statuses"] == {"dataset": 2}
+    out = _phase(jg.ProfBench(RunConfig(model="none", output_dir=tmp_path, options=opts)), "score").run("", "none")
+    assert pb_env.policy == [] and out["n"] == 2 and out["scores"]["Physics PhD"] == 100.0
+
+
+def test_profbench_self_judge_cannot_score_alone(tmp_path):
+    bench = jg.ProfBench(RunConfig(model="m", output_dir=tmp_path, options={"judge_model": "self"}))
+    assert bench.score_needs_server() and bench.splittable
+
+
 # -- GDPval ---------------------------------------------------------------------
 
 
@@ -693,3 +747,69 @@ def test_gdpval_judge_invalid_is_a_failure_and_rejudged_on_resume(tmp_path, monk
     assert agents == ["t1"] and len(judge._client.requests) == 2
     assert out["statuses"]["judged"] == 1 and out["win_rate"] == 1.0
     assert (out["tasks_failed"], out["tasks_total"], out["incomplete"]) == (0, 1, False)
+
+
+def _memo_agent(agents):
+    async def fake_agent(self, task, refs, out_dir, base_url, served):
+        agents.append(task["task_id"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "memo.docx").write_bytes(_docx_bytes("MODEL memo"))
+        return {"finished": True, "note": "Done.", "paths": ["memo.docx"], "turns": 3,
+                "token_usage": {"input": 1, "output": 1, "reasoning": 0}, "failed_outputs": []}
+
+    return fake_agent
+
+
+def test_gdpval_generate_then_score(tmp_path, monkeypatch, gdp_env):
+    agents = []
+    monkeypatch.setattr(jg.GDPval, "_agent", _memo_agent(agents))
+    monkeypatch.delenv("SAGE2_JUDGE_API_KEY", raising=False)  # generating needs no judge key
+    gen = jg.GDPval(RunConfig(model="m", output_dir=tmp_path / "run", dataset=str(gdp_env), workers=2,
+                              phase="generate"))
+    assert gen.needs_server() and not gen.score_needs_server()
+    out = gen.run("http://p/v1", "s")
+    assert agents == ["t1"] and out["n"] == 1 and "value" not in out
+    assert out["statuses"] == {"submitted": 1, "excluded:no_expert_deliverable": 1,
+                               "excluded:expert_deliverable_not_text": 1}
+    assert (tmp_path / "run/tasks/t1/agent.json").exists() and not list(tmp_path.glob("run/tasks/*/report.json"))
+    judge = fake_judge(model_prefers("MODEL memo"))
+    score = make_gdp(tmp_path, monkeypatch, gdp_env, judge)
+    score.config.phase = "score"
+    scored = score.run("", "s")
+    assert agents == ["t1"] and len(judge._client.requests) == 2 and scored["judge_usage"]["calls"] == 2
+    # the same metrics as --phase all on a fresh dir
+    whole = make_gdp(tmp_path / "all", monkeypatch, gdp_env, fake_judge(model_prefers("MODEL memo"))).run("http://p/v1", "s")
+    keys = ("value", "n", "win_rate", "statuses", "tasks_failed", "tasks_total", "per_sector")
+    assert {k: scored[k] for k in keys} == {k: whole[k] for k in keys}
+    # score again: resumes from report.json
+    again = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: pytest.fail("rejudged")))
+    again.config.phase = "score"
+    assert again.run("", "s")["value"] == scored["value"]
+
+
+def test_gdpval_score_without_a_generation_is_a_failure(tmp_path, monkeypatch, gdp_env):
+    agents = []
+    monkeypatch.setattr(jg.GDPval, "_agent", _memo_agent(agents))
+    bench = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: pytest.fail("nothing to judge")))
+    bench.config.phase = "score"
+    with pytest.raises(SystemExit, match="tasks_failed 1/1"):
+        bench.run("", "s")
+    assert agents == [] and not (tmp_path / "run/tasks/t1/report.json").exists()  # retried on resume
+    lenient = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: "VERDICT: A"), max_failed_frac="1")
+    lenient.config.phase = "score"
+    with pytest.raises(SystemExit, match="no task was graded"):
+        lenient.run("", "s")
+    report = lenient._task(GDP_TASKS[0], tmp_path / "run/tasks", "", "s", None, str(gdp_env), None)
+    assert report["status"] == "error:not_generated" and "run --phase generate" in report["error"]
+
+
+def test_gdpval_expert_gold_in_both_phases(tmp_path, monkeypatch, gdp_env):
+    judge = fake_judge(lambda r: "VERDICT: TIE")
+    gen = make_gdp(tmp_path, monkeypatch, gdp_env, fake_judge(lambda r: pytest.fail("no judge")), deliverables="expert")
+    gen.config.phase = "generate"
+    assert not gen.needs_server() and gen.run("", "none")["n"] == 1
+    score = make_gdp(tmp_path, monkeypatch, gdp_env, judge, deliverables="expert")
+    score.config.phase = "score"
+    out = score.run("", "none")
+    assert out["value"] == pytest.approx(1000) and out["n"] == 1 and len(judge._client.requests) == 2
+    assert jg.GDPval(RunConfig(model="m", output_dir=tmp_path, options={"judge_model": "self"})).score_needs_server()

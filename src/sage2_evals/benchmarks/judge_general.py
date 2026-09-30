@@ -30,6 +30,9 @@ GDPval (metric "Elo")
 
 Per-example work goes under ``<output_dir>/samples/`` (ProfBench) or
 ``<output_dir>/tasks/`` (GDPval); finished examples are skipped on restart.
+Both are splittable: ``--phase generate`` saves the policy's reports / the
+agent's deliverables there without building the judge (no key needed),
+``--phase score`` judges them without the served model.
 """
 
 from __future__ import annotations
@@ -444,7 +447,9 @@ class ProfBench(JudgedBenchmark):
       max_failed_frac=0.05      see below
 
     A failed generation drops its sample and a failed judge call drops its
-    criterion, as upstream does; both are retried on resume. ``details.criteria_failed``
+    criterion, as upstream does; both are retried on resume. ``--phase score``
+    judges the saved ``response.json`` files; a sample without one counts as a
+    failed generation (status ``not_generated``). ``details.criteria_failed``
     / ``criteria_total`` count the criteria left unrated; above ``max_failed_frac``
     (0 = any) the run fails, below it the result is flagged ``incomplete``.
 
@@ -460,6 +465,7 @@ class ProfBench(JudgedBenchmark):
     dataset = "nvidia/ProfBench"
     dataset_revision = "f5c471cf2f277c264621e4b5c0cad5bb466f9260"
     split: ClassVar[str] = "test"
+    splittable = True
 
     @property
     def responses(self) -> str:
@@ -469,7 +475,10 @@ class ProfBench(JudgedBenchmark):
         return r
 
     def needs_server(self) -> bool:
-        return self.responses == "model" or self.judge_model == "self"
+        return self.responses == "model"
+
+    def score_needs_server(self) -> bool:
+        return self.judge_model == "self"
 
     # -- entry point -------------------------------------------------------
 
@@ -484,11 +493,13 @@ class ProfBench(JudgedBenchmark):
         log.info("profbench: %d tasks, %d samples (responses=%s, judge=%s)",
                  len(tasks), len(samples), self.responses, self.judge_model)
 
-        judge = None if self.judge_model == "human" else self.make_judge(base_url, served_model_name, _pb_cache_split)
         root = self.config.output_dir / "samples"
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
             gens = list(pool.map(lambda s: self._generate(s, root, base_url, served_model_name), samples))
+        if not self.scoring:
+            return self._generated(samples, gens, source, revision)
+        judge = None if self.judge_model == "human" else self.make_judge(base_url, served_model_name, _pb_cache_split)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.opt("judge_workers", 16)) as pool:
             judged = list(pool.map(lambda sg: self._judge_sample(pb, sg[0], sg[1], root, judge), zip(samples, gens)))
         return self._aggregate(pb, samples, gens, judged, judge, source, revision)
@@ -513,15 +524,20 @@ class ProfBench(JudgedBenchmark):
     def _generate(self, sample: dict, root: Path, base_url: str, served: str) -> dict:
         task, k = sample["task"], sample["k"]
         sdir = root / task["task_id"] / str(k)
-        sdir.mkdir(parents=True, exist_ok=True)
         path = sdir / "response.json"
         if path.exists():
             return json.loads(path.read_text())
+        sdir.mkdir(parents=True, exist_ok=True)
         if self.responses != "model":
+            # The dataset's reports: no model, so any phase may write them.
             out = {"status": "dataset", "response": task[f"{self.responses}_response"],
                    "prompt_tokens": None, "completion_tokens": None}
             _write_json(path, out)
             return out
+        if not self.generating:
+            # Score phase: never generate; the sample is left out like a failed generation.
+            log.warning("profbench: %s", self.not_generated(f"{task['task_id']}#{k}"))
+            return {"status": "not_generated", "response": None, "prompt_tokens": None, "completion_tokens": None}
         try:
             from openai import OpenAI
 
@@ -553,6 +569,26 @@ class ProfBench(JudgedBenchmark):
         log.info("profbench: generated %s#%d %s (%s tokens)", task["task_id"], k, out["status"], out["completion_tokens"])
         return out
 
+    def _generated(self, samples, gens, source, revision) -> dict[str, Any]:
+        """The generate phase's summary (generation.json): reports saved, not judged."""
+        failed = sum(g["response"] is None for g in gens)
+        if failed:
+            log.warning("profbench: %d/%d generations failed; rerun --phase generate to retry them",
+                        failed, len(gens))
+        return {
+            "n": len(gens) - failed,  # samples with a saved response.json
+            "samples": len(samples),
+            "generations_failed": failed,
+            "statuses": _count(g["status"] for g in gens),
+            "dataset": source,
+            "dataset_revision": revision,
+            "version": self.opt("version", "lite") if self.responses == "model" else "provided-reports",
+            "responses": self.responses,
+            "tasks": sorted({s["task"]["task_id"] for s in samples}),
+            "sampling": {**self.sampling(), "max_tokens": self.opt("max_tokens", 64000),
+                         "defaults": "generation_config of the checkpoint"},
+        }
+
     # -- judging -------------------------------------------------------------
 
     def _criteria(self, task: dict, response: str) -> list[dict]:
@@ -576,7 +612,8 @@ class ProfBench(JudgedBenchmark):
         path = root / task["task_id"] / str(k) / (f"judgments-{tag}.json" if tag else "judgments.json")
         done: dict[str, dict] = json.loads(path.read_text()) if path.exists() else {}
         if gen["response"] is None:
-            return {"status": "generation_failed", "ratings": {}}
+            return {"status": "not_generated" if gen["status"] == "not_generated" else "generation_failed",
+                    "ratings": {}}
         points = self._criteria(task, gen["response"])
         if self.judge_model == "human":
             for i, c in enumerate(task["rubrics"]):
@@ -1070,6 +1107,13 @@ class GDPval(JudgedBenchmark):
     benchmarks. The run reports tasks_failed / tasks_total over the tasks not
     excluded, fails above max_failed_frac and is flagged incomplete otherwise.
     A task the model gave up on (no_submission) is still a loss.
+
+    ``--phase generate`` runs the agents (``tasks/<id>/agent.json`` and
+    ``deliverables/``) and writes no report.json; ``--phase score`` judges them.
+    A task without agent.json in the score phase is ``error:not_generated``, a
+    failure like error:* (left out, retried on resume). Exclusions are decided,
+    and their reports written, by the scoring run, so n and the metrics match
+    ``--phase all``.
     """
 
     id = "gdpval"
@@ -1078,6 +1122,7 @@ class GDPval(JudgedBenchmark):
     dataset = "openai/gdpval"
     dataset_revision = "11e7900cdcac61bc4daf59e65feb238acda98fbf"
     split: ClassVar[str] = "train"
+    splittable = True
     default_setup: ClassVar[str] = (
         "python3 -m pip install --quiet --disable-pip-version-check --root-user-action=ignore "
         "python-docx openpyxl python-pptx reportlab pandas matplotlib xlsxwriter pypdf >/tmp/setup.log 2>&1 "
@@ -1089,7 +1134,10 @@ class GDPval(JudgedBenchmark):
         return self.opt("deliverables", "model") == "expert"
 
     def needs_server(self) -> bool:
-        return not self.expert_mode or self.judge_model == "self"
+        return not self.expert_mode
+
+    def score_needs_server(self) -> bool:
+        return self.judge_model == "self"
 
     # -- entry point -------------------------------------------------------
 
@@ -1099,10 +1147,17 @@ class GDPval(JudgedBenchmark):
         if pattern := self.opt("tasks", ""):
             rows = [r for r in rows if re.search(pattern, r["task_id"])]
         tasks = data.take(rows, self.config.limit, key="task_id")
+        root = self.config.output_dir / "tasks"
+        if not self.scoring:
+            log.info("gdpval: %d tasks, generate only (deliverables=%s)", len(tasks),
+                     "expert" if self.expert_mode else "model")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
+                runs = list(pool.map(lambda t: self._generate_task(t, root, base_url, served_model_name,
+                                                                   source, revision), tasks))
+            return self._generated(runs, tasks, source, revision)
         judge = self.make_judge(base_url, served_model_name, _gdp_cache_split)
         log.info("gdpval: %d tasks (deliverables=%s, judge=%s)", len(tasks),
                  "expert" if self.expert_mode else "model", judge.model)
-        root = self.config.output_dir / "tasks"
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
             reports = list(pool.map(lambda t: self._task(t, root, base_url, served_model_name, judge, source, revision), tasks))
         return self._aggregate(reports, tasks, judge, source, revision)
@@ -1135,7 +1190,10 @@ class GDPval(JudgedBenchmark):
             elif not any(renderable(name) for name, _ in expert):
                 report = {**base, "status": "excluded:expert_deliverable_not_text"}
             else:
-                candidate = self._candidate(task, tdir, expert, base_url, served, source, revision)
+                candidate = self._candidate(task, tdir, [n for n, _ in expert], base_url, served, source, revision)
+                if candidate["status"].startswith("error:"):
+                    log.warning("gdpval: %s", candidate["error"])
+                    return {**base, **candidate}  # not generated: retried on resume, no report
                 if candidate["status"] != "submitted":
                     report = {**base, **candidate, "score": 0.0}  # nothing to grade: a loss
                 else:
@@ -1147,13 +1205,37 @@ class GDPval(JudgedBenchmark):
         log.info("gdpval: %s %s score=%s", tid, report["status"], report.get("score"))
         return report
 
-    def _candidate(self, task, tdir, expert, base_url, served, source, revision) -> dict:
+    def _generate_task(self, task: dict, root: Path, base_url: str, served: str, source, revision) -> dict:
+        """Generate phase: the agent's run for one task, saved, not judged.
+
+        Exclusion is read from the expert file names (not fetched); the scoring
+        run decides it again from the files and writes the report."""
+        tid = task["task_id"]
+        tdir = root / tid
+        tdir.mkdir(parents=True, exist_ok=True)
+        base = {"task_id": tid}
+        names = [Path(p).name for p in task["deliverable_files"]]
+        if not names:
+            return {**base, "status": "excluded:no_expert_deliverable"}
+        if not any(renderable(n) for n in names):
+            return {**base, "status": "excluded:expert_deliverable_not_text"}
+        try:
+            candidate = self._candidate(task, tdir, names, base_url, served, source, revision)
+        except Exception as e:  # one broken task must not sink the run
+            log.exception("gdpval: %s failed", tid)
+            return {**base, "status": f"error:{type(e).__name__}", "error": str(e)[:500]}  # retried on resume
+        log.info("gdpval: %s generated: %s", tid, candidate["status"])
+        return {**base, "status": candidate["status"]}
+
+    def _candidate(self, task, tdir, expert_names, base_url, served, source, revision) -> dict:
         """The submission to grade: {status, files: [names], note, agent: {...}}."""
         out_dir = tdir / "deliverables"
         agent_path = tdir / "agent.json"
         if self.expert_mode:
-            return {"status": "submitted", "files": [n for n, _ in expert], "note": None, "candidate": "expert"}
+            return {"status": "submitted", "files": list(expert_names), "note": None, "candidate": "expert"}
         if not agent_path.exists():
+            if not self.generating:  # score phase: never run the agent
+                return {"status": "error:not_generated", "error": str(self.not_generated(f"task {task['task_id']}"))}
             refs = [self._fetch(source, revision, p) for p in task["reference_files"]]
             _write_json(agent_path, asyncio.run(self._agent(task, refs, out_dir, base_url, served)))
         agent = json.loads(agent_path.read_text())
@@ -1251,6 +1333,25 @@ class GDPval(JudgedBenchmark):
         return {"status": "judged", "score": sum(valid) / len(valid), "verdicts": verdicts, "judge_usage": usage}
 
     # -- aggregate -----------------------------------------------------------
+
+    def _generated(self, runs, tasks, source, revision) -> dict[str, Any]:
+        """The generate phase's summary (generation.json): agents run, nothing judged."""
+        failed = sum(r["status"].startswith("error:") for r in runs)
+        if failed:
+            log.warning("gdpval: %d/%d agent runs failed; rerun --phase generate to retry them", failed, len(runs))
+        return {
+            "n": sum(r["status"] in ("submitted", "no_submission") for r in runs),  # tasks with a saved run
+            "tasks_failed": failed,
+            "statuses": _count(r["status"] for r in runs),
+            "dataset": source,
+            "dataset_revision": revision,
+            "deliverables": "expert" if self.expert_mode else "model",
+            "tasks": [t["task_id"] for t in tasks],
+            "harness": "stirrup (ArtificialAnalysis/Stirrup), code_exec + finish tools, sage2 sandbox",
+            "sandbox_image": self.opt("sandbox_image", "python:3.13-bookworm"),
+            "sampling": {**self.sampling(), "max_tokens": self.opt("max_tokens", 32768),
+                         "defaults": "generation_config of the checkpoint"},
+        }
 
     def _aggregate(self, reports, tasks, judge: Judge, source, revision) -> dict[str, Any]:
         graded = [r for r in reports if r["status"] in ("judged", "no_submission")]
