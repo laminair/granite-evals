@@ -3,6 +3,14 @@
 Every benchmark is one class registered under a stable id (e.g.
 ``swebench-verified``). The id is what granite.build step templates pass to
 ``sage2-evals run``, and what the suite files in ``sage2_evals/suites`` list.
+
+Phases. A ``splittable`` benchmark runs as two jobs on one output dir, so no
+job holds a GPU it does not use: ``--phase generate`` serves the model and
+saves its outputs (the benchmark's own per-example files, which resume already
+reads), ``--phase score`` serves nothing and grades them (tests, verifiers,
+paid judges) on CPU. ``--phase all`` (the default) does both in one job. The
+score phase never generates: a missing generation is a failed example, not a
+call to a model that is not there.
 """
 
 from __future__ import annotations
@@ -13,6 +21,8 @@ import pkgutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
+
+PHASES = ("all", "generate", "score")
 
 # Every module in sage2_evals.benchmarks is imported to register its classes.
 # Modules import their harness inside methods, never at the top, so
@@ -42,6 +52,8 @@ class RunConfig:
     dataset_revision: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     """Benchmark-specific key=value options (``--option k=v``)."""
+    phase: str = "all"
+    """``all``, ``generate`` or ``score`` (see the module docstring)."""
 
 
 class Benchmark(abc.ABC):
@@ -59,6 +71,8 @@ class Benchmark(abc.ABC):
     """Upstream HF dataset id, read directly (public data is not mirrored)."""
     dataset_revision: ClassVar[str | None] = None
     """Commit of ``dataset`` the score is defined on."""
+    splittable: ClassVar[bool] = False
+    """Whether ``--phase generate`` / ``--phase score`` are supported."""
 
     def __init__(self, config: RunConfig):
         self.config = config
@@ -76,12 +90,44 @@ class Benchmark(abc.ABC):
         """Run the benchmark against an OpenAI-compatible endpoint.
 
         Returns a dict with at least ``value`` (headline metric) and ``n``
-        (examples scored). Anything else is copied into results.json.
+        (examples scored). Anything else is copied into results.json. In the
+        generate phase ``n`` counts the examples generated and ``value`` is
+        None (or left out).
         """
 
     def needs_server(self) -> bool:
-        """Whether the benchmark talks to the served model at all."""
+        """Whether generating talks to the served model at all (False for the
+        gold/oracle modes)."""
         return True
+
+    def score_needs_server(self) -> bool:
+        """Whether scoring talks to the served model (e.g. ``judge_model=self``).
+        The score phase serves nothing, so such a run must use ``--phase all``."""
+        return False
+
+    @property
+    def phase(self) -> str:
+        return self.config.phase
+
+    @property
+    def generating(self) -> bool:
+        return self.config.phase in ("all", "generate")
+
+    @property
+    def scoring(self) -> bool:
+        return self.config.phase in ("all", "score")
+
+    def serves(self) -> bool:
+        """Whether this run's phase needs the served model."""
+        if self.phase == "generate":
+            return self.needs_server()
+        if self.phase == "score":
+            return False
+        return self.needs_server() or self.score_needs_server()
+
+    def not_generated(self, what: str) -> RuntimeError:
+        """The error for an example the score phase finds without its generation."""
+        return RuntimeError(f"{self.id}: no generation for {what} (run --phase generate on this output dir)")
 
 
 def failure_policy(

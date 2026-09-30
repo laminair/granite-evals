@@ -6,7 +6,9 @@
 
 ``run`` is what every granite.build ``sage2-*`` step calls. It serves the model
 with vLLM (unless ``--base-url`` points at an existing server), runs one
-benchmark and writes ``<output-dir>/results.json``. The step, not this CLI,
+benchmark and writes ``<output-dir>/results.json``. ``--phase generate`` stops
+before scoring and writes ``generation.json``; ``--phase score`` on the same
+output dir serves nothing and grades it (see ``registry``). The step, not this CLI,
 prints the ``GB_ARTIFACT_ID`` marker, so the artifact contract stays visible in
 the step template.
 """
@@ -23,8 +25,8 @@ import time
 from pathlib import Path
 
 from sage2_evals import meter, registry, suites
-from sage2_evals.registry import RunConfig
-from sage2_evals.results import write_results
+from sage2_evals.registry import PHASES, RunConfig
+from sage2_evals.results import read_generation, write_results
 from sage2_evals.serving import ServerConfig, VLLMServer
 
 def _kv(pairs: list[str]) -> dict[str, str]:
@@ -51,6 +53,8 @@ def _add_run(sub) -> None:
     p.add_argument("--dataset", default="", help="hub id or local path overriding the benchmark's pinned dataset")
     p.add_argument("--dataset-revision", default=None)
     p.add_argument("--option", action="append", default=[], metavar="K=V", help="benchmark-specific option")
+    p.add_argument("--phase", choices=PHASES, default="all",
+                   help="generate: serve the model and save its outputs; score: grade them without a model (CPU)")
     g = p.add_argument_group("vLLM")
     g.add_argument("--tensor-parallel-size", type=int, default=1)
     g.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -64,6 +68,7 @@ def cmd_run(args) -> int:
     served = args.served_model_name or Path(args.model.rstrip("/")).name
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = RunConfig(
+        phase=args.phase,
         model=args.model,
         output_dir=args.output_dir,
         base_url=args.base_url,
@@ -77,9 +82,19 @@ def cmd_run(args) -> int:
         options=_kv(args.option),
     )
     benchmark = registry.get(args.benchmark)(config)
+    generation = None
+    if args.phase != "all":
+        if not benchmark.splittable:
+            raise SystemExit(f"{benchmark.id} scores inside generation; run it with --phase all")
+        if args.phase == "score":
+            if benchmark.score_needs_server():
+                raise SystemExit(f"{benchmark.id}: these options score with the served model; run --phase all")
+            generation = read_generation(benchmark)
+            served = args.served_model_name or generation["served_model_name"]
+            config.served_model_name = served
     started = time.time()
 
-    if args.base_url or not benchmark.needs_server():
+    if args.base_url or not benchmark.serves():
         server = contextlib.nullcontext()
         base_url = args.base_url
     else:
@@ -104,7 +119,11 @@ def cmd_run(args) -> int:
     if (spend := meters.summary()) is not None:
         outcome["api_spend"] = spend
         print(f"sage2-evals: paid API spend ${spend['usd']:.4f} over {spend['calls']} calls")
-    path = write_results(benchmark, outcome, started=started, served_model_name=served)
+    path = write_results(benchmark, outcome, started=started, served_model_name=served, generation=generation)
+    if args.phase == "generate":
+        print(f"sage2-evals: {benchmark.id} generated {json.loads(path.read_text())['n']}; score with --phase score")
+        print(f"sage2-evals: generation {path.resolve()}")
+        return 0
     print(f"sage2-evals: {benchmark.id} = {benchmark_value(path)} ({benchmark.metric})")
     if outcome.get("incomplete"):
         print("sage2-evals: INCOMPLETE: some items failed and were left out; rerun to retry them")

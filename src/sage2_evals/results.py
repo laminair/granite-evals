@@ -7,6 +7,7 @@ report can join them without knowing any benchmark's internals.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import time
 from importlib import metadata
@@ -18,6 +19,9 @@ from sage2_evals.registry import Benchmark
 
 SCHEMA_VERSION = 1
 RESULTS_FILE = "results.json"
+GENERATION_FILE = "generation.json"
+"""What ``--phase generate`` writes instead: the same record with ``value``
+None, for the score phase to check its output dir against."""
 
 
 def _package_versions(names: list[str]) -> dict[str, str]:
@@ -36,13 +40,15 @@ def write_results(
     *,
     started: float,
     served_model_name: str,
+    generation: dict[str, Any] | None = None,
 ) -> Path:
     config = benchmark.config
     record = {
         "schema_version": SCHEMA_VERSION,
         "benchmark": benchmark.id,
         "metric": benchmark.metric,
-        "value": outcome.pop("value"),
+        "phase": config.phase,
+        "value": outcome.pop("value", None),
         "n": outcome.pop("n"),
         "repeats": benchmark.repeats,
         "smoke": config.limit is not None,
@@ -61,6 +67,39 @@ def write_results(
         },
         "details": outcome,
     }
-    path = config.output_dir / RESULTS_FILE
+    if generation is not None:
+        record["generation"] = {
+            k: generation.get(k) for k in ("served_model_name", "options", "started_at", "duration_s", "versions", "job")
+        }
+    if config.phase == "generate":
+        record["job"] = os.environ.get("LSB_JOBID", "")
+    path = config.output_dir / (GENERATION_FILE if config.phase == "generate" else RESULTS_FILE)
     path.write_text(json.dumps(record, indent=2, sort_keys=False) + "\n")
     return path
+
+
+def read_generation(benchmark: Benchmark) -> dict[str, Any]:
+    """The generation record the score phase grades, checked against this run."""
+    config = benchmark.config
+    path = config.output_dir / GENERATION_FILE
+    if not path.exists():
+        raise SystemExit(f"{benchmark.id}: no {path}; run --phase generate on this output dir first")
+    record = json.loads(path.read_text())
+    ours = {
+        "benchmark": benchmark.id,
+        "model": config.model,
+        "limit": config.limit,
+        "repeats": benchmark.repeats,
+        "dataset": config.dataset,
+        "dataset_revision": config.dataset_revision,
+    }
+    # A benchmark may resolve the dataset itself (record: its pin); only an explicit
+    # override has to match.
+    if not config.dataset:
+        ours.pop("dataset")
+        ours.pop("dataset_revision")
+    wrong = {k: (record.get(k), v) for k, v in ours.items() if record.get(k) != v}
+    if wrong:
+        diff = ", ".join(f"{k}: generated {g!r}, scoring {s!r}" for k, (g, s) in wrong.items())
+        raise SystemExit(f"{benchmark.id}: {path} was generated with other settings ({diff})")
+    return record
