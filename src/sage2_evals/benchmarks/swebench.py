@@ -18,6 +18,10 @@ from the instance's SWE-bench image:
 
 Everything is written under ``<output_dir>/repeat-<k>/<instance_id>/`` and a
 finished instance is skipped on restart, so granite.build retries resume.
+
+``--phase generate`` runs only step 1 and stops at ``patch.diff``; ``--phase
+score`` runs only step 2 on those patches (no model; an instance without one is
+``not_generated``, unresolved). ``report.json`` marks a graded instance.
 """
 
 from __future__ import annotations
@@ -133,6 +137,7 @@ def _install_maven_mirror(sb) -> None:
 class SWEBench(Benchmark):
     metric = "pass@1[avg-of-3] resolve rate"
     default_repeats = 3
+    splittable = True
     extra = "swebench"
     harness_packages = ("mini-swe-agent", "swebench")
     split: ClassVar[str] = "test"
@@ -155,7 +160,9 @@ class SWEBench(Benchmark):
     def check(self) -> bool:
         """``--option check=data`` runs no agent and no tests: it checks that
         every selected instance can be graded (test spec, log parser, reference
-        patch, task files) and that its image exists in its registry."""
+        patch, task files) and that its image exists in its registry. It has
+        nothing to generate: ``--phase generate`` only counts the instances and
+        the check runs in the score (or all) phase."""
         return self.opt("check", "") == "data"
 
     def needs_server(self) -> bool:
@@ -180,10 +187,12 @@ class SWEBench(Benchmark):
             rows = [r for r in rows if re.search(pattern, r["instance_id"])]
         instances = data.take(rows, self.config.limit, key="instance_id")
         if self.check:
+            if not self.scoring:
+                return {"n": len(instances), "dataset": source, "dataset_revision": revision, "mode": "check=data"}
             return {"dataset": source, "dataset_revision": revision, **self._check_data(instances)}
-        log.info("%s: %d instances x %d repeats", self.id, len(instances), self.repeats)
+        log.info("%s: %d instances x %d repeats (phase %s)", self.id, len(instances), self.repeats, self.phase)
 
-        per_repeat = []
+        per_repeat, all_reports = [], []
         for k in range(self.repeats):
             repeat_dir = self.config.output_dir / f"repeat-{k}"
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
@@ -193,6 +202,12 @@ class SWEBench(Benchmark):
                         instances,
                     )
                 )
+            all_reports.append(reports)
+            if not self.scoring:
+                failed = [r["instance_id"] for r in reports if r["status"].startswith("error:")]
+                per_repeat.append({"repeat": k, "generated": len(reports) - len(failed), "failed": failed})
+                log.info("%s repeat %d: %d/%d generated", self.id, k, len(reports) - len(failed), len(reports))
+                continue
             resolved = sum(r["resolved"] for r in reports)
             per_repeat.append(
                 {
@@ -206,15 +221,18 @@ class SWEBench(Benchmark):
             )
             log.info("%s repeat %d: %d/%d resolved", self.id, k, resolved, len(reports))
 
-        return {
-            "value": sum(r["resolve_rate"] for r in per_repeat) / len(per_repeat),
-            "n": len(instances),
+        out = {
             "dataset": source,
             "dataset_revision": revision,
             "per_repeat": per_repeat,
             "instances": [i["instance_id"] for i in instances],
             "maven_mirror": maven_mirror() or None,
         }
+        if not self.scoring:
+            # Generated: a patch in every repeat (failed ones are retried by rerunning generate).
+            ok = [all(not rs[i]["status"].startswith("error:") for rs in all_reports) for i in range(len(instances))]
+            return {"n": sum(ok), **out}
+        return {"value": sum(r["resolve_rate"] for r in per_repeat) / len(per_repeat), "n": len(instances), **out}
 
     def _repeat_details(self, reports: list[dict]) -> dict[str, Any]:
         """Extra per-repeat counts for results.json."""
@@ -233,10 +251,16 @@ class SWEBench(Benchmark):
         try:
             patch_path = idir / "patch.diff"
             if not patch_path.exists():
+                if not self.generating:
+                    # Unresolved, as a failed generation is under --phase all; never generated here.
+                    log.warning("%s", self.not_generated(f"{iid} repeat {k}"))
+                    return {"instance_id": iid, "resolved": False, "status": "not_generated"}
                 if self.gold:
                     patch_path.write_text(self._gold_patch(instance))
                 else:
                     patch_path.write_text(self._generate(instance, idir, base_url, served, k))
+            if not self.scoring:
+                return {"instance_id": iid, "resolved": False, "status": "generated"}
             report = self._grade(instance, patch_path.read_text(), idir)
         except Exception as e:  # one broken instance must not sink the run
             log.exception("%s: %s failed", self.id, iid)
@@ -707,6 +731,7 @@ class SWEBenchPro(SWEBench):
       means resolved.
 
     ``--option subset=hard`` runs the HARD-51 subset (HF config ``hard``).
+    The phases split as in :class:`SWEBench`: generate ends at the captured diff.
     """
 
     id = "swebench-pro"
@@ -732,7 +757,7 @@ class SWEBenchPro(SWEBench):
         out.pop("maven_mirror", None)  # Pro's own sandboxes do not install it
         out["subset"] = self.dataset_config()
         out["verifier"] = {"repo": PRO_REPO, "commit": PRO_COMMIT, "sha256sums": PRO_SHA256SUMS_SHA256}
-        if "per_repeat" in out:
+        if self.scoring and "per_repeat" in out:
             total: dict[str, int] = {}
             for rep in out["per_repeat"]:
                 for key, n in rep.get("verifier_pid_ns", {}).items():

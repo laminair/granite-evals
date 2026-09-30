@@ -292,6 +292,94 @@ def test_gold_mode_grades_reference_patch_without_a_model(tmp_path, monkeypatch)
     assert fake.files[sb_mod.PATCH_FILE] == "gold-diff\n"
 
 
+# -- --phase generate / score ----------------------------------------------------
+
+
+def _phased(tmp_path, monkeypatch, phase, calls, **options):
+    bench = sb_mod.SWEBenchVerified(
+        RunConfig(model="m", output_dir=tmp_path, repeats=2, workers=1, phase=phase, options=options)
+    )
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [INSTANCE])
+    monkeypatch.setattr(bench, "_generate", lambda inst, idir, url, served, k: calls.append(k) or ("diff\n" if k == 0 else ""))
+    return bench
+
+
+def test_generate_phase_writes_patches_and_grades_nothing(tmp_path, monkeypatch):
+    calls = []
+    bench = _phased(tmp_path, monkeypatch, "generate", calls)
+    assert bench.splittable and bench.needs_server()
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: pytest.fail("generate phase grades nothing"))
+    out = bench.run("http://x/v1", "m")
+    assert "value" not in out and out["n"] == 1 and calls == [0, 1]
+    assert [r["generated"] for r in out["per_repeat"]] == [1, 1]
+    idir = tmp_path / "repeat-0" / INSTANCE["instance_id"]
+    assert (idir / "patch.diff").read_text() == "diff\n" and not (idir / "report.json").exists()
+    bench.run("http://x/v1", "m")  # resume: nothing regenerated
+    assert calls == [0, 1]
+
+
+def test_generate_phase_leaves_failed_instances_for_a_rerun(tmp_path, monkeypatch):
+    bench = _phased(tmp_path, monkeypatch, "generate", [])
+    monkeypatch.setattr(bench, "_generate", lambda *a: (_ for _ in ()).throw(ConnectionError("down")))
+    out = bench.run("http://x/v1", "m")
+    assert out["n"] == 0 and out["per_repeat"][0]["failed"] == [INSTANCE["instance_id"]]
+    assert not (tmp_path / "repeat-0" / INSTANCE["instance_id"] / "patch.diff").exists()
+
+
+def test_score_phase_grades_saved_patches_without_the_model(tmp_path, monkeypatch):
+    calls = []
+    _phased(tmp_path, monkeypatch, "generate", calls).run("http://x/v1", "m")
+    bench = _phased(tmp_path, monkeypatch, "score", calls)
+    monkeypatch.setattr(bench, "_generate", lambda *a: pytest.fail("score phase must not call the agent"))
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: FakeSandbox())
+    out = bench.run("", "m")
+    assert out["value"] == 0.5 and [r["statuses"] for r in out["per_repeat"]] == [{"graded": 1}, {"empty_patch": 1}]
+    assert (tmp_path / "repeat-0" / INSTANCE["instance_id"] / "report.json").exists()
+    # Rerunnable: graded instances are skipped.
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: pytest.fail("already graded"))
+    assert bench.run("", "m")["value"] == 0.5
+    # Same as --phase all on the same generations.
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: FakeSandbox())
+    both = _phased(tmp_path / "all", monkeypatch, "all", []).run("http://x/v1", "m")
+    assert both["value"] == 0.5 and both["per_repeat"] == out["per_repeat"]
+
+
+def test_score_phase_with_a_missing_patch_is_unresolved_and_never_generates(tmp_path, monkeypatch):
+    calls = []
+    _phased(tmp_path, monkeypatch, "generate", calls).run("http://x/v1", "m")
+    (tmp_path / "repeat-0" / INSTANCE["instance_id"] / "patch.diff").unlink()
+    bench = _phased(tmp_path, monkeypatch, "score", calls)
+    monkeypatch.setattr(bench, "_generate", lambda *a: pytest.fail("score phase must not call the agent"))
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: FakeSandbox())
+    out = bench.run("", "m")
+    assert out["per_repeat"][0]["statuses"] == {"not_generated": 1} and out["value"] == 0.0
+    assert not (tmp_path / "repeat-0" / INSTANCE["instance_id"] / "report.json").exists()  # a later score retries it
+
+
+def test_gold_generate_phase_writes_the_reference_patch_without_a_server(tmp_path, monkeypatch):
+    bench = _phased(tmp_path, monkeypatch, "generate", [], patch="gold")
+    assert bench.needs_server() is False and bench.serves() is False
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [{**INSTANCE, "patch": "gold-diff\n"}])
+    monkeypatch.setattr(bench, "_generate", lambda *a: pytest.fail("gold mode must not call the agent"))
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: pytest.fail("generate phase grades nothing"))
+    assert bench.run("", "m")["n"] == 1
+    assert (tmp_path / "repeat-1" / INSTANCE["instance_id"] / "patch.diff").read_text() == "gold-diff\n"
+
+
+def test_check_mode_checks_in_the_score_phase_only(tmp_path, monkeypatch):
+    def bench(phase):
+        return sb_mod.SWEBenchMultilingual(
+            RunConfig(model="none", output_dir=tmp_path, phase=phase, options={"check": "data"})
+        )
+
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [ML_INSTANCE])
+    monkeypatch.setattr(sb_mod, "probe_image", lambda ref: pytest.fail("generate phase checks nothing"))
+    out = bench("generate").run("", "none")
+    assert out["n"] == 1 and "value" not in out and not (tmp_path / "check.json").exists()
+    monkeypatch.setattr(sb_mod, "probe_image", lambda ref: {"status": 200, "digest": None})
+    assert bench("score").run("", "none")["value"] == 1.0 and (tmp_path / "check.json").exists()
+
+
 # -- SWE-bench Multilingual ----------------------------------------------------
 
 ML_INSTANCE = {
@@ -741,6 +829,22 @@ def test_pro_gold_run_uses_the_task_reference_patch(pro, tmp_path, monkeypatch):
     assert out["per_repeat"][0]["verifier_pid_ns"] == {"true": 1} and out["verifier_pid_ns"] == {"true": 1}
     assert out["verifier"]["commit"] == sb_mod.PRO_COMMIT
     assert fake.files["/tmp/replay.patch"] == "gold-diff\n"
+
+
+def test_pro_generate_then_score(pro, tmp_path, monkeypatch):
+    monkeypatch.setattr(sb_mod.data, "load_split", lambda *a, **k: [PRO_INSTANCE])
+    monkeypatch.setattr(pro, "_generate", lambda *a: "diff\n")
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: pytest.fail("generate phase grades nothing"))
+    pro.config.phase = "generate"
+    out = pro.run("http://x/v1", "m")
+    assert out["n"] == 1 and "value" not in out and "verifier_pid_ns" not in out
+    pro.config.phase = "score"
+    monkeypatch.setattr(pro, "_generate", lambda *a: pytest.fail("score phase must not call the agent"))
+    fake = ProSandbox(reward="1")
+    monkeypatch.setattr(sb_mod, "make_sandbox", lambda *a, **k: fake)
+    out = pro.run("", "m")
+    assert out["value"] == 1.0 and out["verifier_pid_ns"] == {"true": 1}
+    assert fake.files["/tmp/replay.patch"] == "diff\n"
 
 
 # -- check=data ----------------------------------------------------------------
