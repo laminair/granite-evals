@@ -247,3 +247,97 @@ def test_web_search_patch_target_exists(harness_env):
 
     params = list(inspect.signature(WebSearchAPI.search_engine_query).parameters)
     assert params == ["self", "keywords", "max_results", "region"]
+
+
+# -- generate / score phases ---------------------------------------------------
+
+
+def _write_results(root, ids):
+    d = root / "result" / bfcl.REGISTRY_NAME / "non_live"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "BFCL_v4_simple_python_result.json").write_text(
+        "".join(json.dumps({"id": i, "result": [{"f": "{}"}]}) + "\n" for i in ids))
+
+
+def _fake_child(tmp_path, seen, *, results=("simple_python_0", "simple_python_1")):
+    """The BFCL child by phase: generate writes ids and results, score writes scores
+    (or exits MISSING_EXIT when a selected id has no result), as child_main does."""
+
+    def run(cmd, env, check):
+        root = tmp_path / "out" / "bfcl"
+        cfg = json.loads((root / bfcl.CHILD_CONFIG).read_text())
+        seen.append((cfg["phase"], env.get("OPENAI_BASE_URL")))
+        (root / bfcl.TEST_IDS_FILE).write_text(json.dumps(
+            {"simple_python": ["simple_python_0", "simple_python_1"], "memory_kv": ["memory_kv_prereq_0-a-0"]}))
+        code = 0
+        if cfg["phase"] in ("all", "generate"):
+            _write_results(root, results)
+            (root / bfcl.SEARCH_STATS).write_text(json.dumps({"calls": 4}))
+        if cfg["phase"] == "score" and bfcl.missing_results(root):
+            code = bfcl.MISSING_EXIT
+        elif cfg["phase"] in ("all", "score"):
+            d = root / "score" / bfcl.REGISTRY_NAME / "non_live"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "BFCL_v4_simple_python_score.json").write_text(
+                json.dumps({"accuracy": 0.5, "correct_count": 1, "total_count": 2}) + "\n")
+            cols = ["Rank", "Overall Acc", "Model", *bfcl.OVERALL_GROUPS.values()]
+            (root / "score" / "data_overall.csv").write_text(
+                ",".join(cols) + "\n" + ",".join(["1", "5.00%", "m"] + ["N/A"] * 7) + "\n")
+        return type("P", (), {"returncode": code})()
+
+    return run
+
+
+def test_missing_results_ignores_memory_prereqs(tmp_path):
+    root = tmp_path / "bfcl"
+    root.mkdir()
+    (root / bfcl.TEST_IDS_FILE).write_text(json.dumps(
+        {"simple_python": ["simple_python_0", "simple_python_1"], "memory_kv": ["memory_kv_prereq_0-a-0"]}))
+    assert bfcl.scored_ids(root) == ["simple_python_0", "simple_python_1"]
+    assert bfcl.missing_results(root) == ["simple_python_0", "simple_python_1"]
+    _write_results(root, ["simple_python_1"])
+    assert bfcl.missing_results(root) == ["simple_python_0"]
+
+
+def test_generate_then_score(tmp_path, monkeypatch):
+    from sage2_evals.registry import RunConfig
+
+    seen = []
+    monkeypatch.setattr(bfcl.subprocess, "run", _fake_child(tmp_path, seen))
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    gen = bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path / "out", limit=2, phase="generate")).run("http://srv/v1", "m")
+    assert "value" not in gen and (gen["n"], gen["missing"]) == (2, 0) and gen["web_search"] == {"calls": 4}
+    assert not (tmp_path / "out" / "bfcl" / "score").exists()
+    out = bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path / "out", limit=2, phase="score")).run("", "m")
+    # score: no endpoint in the child's environment; the search stats are generation's
+    assert seen == [("generate", "http://srv/v1"), ("score", None)]
+    assert out["value"] == pytest.approx(0.05) and out["n"] == 2
+    assert out["web_search_backend"]["calls"] == 4
+
+
+def test_score_with_a_missing_generation_fails(tmp_path, monkeypatch):
+    from sage2_evals.registry import RunConfig
+
+    monkeypatch.setattr(bfcl.subprocess, "run", _fake_child(tmp_path, [], results=["simple_python_1"]))
+    gen = bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path / "out", limit=2, phase="generate")).run("http://s", "m")
+    assert (gen["n"], gen["missing"]) == (1, 1)
+    with pytest.raises(RuntimeError, match="no generation for 1 test ids .first: simple_python_0"):
+        bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path / "out", limit=2, phase="score")).run("", "m")
+
+
+def test_child_score_phase_evaluates_saved_results_only(tmp_path, harness_env, monkeypatch):
+    """The real child in the score phase: no search patch, no generation, BFCL's
+    evaluation on the saved result file (endpoint unreachable: never called)."""
+    root = tmp_path / "bfcl"
+    cfg = {"served_model_name": "m", "categories": ["simple_python"], "limit": 1, "num_threads": 1,
+           "sampling": {}, "search_mcp_url": "http://127.0.0.1:9/mcp", "include_input_log": False, "phase": "score"}
+    root.mkdir(exist_ok=True)
+    (root / bfcl.CHILD_CONFIG).write_text(json.dumps(cfg))
+    monkeypatch.setattr(bfcl, "MCPSearch", None)  # constructing it would fail the test
+    with pytest.raises(SystemExit) as e:
+        bfcl.child_main(str(root / bfcl.CHILD_CONFIG))
+    assert e.value.code == bfcl.MISSING_EXIT
+    _write_results(root, ["simple_python_0"])
+    bfcl.child_main(str(root / bfcl.CHILD_CONFIG))
+    assert bfcl.read_category_scores(root / "score" / bfcl.REGISTRY_NAME)["simple_python"]["total_count"] == 1
+    assert (root / "score" / "data_overall.csv").exists()

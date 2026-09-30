@@ -256,3 +256,97 @@ def test_nemo_skills_schema_context(tmp_path, dev):
     schemas = birdbench.BirdBench(cfg).schemas(dev)
     assert "CREATE TABLE t" in schemas["toy"]
     assert (dev.parent / "sql_context.json").exists()
+
+
+# -- generate / score phases ---------------------------------------------------
+
+
+def _fake_model(monkeypatch, sent):
+    """The fakes of test_model_mode_with_fakes: question -> SQL, one wrong, one broken."""
+
+    class Completions:
+        def create(self, **kw):
+            sent.append(kw)
+            sql = {"How many rows?": "SELECT COUNT(*) FROM t", "Names?": "SELECT id FROM t"}.get(
+                kw["messages"][-1]["content"], "SELEC")
+            msg = SimpleNamespace(content=f"```sql\n{sql}\n```", reasoning=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")], usage=None)
+
+    monkeypatch.setattr(birdbench, "_client", lambda url: SimpleNamespace(chat=SimpleNamespace(completions=Completions())))
+    monkeypatch.setattr(birdbench, "_prompt", lambda: SimpleNamespace(fill=lambda v: [{"role": "user", "content": v["question"]}]))
+    monkeypatch.setattr(birdbench, "_extractor", lambda dev: lambda t: t.split("```sql")[-1].split("```")[0].strip())
+    monkeypatch.setattr(birdbench.BirdBench, "schemas", lambda self, dev: {"toy": ""})
+
+
+def _no_model(monkeypatch):
+    def refuse(*a, **kw):
+        raise AssertionError("the score phase must not touch the model")
+
+    for name in ("_client", "_prompt", "_extractor"):
+        monkeypatch.setattr(birdbench, name, refuse)
+    monkeypatch.setattr(birdbench.BirdBench, "schemas", refuse)
+
+
+def _cfg(tmp_path, dev, phase, **kw):
+    return RunConfig(model="m", output_dir=tmp_path / "out", dataset=str(dev), workers=1, phase=phase, **kw)
+
+
+def test_generate_then_score_equals_all(tmp_path, dev, monkeypatch):
+    sent = []
+    _fake_model(monkeypatch, sent)
+    gen = birdbench.BirdBench(_cfg(tmp_path, dev, "generate", repeats=2)).run("http://srv/v1", "served")
+    assert "value" not in gen and gen["n"] == 3 and len(sent) == 6
+    assert gen["per_repeat"] == [{"repeat": k, "generated": 3, "failed": 0} for k in range(2)]
+    rec = json.loads((tmp_path / "out" / "repeat-0" / "1.json").read_text())
+    assert rec["status"] == birdbench.GENERATED and "correct" not in rec and rec["pred_sql"] == "SELECT COUNT(*) FROM t"
+    # A second generate run resumes: nothing is regenerated, nothing is executed.
+    birdbench.BirdBench(_cfg(tmp_path, dev, "generate", repeats=2)).run("http://srv/v1", "served")
+    assert len(sent) == 6 and json.loads((tmp_path / "out" / "repeat-0" / "1.json").read_text()) == rec
+
+    _no_model(monkeypatch)
+    out = birdbench.BirdBench(_cfg(tmp_path, dev, "score", repeats=2)).run("", "served")
+    assert out["value"] == pytest.approx(1 / 3) and out["n"] == 3 and not out["incomplete"]
+    assert out["per_repeat"][0]["statuses"] == {"correct": 1, "pred_error": 1, "wrong": 1}
+    rec = json.loads((tmp_path / "out" / "repeat-0" / "1.json").read_text())
+    assert rec["status"] == "correct" and rec["correct"] and rec["pred_rows"] == 1
+    # Re-running score reuses the scored files (a hand edit shows they are not re-executed).
+    rec["correct"], rec["status"] = False, "wrong"
+    (tmp_path / "out" / "repeat-0" / "1.json").write_text(json.dumps(rec))
+    assert birdbench.BirdBench(_cfg(tmp_path, dev, "score", repeats=2)).run("", "served")["value"] == pytest.approx(1 / 6)
+
+    # --phase all on fresh generations gives the same records and score.
+    sent.clear()
+    _fake_model(monkeypatch, sent)
+    cfg = _cfg(tmp_path, dev, "all", repeats=2)
+    cfg.output_dir = tmp_path / "all"
+    assert birdbench.BirdBench(cfg).run("http://srv/v1", "served")["value"] == pytest.approx(1 / 3)
+    for k in range(2):
+        for qid in range(3):
+            split = json.loads((tmp_path / "out" / f"repeat-{k}" / f"{qid}.json").read_text())
+            whole = json.loads((tmp_path / "all" / f"repeat-{k}" / f"{qid}.json").read_text())
+            if (k, qid) != (0, 1):  # hand-edited above
+                assert {x: v for x, v in split.items() if x != "exec_s"} == {x: v for x, v in whole.items() if x != "exec_s"}
+
+
+def test_score_counts_a_missing_generation_as_failed(tmp_path, dev, monkeypatch):
+    _fake_model(monkeypatch, [])
+    birdbench.BirdBench(_cfg(tmp_path, dev, "generate")).run("http://srv/v1", "served")
+    (tmp_path / "out" / "repeat-0" / "0.json").unlink()
+    _no_model(monkeypatch)
+    out = birdbench.BirdBench(_cfg(tmp_path, dev, "score", options={"max_failed_frac": "0.5"})).run("", "served")
+    # Left out and counted, like a failed request; its file is not created.
+    assert (out["value"], out["n"], out["questions_failed"], out["incomplete"]) == (0.5, 2, 1, True)
+    assert not (tmp_path / "out" / "repeat-0" / "0.json").exists()
+    with pytest.raises(SystemExit, match="questions_failed 1/3"):
+        birdbench.BirdBench(_cfg(tmp_path, dev, "score")).run("", "served")
+
+
+def test_gold_mode_in_every_phase(tmp_path, dev, monkeypatch):
+    _no_model(monkeypatch)
+    opts = {"sql": "gold"}
+    gen = birdbench.BirdBench(_cfg(tmp_path, dev, "generate", options=opts)).run("", "")
+    assert gen["n"] == 3 and gen["mode"] == "gold"
+    rec = json.loads((tmp_path / "out" / "repeat-0" / "2.json").read_text())
+    assert rec["status"] == birdbench.GENERATED and rec["pred_sql"] == rec["gold_sql"]
+    out = birdbench.BirdBench(_cfg(tmp_path, dev, "score", options=opts)).run("", "")
+    assert out["value"] == 1.0 and out["n"] == 3

@@ -27,6 +27,13 @@ BFCL runs in a child process (``python -m sage2_evals.benchmarks.bfcl``) because
 it reads ``BFCL_PROJECT_ROOT`` at import time and keeps state in module globals.
 Generation resumes natively (finished test ids are skipped); inference errors
 that look like infrastructure failures are dropped on restart so they are retried.
+
+Phases: ``--phase generate`` runs BFCL's generation only (vLLM and the search
+MCP server; results under ``bfcl/result/``); ``--phase score`` runs only BFCL's
+evaluation on those files, which replays multi-turn calls in BFCL's local
+simulators and never calls the model or web search. Every selected test id
+needs a result: BFCL itself refuses a full evaluation with missing ones (and
+silently drops them from a partial one), so a missing one fails the score phase.
 """
 
 from __future__ import annotations
@@ -55,6 +62,8 @@ DEFAULT_SEARCH_MCP_URL = "https://mcp.ete-server.vpc-int.res.ibm.com/mcp"
 SEARCH_TOOL = "google_pse_search"
 CHILD_CONFIG = "sage2_bfcl_config.json"
 SEARCH_STATS = "web_search_stats.json"
+TEST_IDS_FILE = "test_case_ids_to_generate.json"  # BFCL's TEST_IDS_TO_GENERATE_PATH, under BFCL_PROJECT_ROOT
+MISSING_EXIT = 3  # the child's exit code when the score phase finds test ids without a result
 
 # An inference error with one of these in its message is an infrastructure
 # failure, not a model failure: drop it on restart so the entry is regenerated.
@@ -71,6 +80,7 @@ class BFCLv4(Benchmark):
     default_repeats = 1
     extra = "bfcl"
     harness_packages = (HARNESS,)
+    splittable = True
     # The data ships inside the pinned package (bfcl_eval/data), so the dataset
     # is the exact package release, pinned by its wheel's sha256.
     dataset = f"https://pypi.org/project/{HARNESS}/{HARNESS_VERSION}/"
@@ -103,6 +113,7 @@ class BFCLv4(Benchmark):
             "sampling": self.sampling(),
             "search_mcp_url": self.opt("search_mcp_url", DEFAULT_SEARCH_MCP_URL),
             "include_input_log": self.opt("include_input_log", "false").lower() == "true",
+            "phase": self.phase,
         }
         (root / CHILD_CONFIG).write_text(json.dumps(child, indent=2))
         env = {
@@ -112,17 +123,28 @@ class BFCLv4(Benchmark):
             "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY") or "EMPTY",
             "TQDM_DISABLE": "1",
         }
+        if not base_url:
+            env.pop("OPENAI_BASE_URL")  # score phase: the handler is built, never called
         log.info("%s: categories=%s limit=%s workers=%d sampling=%s", self.id, ",".join(categories),
                  self.config.limit, self.config.workers, child["sampling"] or "generation_config")
         cmd = [sys.executable, "-m", "sage2_evals.benchmarks.bfcl", str(root / CHILD_CONFIG)]
         proc = subprocess.run(cmd, env=env, check=False)
+        if proc.returncode == MISSING_EXIT and not self.generating:
+            missing = missing_results(root)
+            raise self.not_generated(f"{len(missing)} test ids (first: {', '.join(missing[:5])})")
         if proc.returncode != 0:
             raise RuntimeError(f"bfcl child process exited with {proc.returncode}")
+        stats_path = root / SEARCH_STATS
+        search_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
+        if not self.scoring:
+            missing = missing_results(root)
+            generated = len(scored_ids(root)) - len(missing)
+            log.info("%s: generated %d entries, %d without a result", self.id, generated, len(missing))
+            return {"n": generated, "missing": len(missing), "categories": categories,
+                    "sampling": child["sampling"] or "checkpoint generation_config", "web_search": search_stats}
 
         per_category = read_category_scores(root / "score" / REGISTRY_NAME)
         overall = read_overall(root / "score" / "data_overall.csv")
-        stats_path = root / SEARCH_STATS
-        search_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
         for cat, s in per_category.items():
             log.info("%s: %s accuracy=%.4f (%d/%d)", self.id, cat, s["accuracy"], s["correct_count"], s["total_count"])
         log.info("%s: overall_accuracy=%.4f", self.id, overall["overall"])
@@ -207,6 +229,20 @@ def select_ids(entries_by_category: dict[str, list[dict]], limit: int | None) ->
             ids.update(e.get("depends_on") or [])
         out[cat] = [e["id"] for e in entries if e["id"] in ids]
     return out
+
+
+def scored_ids(root: Path) -> list[str]:
+    """The selected test ids BFCL scores (memory prereq conversations are not scored)."""
+    ids = json.loads((root / TEST_IDS_FILE).read_text())
+    return [i for cat_ids in ids.values() for i in cat_ids if "prereq" not in i]
+
+
+def missing_results(root: Path) -> list[str]:
+    """Selected scored test ids with no entry in any result file under ``root``."""
+    present = set()
+    for path in (root / "result" / REGISTRY_NAME).rglob("BFCL_v4_*_result.json"):
+        present.update(json.loads(line)["id"] for line in path.read_text().splitlines() if line.strip())
+    return [i for i in scored_ids(root) if i not in present]
 
 
 def prune_infra_errors(result_file: Path) -> int:
@@ -460,6 +496,14 @@ def child_main(config_path: str) -> None:
         underscore_to_dot=True,  # OpenAI-style tool names: "." is sent as "_"
     )
 
+    if cfg["phase"] == "score":
+        # Score only what was generated; a missing result is no model failure to hide.
+        if missing := missing_results(root):
+            print(f"bfcl-v4: {len(missing)} test ids have no result (run --phase generate)", flush=True)
+            sys.exit(MISSING_EXIT)
+        evaluation_main([REGISTRY_NAME], cfg["categories"], None, None, cfg["limit"] is not None)
+        return
+
     search = MCPSearch(cfg["search_mcp_url"])
     web_search.WebSearchAPI.search_engine_query = make_search_engine_query(search)
 
@@ -479,6 +523,8 @@ def child_main(config_path: str) -> None:
         run_ids=True, enable_lora=False, max_lora_rank=None, lora_modules=None,
     ))
     (root / SEARCH_STATS).write_text(json.dumps(search.stats, indent=2))
+    if cfg["phase"] == "generate":
+        return
     evaluation_main([REGISTRY_NAME], cfg["categories"], None, None, cfg["limit"] is not None)
 
 
