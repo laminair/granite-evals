@@ -11,6 +11,14 @@ Each run serves the model with vLLM in the job, runs one benchmark and writes
 `out/results.json`. The upstream harnesses (mini-swe-agent, swebench, …) are pinned
 dependencies. This repo only adapts them. Each harness family ships as its own image.
 
+`--phase generate` and `--phase score` split a run into two jobs on one output dir, so
+grading (sandboxes, verifiers, paid judges) holds no GPU. `generate` serves the model
+and writes `out/generation.json`; `score` serves nothing, checks that generation.json
+matches its model, limit, repeats and dataset, and grades the saved outputs. It never
+generates: an example without a generation fails like a failed generation.
+`terminal-bench-2.1` and `mmlu-prox-lite` grade inside generation and only take
+`--phase all` (the default); so do options with `judge_model=self`.
+
 ## Suites
 
 `sage2-evals list --suite granite42` (or `granite5`) prints each benchmark and whether
@@ -49,7 +57,7 @@ official GPT-4.1 judge, and without style control; results record both judges.
 | `serving.py` | vLLM server lifecycle (`--tool-call-parser auto --reasoning-parser auto`) |
 | `data.py` | dataset loading (upstream HF datasets, pinned by commit) |
 | `meter.py` | metering proxy for paid judge / user-simulator APIs: cost ledger, budget cap |
-| `results.py` | `results.json` schema (value, n, smoke flag, versions, details) |
+| `results.py` | `results.json` schema (value, n, smoke flag, versions, details), `generation.json` |
 | `sandbox/` | per-task containers: enroot (BlueVela), podman/docker (local) |
 | `benchmarks/` | one module per benchmark family |
 

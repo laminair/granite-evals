@@ -43,6 +43,8 @@ sandboxes. Results go to `$ROOT/runs/smoke-<jobid>/`, and `ROOT` defaults to
 | `MODEL` | `none` | A hub id, an absolute path (mounted), or `none` for gold/oracle modes |
 | `LIMIT` / `REPEATS` / `WORKERS` | `2` / `1` / `2` | |
 | `OPTIONS` | `""` | Space-separated `key=value` |
+| `PHASE` | `all` | `generate` or `score` for a split run (below) |
+| `RUN` | `$ROOT/runs/smoke-<jobid>` | Output dir; a score job takes its generate job's |
 | `EXTRA_ARGS` | `""` | More `sage2-evals run` flags, e.g. `--max-model-len 131072` |
 | `JUDGE_ENV` | `~/.config/sage2/judge.env` | Mode-600 env file holding `SAGE2_JUDGE_API_KEY` / `SAGE2_USER_API_KEY`. `/dev/null` means no paid API |
 | `SPEND_LEDGER` / `SPEND_BUDGET_USD` | `$ROOT/spend/ledger.jsonl` / `50` | Every job shares one ledger and one cap |
@@ -66,6 +68,12 @@ ssh bv 'zsh -ic "cd /proj/data-eng/hew/sage2/logs && \
 
 `~/bv-smoke.sh` is a copy of `scripts/bv-smoke.sh`. Don't replace it while jobs
 that use it are still queued or running.
+
+A split run is two jobs on one run dir: `PHASE=generate` with `-gpu`, then
+`PHASE=score RUN=$ROOT/runs/smoke-<generate jobid>` without `-gpu` (same `BENCHMARK`,
+`MODEL`, `LIMIT`, `REPEATS`, `OPTIONS`). bsub's `-w "done(<jobid>)"` queues the second
+behind the first. The paid judge keys are needed only by the score job (the tau user
+simulator runs in generate).
 
 For gold and oracle modes (`MODEL=none`), drop `-gpu`. `ruler-*` needs a tokenizer
 even in gold mode, so keep `MODEL`. It also needs `EXTRA_ARGS="--max-model-len 131072"`.

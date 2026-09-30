@@ -9,6 +9,8 @@
 #   MODEL=/path/to/hf/model bsub ... -gpu num=1 bv-smoke.sh   # model run
 # IMAGE is required; BENCHMARK, LIMIT, OPTIONS (space-separated k=v), EXTRA_ARGS optional.
 # SWE-bench gold run (no model): MODEL=none OPTIONS=patch=gold.
+# Split run: PHASE=generate (GPU job), then PHASE=score RUN=<the generate job's run dir>
+# (CPU job, no -gpu).
 set -euo pipefail
 
 IMAGE="${IMAGE:?set IMAGE=icr.io/tir-hew-sage2-evals/sage2-evals-<family>:<sha>}"
@@ -20,6 +22,7 @@ WORKERS="${WORKERS:-2}"
 # Empty = the dataset the benchmark pins.
 DATASET="${DATASET:-}"
 OPTIONS="${OPTIONS:-}"
+PHASE="${PHASE:-all}"  # all | generate | score
 EXTRA_ARGS="${EXTRA_ARGS:-}"  # further `sage2-evals run` arguments, e.g. --max-model-len 32768; split on spaces, no quote removal (values with shell characters go in OPTIONS)
 ROOT="${ROOT:-/proj/data-eng/hew/sage2}"
 # Judge / user-simulator key: an env file the user keeps in their home (mode 600),
@@ -144,7 +147,8 @@ enroot create --name "$NAME" "$SQSH"
 MOUNTS=(--mount "$ROOT:$ROOT" --mount "$LOCAL/inner:/scratch")
 case "$MODEL" in /*) MOUNTS+=(--mount "$MODEL:$MODEL") ;; esac
 # Passed to the inner shell as arguments, so a value like instances='a|b(c)' stays one word.
-RUN_ARGS=(--model "$MODEL" --output-dir "$RUN" --limit "$LIMIT" --repeats "$REPEATS" --workers "$WORKERS")
+RUN_ARGS=(--model "$MODEL" --output-dir "$RUN" --limit "$LIMIT" --repeats "$REPEATS" --workers "$WORKERS"
+    --phase "$PHASE")
 [ -n "$DATASET" ] && RUN_ARGS+=(--dataset "$DATASET")
 for kv in $OPTIONS; do RUN_ARGS+=(--option "$kv"); done
 
@@ -170,6 +174,8 @@ enroot start --rw "${MOUNTS[@]}" \
         enroot version
         log=$1; shift
         sage2-evals run "$@" 2>&1 | tee "$log"
-    ' _ "$RUN/sage2.log" "$BENCHMARK" "${RUN_ARGS[@]}" $EXTRA_ARGS
-echo "=== results: $RUN/results.json ==="
-cat "$RUN/results.json"
+    ' _ "$RUN/sage2-$PHASE.log" "$BENCHMARK" "${RUN_ARGS[@]}" $EXTRA_ARGS
+RESULT="$RUN/results.json"
+[ "$PHASE" = generate ] && RESULT="$RUN/generation.json"
+echo "=== results: $RESULT ==="
+cat "$RESULT"
