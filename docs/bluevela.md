@@ -10,7 +10,7 @@ image directly on BlueVela with `scripts/bv-smoke.sh` (smokes, gold checks, debu
 BlueVela cannot build images. Build them on hg4os and push them to ICR:
 
 ```bash
-make publish-image EXTRA=<family>   # -> icr.io/tir-hew-sage2-evals/sage2-evals-<family>:<sha>
+make publish-image EXTRA=<family>   # -> us.icr.io/cil15-shared-registry/sage2-evals-<family>:<sha>
 ```
 
 | Family | Benchmarks |
@@ -38,7 +38,7 @@ sandboxes. Results go to `$ROOT/runs/smoke-<jobid>/`, and `ROOT` defaults to
 
 | Variable | Default | |
 |---|---|---|
-| `IMAGE` | required | `icr.io/tir-hew-sage2-evals/sage2-evals-<family>:<sha>` |
+| `IMAGE` | required | `us.icr.io/cil15-shared-registry/sage2-evals-<family>:<sha>` |
 | `BENCHMARK` | `swebench-verified` | |
 | `MODEL` | `none` | A hub id, an absolute path (mounted), or `none` for gold/oracle modes |
 | `LIMIT` / `REPEATS` / `WORKERS` | `2` / `1` / `2` | |
@@ -59,7 +59,7 @@ copies the environment into the job:
 
 ```bash
 ssh bv 'zsh -ic "cd /proj/data-eng/hew/sage2/logs && \
-  IMAGE=icr.io/tir-hew-sage2-evals/sage2-evals-nemoskills:<sha> BENCHMARK=gpqa \
+  IMAGE=us.icr.io/cil15-shared-registry/sage2-evals-nemoskills:<sha> BENCHMARK=gpqa \
   MODEL=ibm-granite/granite-4.2-3b LIMIT=5 WORKERS=4 JUDGE_ENV=/dev/null \
   bsub -G grp_preemptable -q preemptable -J sage2-gpqa -o %J.out -e %J.err \
        -n 16 -R \"span[hosts=1]\" -M 64G -gpu num=1:mode=exclusive_process \

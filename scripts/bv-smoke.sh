@@ -13,7 +13,7 @@
 # (CPU job, no -gpu).
 set -euo pipefail
 
-IMAGE="${IMAGE:?set IMAGE=icr.io/tir-hew-sage2-evals/sage2-evals-<family>:<sha>}"
+IMAGE="${IMAGE:?set IMAGE=us.icr.io/cil15-shared-registry/sage2-evals-<family>:<sha>}"
 BENCHMARK="${BENCHMARK:-swebench-verified}"
 MODEL="${MODEL:-none}"
 LIMIT="${LIMIT:-2}"

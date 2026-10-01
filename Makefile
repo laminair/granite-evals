@@ -2,7 +2,7 @@
 #   make image EXTRA=swebench
 #   make publish-image EXTRA=swebench
 # ICR namespace (ETE CIL12 tenant) for the sage2 images.
-REGISTRY ?= icr.io/tir-hew-sage2-evals
+REGISTRY ?= us.icr.io/cil15-shared-registry
 # hg4os builds as root inside a container: BUILD_FLAGS='--isolation=chroot --cgroup-manager=cgroupfs'
 BUILD_FLAGS ?=
 EXTRA ?= swebench

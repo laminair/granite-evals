@@ -106,7 +106,7 @@ Each benchmark class pins its upstream HF dataset and commit (`dataset`,
 Images are built on hg4os, because BlueVela cannot build them, and pushed to ICR:
 
 ```bash
-make publish-image EXTRA=swebench   # -> icr.io/tir-hew-sage2-evals/sage2-evals-swebench:<sha>
+make publish-image EXTRA=swebench   # -> us.icr.io/cil15-shared-registry/sage2-evals-swebench:<sha>
 ```
 
 Tags are the git short SHA. Pin that tag in the granite.build recipe.
