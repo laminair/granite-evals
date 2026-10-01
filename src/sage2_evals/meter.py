@@ -20,7 +20,8 @@ The ledger holds costs and token counts only, never prompts or keys.
 The CLI starts a :class:`Meters` around each run: options named ``*_base_url``
 with an http(s) value are rewritten to their proxy, and benchmarks route any
 other paid endpoint (e.g. a class default) through :func:`metered`. The run's
-spend goes to results.json as ``details.api_spend``.
+spend goes to results.json as ``details.api_spend``; ``run_total_usd`` adds
+the ledger's earlier attempts on the same output dir.
 """
 
 from __future__ import annotations
@@ -56,13 +57,16 @@ class Ledger:
         self.path = path
         self._lock = threading.Lock()
 
-    def total(self) -> float:
+    def total(self, run: str | None = None) -> float:
+        """What every job has spent, or only the calls tagged with output dir ``run``."""
         if not self.path or not self.path.exists():
             return 0.0
         total = 0.0
         for line in self.path.read_text().splitlines():
             try:
-                total += float(json.loads(line).get("cost_usd", 0))
+                entry = json.loads(line)
+                if run is None or entry.get("run") == run:
+                    total += float(entry.get("cost_usd", 0))
             except (ValueError, AttributeError):
                 continue
         return total
@@ -281,6 +285,11 @@ class Meters:
             "budget_usd": self.budget_usd,
             "ledger": str(self.ledger.path) if self.ledger.path else None,
             "ledger_total_usd": round(self.ledger.total(), 6) if self.ledger.path else None,
+            # Every attempt and phase on this output dir: a job the queue requeued resumes
+            # from saved results, so ``usd`` (this process) leaves out the earlier attempts.
+            "run_total_usd": round(self.ledger.total(run=self.tags.get("run")), 6)
+            if self.ledger.path and self.tags.get("run")
+            else None,
             "endpoints": meters,
         }
 

@@ -77,6 +77,22 @@ def test_options_are_metered_and_spend_is_ledgered(upstream, tmp_path, monkeypat
     assert meter.report(ledger)["by_benchmark"] == {"b": 0.02}
 
 
+def test_run_total_counts_earlier_attempts(upstream, tmp_path, monkeypatch):
+    # A requeued score job resumes from saved judgements: its own process pays little,
+    # the output dir's total still counts the first attempt.
+    ledger = tmp_path / "spend.jsonl"
+    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(ledger))
+    monkeypatch.delenv("SAGE2_SPEND_BUDGET_USD", raising=False)
+    for run, n in (("/runs/a", 2), ("/runs/other", 1), ("/runs/a", 1)):
+        options = {"judge_base_url": upstream}
+        with meter.Meters(options, {"benchmark": "b", "run": run}) as meters:
+            for _ in range(n):
+                _chat(options["judge_base_url"])
+            spend = meters.summary()
+    assert spend["usd"] == pytest.approx(0.01) and spend["run_total_usd"] == pytest.approx(0.03)
+    assert spend["ledger_total_usd"] == pytest.approx(0.04)
+
+
 def test_roles_on_one_gateway_are_accounted_apart(upstream, tmp_path, monkeypatch):
     # tau's user simulator and judge share the gateway URL.
     ledger = tmp_path / "spend.jsonl"
