@@ -126,6 +126,21 @@ def test_summarize_macro_over_languages_and_ignores_other_filters():
     assert out["statuses"] == {"answered": 4, "no_content": 1, "error": 1}
 
 
+def test_prox_pass_at_k_macro_over_languages():
+    def s(doc_id, score, flt=chat_if.FILTER):
+        return {"filter": flt, "exact_match": score, "doc_id": doc_id}
+
+    r0 = chat_if.sample_scores({"mmlu_prox_lite_en_math": [s(0, 1.0), s(1, 0.0), s(1, 1.0, flt="other")],
+                                "mmlu_prox_lite_de_law": [s(0, 0.0)]})  # fmt: skip
+    r1 = chat_if.sample_scores({"mmlu_prox_lite_en_math": [s(0, 0.0), s(1, 1.0)], "mmlu_prox_lite_de_law": [s(0, 0.0)]})
+    assert r0 == {"en": {"mmlu_prox_lite_en_math/0": 1.0, "mmlu_prox_lite_en_math/1": 0.0},
+                  "de": {"mmlu_prox_lite_de_law/0": 0.0}}  # fmt: skip
+    # en: pass@1 0.5, pass@2 1.0; de: 0 and 0
+    out = chat_if.prox_pass_at_k([r0, r1], 2)
+    how = "mean over languages; an example counts if it matched in any repeat"
+    assert out == {"k": 2, "pass_at_1": 0.25, "pass_at_k": 0.5, "n": 3, "how": how}
+
+
 def _kw(tmp_path, **options):
     return chat_if.MMLUProXLite(RunConfig(model="m", output_dir=tmp_path, options=options)).gen_kwargs()
 
@@ -226,7 +241,10 @@ def test_gold_scores_one_end_to_end(tmp_path, dataset_dir):
     assert not b.needs_server()
     out = b.run("", "")
     assert out["value"] == 1.0 and out["n"] == 28
+    assert {k: out["pass_at_k"][k] for k in ("k", "pass_at_1", "pass_at_k", "n")} == {"k": 1, "pass_at_1": 1.0,
+                                                                                    "pass_at_k": 1.0, "n": 28}  # fmt: skip
     rep = out["per_repeat"][0]
+    assert "sample_scores" not in rep
     assert rep["statuses"] == {"answered": 28}
     assert set(rep["per_language"]) == set(LANGS)
     rows = [json.loads(x) for x in (tmp_path / "out/repeat-0/samples/mmlu_prox_lite_de_computer_science.jsonl").read_text().splitlines()]

@@ -22,6 +22,9 @@ confirmed one; ``--option languages=all`` (or a comma list) changes it.
 The headline value is the mean over languages of each language's exact match
 (lm-eval's ``mmlu_prox_lite_{lang}`` group: size-weighted over subjects). All
 languages have the same 588 questions, so this is also the micro average.
+With ``--repeats k`` it is the mean of the k repeats' values (pass@1[avg-of-k])
+and ``details.pass_at_k`` adds pass@k (an example matched in any repeat), both
+averaged over languages the same way.
 
 Generation uses Granite 4.2's card settings for thinking mode, not the task
 configs: ``temperature=1.0``, ``top_p=0.95``, ``max_tokens=8192``, thinking left
@@ -80,7 +83,7 @@ from typing import Any, ClassVar
 
 from sage2_evals import data
 from sage2_evals.benchmarks.nemo_skills import NemoSkillsBenchmark
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, pass_at_k, pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -190,6 +193,34 @@ def summarize(samples: dict[str, list[dict]]) -> dict[str, Any]:
         "per_subject": {s: {"exact_match": sum(v) / len(v), "n": len(v)} for s, v in sorted(per_subject.items())},
         "statuses": statuses,
     }
+
+
+def sample_scores(samples: dict[str, list[dict]]) -> dict[str, dict[str, float]]:
+    """Per language, each example's exact match (``custom-extract``), keyed
+    ``<task>/<doc_id>``: one repeat's input to pass@k."""
+    out: dict[str, dict[str, float]] = {}
+    for task, rows in samples.items():
+        lang, _ = parse_task(task)
+        for row in rows:
+            if row.get("filter") == FILTER:
+                out.setdefault(lang, {})[f"{task}/{row['doc_id']}"] = float(row[METRIC])
+    return out
+
+
+def prox_pass_at_k(repeats: list[dict[str, dict[str, float]]], k: int) -> dict[str, Any]:
+    """``details.pass_at_k`` over repeats' ``sample_scores``, macro-averaged over
+    languages as the headline is: pass@1[avg-of-k] and pass@k (matched in any
+    repeat) per language, then their mean."""
+    langs = sorted({lang for r in repeats for lang in r})
+    recs = []
+    for lang in langs:
+        keys = sorted({key for r in repeats for key in r.get(lang, {})})
+        recs.append(pass_at_k([[r[lang][key] for r in repeats if key in r.get(lang, {})] for key in keys], k))
+    how = "mean over languages; an example counts if it matched in any repeat"
+    if not recs:
+        return pass_at_k_record(k, None, None, 0, how)
+    return pass_at_k_record(k, sum(x["pass_at_1"] for x in recs) / len(recs), sum(x["pass_at_k"] for x in recs) / len(recs),
+                            sum(x["n"] for x in recs), how)  # fmt: skip
 
 
 def effective_generation_kwargs(configs: dict[str, dict]) -> dict[str, dict]:
@@ -507,9 +538,10 @@ class MMLUProXLite(Benchmark):
             tasks = [task_name(lang, s) for lang in langs for s in SUBJECTS]
         log.info("%s: %d languages, %d tasks, limit=%s", self.id, len(langs), len(tasks), self.config.limit)
 
-        per_repeat = []
+        per_repeat, scores = [], []
         for k in range(self.repeats):
             summary = self._repeat(k, tasks, samples, source, revision, base_url, served_model_name)
+            scores.append(summary.pop("sample_scores"))
             per_repeat.append({"repeat": k, **summary})
             log.info("%s repeat %d: exact_match %.4f over %d (%s)", self.id, k, summary["value"], summary["n"], summary["statuses"])
 
@@ -523,6 +555,7 @@ class MMLUProXLite(Benchmark):
             "gen_kwargs_overrides": self.gen_kwargs(),
             "stop": "task" if self.stop() is None else self.stop(),
             "generation_kwargs": per_repeat[0]["generation_kwargs"],
+            "pass_at_k": prox_pass_at_k(scores, self.repeats),
             "per_repeat": per_repeat,
         }
 
@@ -552,6 +585,7 @@ class MMLUProXLite(Benchmark):
                 log.warning("%s repeat %d: %d failed requests dropped from the cache for retry", self.id, k, dropped)
         self._write(repeat_dir, results)
         summary = summarize(results["samples"])
+        summary["sample_scores"] = sample_scores(results["samples"])
         if not self.gold:
             summary["requests"] = summarize_requests(results["samples"])
         summary["generation_kwargs"] = effective_generation_kwargs(results.get("configs") or {})
