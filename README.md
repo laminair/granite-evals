@@ -43,10 +43,21 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
 | `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000); `details.elo_is_approximation` | `judged` |
 | `profbench` | overall (ProfBench report generation, lite, LLM-judged rubrics) | `judged` |
+| `hle-tools` (HLE text-only, python + web search tools) | pass@1 judge_correct | `nemoskills` |
+| `critpt-tools` (python tool; graded by Artificial Analysis's CritPt API) | Challenge Accuracy | `nemoskills` |
+| `browsecomp` (web search + page fetch tools) | mean reward (simple-evals grader) | `nemoskills` |
 
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
 official GPT-4.1 judge, and without style control; results record both judges.
+
+`hle-tools`, `critpt-tools` and `browsecomp` (`benchmarks/tools_agentic.py`) add tools to
+NeMo-Skills tool calling (`agent_tools.py`): a stateful python REPL in an enroot sandbox
+with no network (`python_network`), web search through the IBM search MCP, and a page
+fetch. URLs that would leak the benchmark's answers are blocked. `hle-tools` and
+`browsecomp` are judged by `aws/claude-sonnet-5` instead of o3-mini and GPT-4.1, using the
+official prompts. `critpt-tools` needs an approved `ARTIFICIAL_ANALYSIS_API_KEY`, and each
+grading response is cached because the API allows 10 requests a day.
 
 ## Layout
 
