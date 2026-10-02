@@ -1,7 +1,10 @@
 """Terminal-Bench 2.1 (Sage2: agentic coding).
 
-Metric: pass@1[avg-of-8] resolve rate, i.e. the fraction of tasks whose tests
-pass (harbor reward 1), per independent repeat, averaged over 8 repeats.
+Metric: pass@1 resolve rate, i.e. the fraction of tasks whose tests pass
+(harbor reward 1) in one trial per task (``repeats`` 1). With ``--repeats k``
+the value is pass@1[avg-of-k], that fraction per independent repeat averaged
+over the k, and ``details.pass_at_k`` adds pass@k: the fraction of tasks
+resolved in at least one of the k trials.
 
 The harness is Harbor, Terminal-Bench 2.x's official one, with its reference
 agent Terminus 2. Each (task, repeat) is one harbor ``Trial``: harbor's agent
@@ -36,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, pass_at_k, register
 from sage2_evals.sandbox.nodelock import async_node_locks
 
 log = logging.getLogger(__name__)
@@ -259,8 +262,7 @@ def _count(values) -> dict[str, int]:
 @register
 class TerminalBench21(Benchmark):
     id = "terminal-bench-2.1"
-    metric = "pass@1[avg-of-8] resolve rate"
-    default_repeats = 8
+    metric = "pass@1 resolve rate"
     extra = "tbench"
     harness_packages = ("harbor",)
     dataset = "harborframework/terminal-bench-2.1"
@@ -358,6 +360,11 @@ class TerminalBench21(Benchmark):
             "agent": self.agent,
             "sampling": self.sampling(),
             "per_repeat": per_repeat,
+            "pass_at_k": pass_at_k(
+                ([r["resolved"] for r in reports if r["task"] == t["name"]] for t in tasks),
+                self.repeats,
+                "resolved in any of the k trials",
+            ),
             "per_task_resolved": per_task,
             "per_task_status": per_task_status,
             "tasks": [t["name"] for t in tasks],

@@ -61,7 +61,7 @@ def bench(tmp_path, names, **options):
 
 def test_metadata():
     cls = tb.TerminalBench21
-    assert cls.metric == "pass@1[avg-of-8] resolve rate" and cls.default_repeats == 8
+    assert cls.metric == "pass@1 resolve rate" and cls.default_repeats == 1
     assert len(cls.dataset_revision) == 40
     assert tb.HOST_PORT_TASKS.isdisjoint(tb.EXCLUDED)
     assert len(tb.TASK_DIGESTS) == tb.N_TASKS
@@ -84,22 +84,29 @@ def test_run_scores_resumes_and_records(tmp_path, monkeypatch):
         calls.append((task["name"], k))
         assert agent == {"name": "oracle"}
         (repeat_dir / task["name"]).mkdir(parents=True, exist_ok=True)
-        if task["name"] == "b-task":
+        if task["name"] == "b-task" and k == 0:  # b-task: resolved in repeat 1 only
             return fake_result(0.0, "AgentTimeoutError")
         return fake_result(1.0)
 
     monkeypatch.setattr(tb.TerminalBench21, "_run_trial", run_trial)
     out = b.run("", "")
     assert out["n"] == 3 and out["n_total"] == 3 and out["excluded"] == {}
-    assert out["value"] == pytest.approx(2 / 3)
+    assert out["value"] == pytest.approx((2 / 3 + 1) / 2)
     assert out["per_repeat"][0]["statuses"] == {"graded": 2, "AgentTimeoutError": 1}
-    assert out["per_task_resolved"] == {"a-task": 2, "b-task": 0, "c-task": 2}
+    assert out["per_task_resolved"] == {"a-task": 2, "b-task": 1, "c-task": 2}
+    assert out["pass_at_k"] == {
+        "k": 2,
+        "pass_at_1": pytest.approx(5 / 6),
+        "pass_at_k": 1.0,
+        "n": 3,
+        "how": "resolved in any of the k trials",
+    }
     assert out["tasks_digest"] is None  # dataset override: no pin to check
     assert len(calls) == 6
     assert json.loads((tmp_path / "out" / "repeat-1" / "a-task" / "sage2.json").read_text())["resolved"]
 
     calls.clear()
-    assert b.run("", "")["value"] == pytest.approx(2 / 3)
+    assert b.run("", "")["value"] == pytest.approx(5 / 6)
     assert calls == []  # everything resumed
 
 
