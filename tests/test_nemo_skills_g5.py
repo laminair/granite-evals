@@ -35,6 +35,11 @@ def ns():
     return pytest.importorskip("nemo_skills")
 
 
+@pytest.fixture
+def mecab():  # sacrebleu[ja], in the nemoskills extra only (the bird image has ns without it)
+    return pytest.importorskip("MeCab")
+
+
 @pytest.mark.parametrize("bid", IDS)
 def test_registered_as_in_suite(bid):
     cls = registry.get(bid)
@@ -373,7 +378,7 @@ def test_wmt_gold_server_matches_source_and_language():
     assert s.lookup(prompt.format("French", "Good morning.")) == ""
 
 
-def test_wmt_gold_bleu_end_to_end(ns, tmp_path, monkeypatch):
+def test_wmt_gold_bleu_end_to_end(ns, mecab, tmp_path, monkeypatch):
     """Reference translations through ns's real prompt -> generate -> BLEU (ja-mecab
     for Japanese, with ns's run-time pip install patched out)."""
     _local_data(monkeypatch, g5.WMT24pp, tmp_path / "data.jsonl", WMT_ROWS)
@@ -394,7 +399,7 @@ def test_wmt_gold_bleu_end_to_end(ns, tmp_path, monkeypatch):
     assert r["per_repeat"][0]["bleu"] == pytest.approx(1.0)
 
 
-def test_wmt_comet_step(ns, tmp_path, monkeypatch):
+def test_wmt_comet_step(ns, mecab, tmp_path, monkeypatch):
     _local_data(monkeypatch, g5.WMT24pp, tmp_path / "data.jsonl", WMT_ROWS)
     specs = []
 
