@@ -94,3 +94,16 @@ for z in punkt:da7ffbd1e6fd6cc5c2f6879c2d4da23c7691944c punkt_tab:5e5ff6137d5ee6
     unzip -q -o "$D/$name.zip" -d "$D"
 done
 chmod -R a+rX /usr/local/share/nltk_data
+
+# --- WMT24++ (wmt24pp): the COMET scorer's env -------------------------------------
+# ns scores translations with unbabel-comet (XCOMET-XXL), which it pip-installs
+# unpinned at run time. unbabel-comet needs transformers<5, numpy<2 and protobuf<5,
+# which the job venv's vLLM cannot share, so it gets its own env, hash-locked in
+# comet-requirements.txt (setuptools<81: comet imports pkg_resources). The model is
+# not baked in: it is gated (CC-BY-NC-SA-4.0); the run downloads it at a pinned
+# revision (sage2_evals.benchmarks.nemo_skills_g5.WMT24pp).
+uv venv --python /usr/local/bin/python3 /opt/comet
+uv pip install --python /opt/comet/bin/python --require-hashes -r /tmp/extras/comet-requirements.txt
+/opt/comet/bin/python -c "import comet, torch, transformers; print('comet env', torch.__version__, transformers.__version__)"
+uv pip freeze --python /opt/comet/bin/python > /opt/comet/sage2-freeze.txt
+chmod -R a+rX /opt/comet
