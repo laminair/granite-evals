@@ -54,6 +54,7 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `fortress-adversity` | Adversity resilience = 1 - ARS/100 (FORTRESS adversarial prompts, per-prompt Y/N rubrics, inspect_evals grading) | `judged` |
 | `fortress-benign` | Benign compliance = 1 - ORS/100 (FORTRESS benign prompts, judged refusal rate) | `judged` |
 | `strongreject` | Harmlessness = 1 - mean StrongREJECT score (313 forbidden prompts, no jailbreak, StrongREJECT rubric judge) | `judged` |
+| `mcpatlas` | pass rate (claim coverage >= 0.75). Default `subset=keyless`: the 30 of 500 tasks whose tools need no API key (`subset=all` needs 16 servers' keys); upstream's environment image + ported harness loop; claims judged by `aws/claude-sonnet-5`, not upstream's Gemini | `judged` |
 
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one).
