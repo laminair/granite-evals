@@ -334,6 +334,7 @@ def test_run_scores_with_ns_ruler_score(ns, tmp_path, monkeypatch):
     assert r["per_task"]["vt"] == {"accuracy": pytest.approx(0.5), "n": 4, "statuses": {"stop": 4}}
     assert not r["partial_task_set"] and r["ns_metric"]["score"] == "ruler_score"
     assert r["statuses"] == {"stop": 52}
+    assert r["pass_at_k"] == {"k": 1, "pass_at_1": pytest.approx(0.5), "pass_at_k": pytest.approx(0.5), "n": 52, "how": "ns metrics, ruler_score"}
     th = r["thinking"]
     assert (th["enabled"], th["budget"], th["data_format"], th["scoring_source"]) == (
         True,
@@ -347,6 +348,25 @@ def test_run_scores_with_ns_ruler_score(ns, tmp_path, monkeypatch):
     assert r["sample_length"] == 131072 and r["required_context"] == 131072 and r["context_cap"] == 131072
     assert r["failures"] == {"file": nsr.FAILURES_FILE, "total": 0, "by_reason": dict.fromkeys(nsr.FAILURE_REASONS, 0), "per_task": {}}
     assert len(r["departures"]) == 1 and r["generation_args"]["vt"][-1] == "++inference.tokens_to_generate=null"
+
+
+def test_run_pass_at_k(ns, tmp_path, monkeypatch):
+    """k = 2, each repeat right on the other half of the samples: pass@1 0.5, pass@2 1."""
+    d = _setup(tmp_path, tasks=["vt", "cwe"])
+    b = bench("ruler-64k", tmp_path / "out", limit=4, repeats=2, options={"answers": "gold", "tasks": "vt,cwe"})
+    monkeypatch.setattr(nsr.RulerBenchmark, "prepare_data", lambda self: (d, {"source": "fake"}))
+    gen = _fake_generate(2)
+
+    def shifted(self, setup_dir, task, input_file, base_url, served, k, cap):
+        gen(self, setup_dir, task, input_file, base_url, served, k, cap)
+        out = Path(input_file).parent / f"output-rs{k}.jsonl"
+        rows = [json.loads(line) for line in out.read_text().splitlines()]
+        out.write_text("".join(json.dumps({**r, "is_correct": (r["index"] + k) % 2 == 0}) + "\n" for r in rows))
+
+    monkeypatch.setattr(nsr.RulerBenchmark, "_generate_task", shifted)
+    r = b.run("", "")
+    assert r["value"] == pytest.approx(0.5) and r["ns_metric"]["aggregation"] == "pass@1[avg-of-2]"
+    assert r["pass_at_k"] == {"k": 2, "pass_at_1": pytest.approx(0.5), "pass_at_k": pytest.approx(1.0), "n": 8, "how": "ns metrics, ruler_score"}
 
 
 def test_run_cut_off_thinking_scores_zero(ns, tmp_path, monkeypatch):

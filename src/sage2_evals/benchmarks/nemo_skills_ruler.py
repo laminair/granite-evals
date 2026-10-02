@@ -100,6 +100,7 @@ from sage2_evals.benchmarks.nemo_skills import (
     _passthrough,
     _read_jsonl,
     _run_ns,
+    _scaled,
     _sha256,
     _status_line,
     _statuses,
@@ -108,7 +109,7 @@ from sage2_evals.benchmarks.nemo_skills import (
     _write_jsonl,
     log,
 )
-from sage2_evals.registry import register
+from sage2_evals.registry import pass_at_k_record, register
 from sage2_evals.results import GENERATION_FILE
 
 RULER_REPO = "https://github.com/NVIDIA/RULER"
@@ -562,9 +563,12 @@ class RulerBenchmark(NemoSkillsBenchmark):
         if set(tasks) == set(TASKS):  # ns's own group score
             from nemo_skills.dataset.ruler.ruler_score import compute_score
 
-            raw = compute_score(dict(per_task_metrics))[self.setup_name()][agg]["accuracy"]
-        else:
-            raw = sum(m[agg]["accuracy"] for m in per_task_metrics.values()) / len(tasks)
+            group = compute_score(dict(per_task_metrics))[self.setup_name()]
+        else:  # the same mean over the tasks run
+            aggs = [a for a, v in next(iter(per_task_metrics.values())).items() if isinstance(v, dict) and "accuracy" in v]
+            group = {a: {"accuracy": sum(m[a]["accuracy"] for m in per_task_metrics.values()) / len(tasks)} for a in aggs}
+        raw = group[agg]["accuracy"]
+        pk = group.get(f"pass@{self.repeats}", {}).get("accuracy")
         return {
             "value": raw * self.value_scale,
             "n": n,
@@ -573,6 +577,8 @@ class RulerBenchmark(NemoSkillsBenchmark):
             "harness": {"name": "nemo-skills", "repo": NS_REPO, "commit": NS_COMMIT},
             "ns_benchmark": f"ruler.{self.setup_name()}",
             "ns_metric": {"aggregation": agg, "key": "accuracy", "raw": raw, "scale": self.value_scale, "score": "ruler_score"},
+            # pass@k: per sample the best of its k (RULER's match is a fraction), then ruler_score's mean
+            "pass_at_k": pass_at_k_record(self.repeats, raw * self.value_scale, _scaled(pk, self.value_scale), n, "ns metrics, ruler_score"),
             "max_seq_length": self.max_seq_length,
             "sample_length": self.sample_length(),
             "served_max_model_len": max_model_len,
