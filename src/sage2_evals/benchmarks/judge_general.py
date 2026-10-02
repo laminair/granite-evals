@@ -26,7 +26,11 @@ GDPval (metric "Elo")
     Elo cannot be reproduced: ``value`` is an Elo-style score derived from the
     win rate against the expert (expert = ``elo_anchor``), flagged as an
     approximation in results.json (``details.elo_is_approximation``,
-    ``details.metric_note``) and in the log.
+    ``details.metric_note``) and in the log. It is relative (the expert sits
+    at the anchor), not on the scale of IBM's published Granite GDPval numbers.
+
+Both judge one response per task (``--repeats 1``); ``details.pass_at_k`` is
+the k = 1 record (GDPval: the win rate, no pass@k).
 
 Per-example work goes under ``<output_dir>/samples/`` (ProfBench) or
 ``<output_dir>/tasks/`` (GDPval); finished examples are skipped on restart.
@@ -60,7 +64,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, failure_policy, register
+from sage2_evals.registry import Benchmark, failure_policy, pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -329,6 +333,14 @@ class JudgedBenchmark(Benchmark):
             body.update(parsed)
         return body
 
+    def one_sample(self) -> None:
+        """Both judged benchmarks grade one response per task (``--repeats 1``):
+        their scores (ProfBench's weighted rubric Overall, GDPval's win rate)
+        are defined over one response, and k responses would cost k paid judge
+        passes for a number upstream does not report."""
+        if self.repeats != 1:
+            raise SystemExit(f"{self.id}: one response per task is judged; use --repeats 1")
+
     def sampling(self) -> dict[str, Any]:
         """Policy-model sampling overrides; unset ones fall back to the
         checkpoint's generation_config, which vLLM applies."""
@@ -483,6 +495,7 @@ class ProfBench(JudgedBenchmark):
     # -- entry point -------------------------------------------------------
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
+        self.one_sample()
         if self.judge_model == "human" and self.responses == "model":
             raise SystemExit("profbench: judge_model=human needs responses=o3|grok4|r1-0528 (human labels)")
         pb = profbench_modules()
@@ -714,6 +727,8 @@ class ProfBench(JudgedBenchmark):
             "version": self.opt("version", "lite") if self.responses == "model" else "provided-reports",
             "responses": self.responses,
             "scores": scores,
+            "pass_at_k": pass_at_k_record(1, scores["Overall"] / 100, scores["Overall"] / 100, scored,
+                                          "ProfBench Overall, one report per task"),  # fmt: skip
             "tasks": sorted({s["task"]["task_id"] for s in samples}),
             "statuses": _count(statuses),
             "criteria_judged": len(rows),
@@ -771,7 +786,8 @@ GDPVAL_METRIC_NOTE = (
     "(ties = 0.5, both presentation orders) of the model's deliverables against the expert "
     "deliverables of the GDPval gold set, judged by {judge}: elo = anchor + 400*log10(p/(1-p)) "
     "with the expert at anchor={anchor} and p smoothed as (score+0.5)/(n+1). Not comparable "
-    "with Artificial Analysis' published GDPval-AA numbers."
+    "with Artificial Analysis' published GDPval-AA numbers, nor on the scale of IBM's published "
+    "Granite GDPval numbers: it is relative to the expert, and only runs with the same judge compare."
 )
 
 # The deliverable guidance of the GDPval paper's agent prompt (arXiv 2510.04374, A.3),
@@ -1142,6 +1158,7 @@ class GDPval(JudgedBenchmark):
     # -- entry point -------------------------------------------------------
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
+        self.one_sample()
         source, revision = self.dataset_source()
         rows = data.load_split(source, revision=revision, split=self.split)
         if pattern := self.opt("tasks", ""):
@@ -1380,6 +1397,8 @@ class GDPval(JudgedBenchmark):
             "elo_anchor": anchor,
             "win_rate": score / n if n else 0.0,
             "wins_or_ties_rate": sum(r["score"] >= 0.5 for r in graded) / n if n else 0.0,
+            "pass_at_k": pass_at_k_record(1, score / n if n else 0.0, None, n,
+                                          "pass_at_1 is the win rate the Elo comes from; no pass@k for an Elo"),  # fmt: skip
             "deliverables": "expert" if self.expert_mode else "model",
             "statuses": _count(r["status"] for r in reports),
             **policy,

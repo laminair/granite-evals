@@ -284,6 +284,7 @@ def test_profbench_scores_with_the_upstream_scorer(tmp_path, monkeypatch, pb_env
     assert out["scores"]["Finance MBA"] == pytest.approx(66.7)
     assert out["scores"]["Physics PhD"] == 100.0
     assert out["value"] == pytest.approx((0.667 + 1.0) / 2, abs=1e-3)
+    assert out["pass_at_k"]["k"] == 1 and out["pass_at_k"]["pass_at_k"] == out["pass_at_k"]["pass_at_1"] == out["value"]
     assert out["judge_usage"]["calls"] == 12 and out["judge_usage"]["cached_tokens"] == 12 * 900
     # Upstream's mixed reasoning: high for Physics PhD or Style criteria.
     efforts = {(user_text(r).rsplit(": ", 1)[1][:13], r.get("reasoning_effort")) for r in judge._client.requests}
@@ -650,6 +651,9 @@ def test_gdpval_expert_vs_expert_is_even_and_flagged(tmp_path, monkeypatch, gdp_
         out = bench.run("", "none")
     assert out["value"] == pytest.approx(1000) and out["win_rate"] == 0.5 and out["n"] == 1
     assert out["elo_is_approximation"] is True and "APPROXIMATION" in out["metric_note"]
+    assert "IBM's published" in out["metric_note"]
+    assert out["pass_at_k"] == {"k": 1, "pass_at_1": 0.5, "pass_at_k": None, "n": 1,
+                                "how": "pass_at_1 is the win rate the Elo comes from; no pass@k for an Elo"}
     assert "APPROXIMATION" in caplog.text
     assert out["statuses"] == {"judged": 1, "excluded:no_expert_deliverable": 1,
                                "excluded:expert_deliverable_not_text": 1}
@@ -813,3 +817,9 @@ def test_gdpval_expert_gold_in_both_phases(tmp_path, monkeypatch, gdp_env):
     out = score.run("", "none")
     assert out["value"] == pytest.approx(1000) and out["n"] == 1 and len(judge._client.requests) == 2
     assert jg.GDPval(RunConfig(model="m", output_dir=tmp_path, options={"judge_model": "self"})).score_needs_server()
+
+
+@pytest.mark.parametrize("cls", [jg.ProfBench, jg.GDPval])
+def test_one_response_per_task(tmp_path, cls):
+    with pytest.raises(SystemExit, match="use --repeats 1"):
+        cls(RunConfig(model="m", output_dir=tmp_path, repeats=2)).run("", "m")
