@@ -43,10 +43,20 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
 | `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000); `details.elo_is_approximation` | `judged` |
 | `profbench` | overall (ProfBench report generation, lite, LLM-judged rubrics) | `judged` |
+| `multi-challenge` | pass@1 correct (Scale AI MultiChallenge, judged YES/NO per conversation, macro over 4 axes; `--repeats k`: pass@1[avg-of-k] and pass@k) | `judged` |
+| `fortress-adversity` | Adversity resilience = 1 - ARS/100 (FORTRESS adversarial prompts, per-prompt Y/N rubrics, inspect_evals grading) | `judged` |
+| `fortress-benign` | Benign compliance = 1 - ORS/100 (FORTRESS benign prompts, judged refusal rate) | `judged` |
+| `strongreject` | Harmlessness = 1 - mean StrongREJECT score (313 forbidden prompts, no jailbreak, StrongREJECT rubric judge) | `judged` |
 
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
 official GPT-4.1 judge, and without style control; results record both judges.
+
+`multi-challenge`, `fortress-*` and `strongreject` (`benchmarks/multi_challenge.py`,
+`benchmarks/safety.py`) use the same single judge instead of the official ones (GPT-4o;
+FORTRESS's o3 / Claude 3.7 / Gemini 2.5 panel and GPT-4o-mini; StrongREJECT's gpt-4o-mini);
+`details.deviations` lists every departure. `--option responses=refusal` (safety) or
+`responses=<shipped model>` (multi-challenge) grades reference responses with no served model.
 
 ## Layout
 
