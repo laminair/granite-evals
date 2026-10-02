@@ -35,6 +35,8 @@ nemoskills = [
     "wonderwords",
     "nltk",
     "tenacity",
+    # browsecomp: the fetch_url tool's PDF text.
+    "pypdf>=5.0",
 ]
 # IFBench through NeMo-Skills (the `nemoskills` extra) plus the requirements of
 # allenai/IFBench's run_eval.py, which ns's ifbench evaluator runs from
