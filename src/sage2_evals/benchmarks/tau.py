@@ -11,12 +11,22 @@ the harness's ``user_simulator`` on an OpenAI-compatible endpoint
 (``user_base_url`` / ``user_model`` / ``user_api_key_env``; ``user_model=self``
 uses the served model). Retail's NL-assertion checks call an LLM judge, which
 the harness hard-codes to gpt-4.1; here it is ``judge_*`` (same pattern).
+Both default to aws/claude-sonnet-5 on IBM's gateway, not the harness's
+gpt-4.1 (user simulator and NL judge), so scores are not directly comparable
+with published τ³ numbers.
 
 Metric, per domain: the harness's pass^1, i.e. the mean over tasks of the
 fraction of trials with reward 1 (``tau2.metrics.agent_metrics``). The
 ``tau3-bench`` aggregate is the unweighted mean of pass^1 over the three core
 domains (airline, retail, telecom), as the τ³ leaderboard computes "Overall";
 banking is scored separately (web/leaderboard/src/components/Leaderboard.jsx).
+
+Trials: 1 per task by default (pass^1 = pass@1 on one sample); the published
+protocol runs 4 (``--repeats 4``). With k trials the value stays pass^1 (the
+mean success over the k, i.e. pass@1[avg-of-k]); each domain adds the
+harness's pass^k (all of k trials succeed) and pass@k (at least one does,
+``pass_at_k``: 1 - C(n-c, k)/C(n, k)), and ``details.pass_at_k`` carries the
+same mean over domains of pass^1, pass@k and pass^k (``pass_hat_k``).
 
 Everything is written under ``<output_dir>/<domain>/trial-<k>/<task>.json``;
 finished simulations are skipped on restart.
@@ -55,7 +65,7 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar
 
 from sage2_evals import data, meter
-from sage2_evals.registry import Benchmark, failure_policy, register
+from sage2_evals.registry import Benchmark, failure_policy, pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +80,8 @@ CORE_DOMAINS = ("airline", "retail", "telecom")
 DEFAULT_SEED = 300
 DEFAULT_MAX_STEPS = 200
 DEFAULT_MAX_ERRORS = 10
-DEFAULT_TRIALS = 4
+DEFAULT_TRIALS = 1
+"""One trial per task (sage2's pass@1 default); the published protocol's 4 is ``--repeats 4``."""
 # User decision 2026-09-28: judges and user simulators on IBM's LiteLLM gateway.
 DEFAULT_GATEWAY = "https://ete-litellm.ai-models.vpc-int.res.ibm.com/v1"
 DEFAULT_SIM_MODEL = "aws/claude-sonnet-5"
@@ -288,6 +299,13 @@ def pass_hat_k(num_trials: int, successes: int, k: int) -> float:
     return comb(successes, k) / comb(num_trials, k) if num_trials >= k else float("nan")
 
 
+def pass_at_k(num_trials: int, successes: int, k: int) -> float:
+    """pass@k, the chance that k of the n trials hold a success: 1 - C(n-c, k) / C(n, k)."""
+    from math import comb
+
+    return 1 - comb(num_trials - successes, k) / comb(num_trials, k) if num_trials >= k else float("nan")
+
+
 def is_failed(record: dict) -> bool:
     """A simulation that never ran to a reward: an exception here, or the
     harness's INFRASTRUCTURE_ERROR (which tau2's run_with_retry makes of one,
@@ -299,7 +317,8 @@ def domain_summary(records: list[dict], trials: int) -> dict[str, Any]:
     """pass^k and average reward over the (task, trial) records of one domain,
     as tau2's get_metrics_df: failed simulations are left out
     (agent_metrics.py:138-145), and pass^k goes up to the fewest trials a task
-    has left (:158-165); a task with none left drops out."""
+    has left (:158-165); a task with none left drops out. pass@k
+    (``pass_at_<k>``, not in the harness) over the same tasks and k."""
     scored = [r for r in records if not is_failed(r)]
     by_task: dict[str, list[dict]] = {}
     for r in scored:
@@ -316,6 +335,8 @@ def domain_summary(records: list[dict], trials: int) -> dict[str, Any]:
     for k in range(1, max_k + 1):
         vals = [pass_hat_k(len(rs), sum(is_success(r["reward"]) for r in rs), k) for rs in by_task.values()]
         out[f"pass_hat_{k}"] = sum(vals) / len(vals)
+        anyk = [pass_at_k(len(rs), sum(is_success(r["reward"]) for r in rs), k) for rs in by_task.values()]
+        out[f"pass_at_{k}"] = sum(anyk) / len(anyk)
     out["per_trial_pass_1"] = [
         _mean([is_success(r["reward"]) for r in scored if r["trial"] == t]) for t in range(trials)
     ]
@@ -507,6 +528,16 @@ class Tau3(Benchmark):
             log.info("%s %s: pass^1=%.4f over %d tasks", self.id, d, summary["pass_hat_1"], summary["n_tasks"])
         policy = failure_policy(self.id, "simulations", sum(map(is_failed, records)), len(records), max_frac)
         value = _mean([per_domain[d]["pass_hat_1"] for d in tasks])
+        k = self.repeats
+
+        def over_domains(key: str) -> float | None:  # None if a domain lost a task's k-th trial
+            vals = [per_domain[d].get(key) for d in tasks]
+            return None if None in vals else _mean(vals)
+
+        pak = pass_at_k_record(k, value, over_domains(f"pass_at_{k}"),
+                               sum(per_domain[d]["n_tasks"] for d in tasks),
+                               "mean over domains; a task counts if any of its k trials has reward 1")  # fmt: skip
+        pak["pass_hat_k"] = over_domains(f"pass_hat_{k}")
         usage = {role: sum_usage([r["usage"][role] for r in records]) for role in ("agent", "user_sim", "judge")}
         n_sims = len(records)
         return {
@@ -517,6 +548,7 @@ class Tau3(Benchmark):
             "dataset_revision": revision,
             "harness": {"repo": TAU2_REPO, "commit": TAU2_COMMIT, "version": "1.0.1"},
             "aggregate": "mean of per-domain pass^1" if len(tasks) > 1 else "pass^1",
+            "pass_at_k": pak,
             "domains": per_domain,
             "trials": self.repeats,
             "seed": seed,

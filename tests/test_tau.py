@@ -43,7 +43,7 @@ def test_ids_metrics_and_pins():
         cls = registry.get(bid)
         assert cls.metric == metric
         assert cls.dataset == tau.TAU2_REPO and cls.dataset_revision == tau.TAU2_COMMIT
-        assert cls.extra == "tau" and cls.default_repeats == 4
+        assert cls.extra == "tau" and cls.default_repeats == 1
     assert registry.get("tau3-bench").domains == ("airline", "retail", "telecom")
     assert registry.get("tau3-banking-knowledge").domains == ("banking_knowledge",)
 
@@ -57,6 +57,7 @@ def test_trial_seeds_match_harness():
 def test_pass_hat_k_and_summary():
     assert tau.pass_hat_k(4, 2, 1) == 0.5
     assert tau.pass_hat_k(4, 2, 2) == pytest.approx(1 / 6)
+    assert tau.pass_at_k(4, 2, 1) == 0.5 and tau.pass_at_k(4, 2, 2) == pytest.approx(5 / 6) and tau.pass_at_k(4, 2, 3) == 1.0
     recs = [
         {"task_id": "a", "trial": 0, "reward": 1.0, "status": "success"},
         {"task_id": "a", "trial": 1, "reward": 0.0, "status": "fail"},
@@ -65,6 +66,7 @@ def test_pass_hat_k_and_summary():
     ]
     s = tau.domain_summary(recs, 2)
     assert s["pass_hat_1"] == 0.75 and s["pass_hat_2"] == 0.5
+    assert s["pass_at_1"] == 0.75 and s["pass_at_2"] == 1.0  # a and b each succeed in some trial
     assert s["per_trial_pass_1"] == [1.0, 0.5]
     assert s["statuses"] == {"fail": 1, "success": 3}
     assert (s["simulations_failed"], s["simulations_total"]) == (0, 4)
@@ -81,7 +83,7 @@ def test_failed_simulations_are_left_out_as_the_harness_does():
     ]
     s = tau.domain_summary(recs, 2)
     # a: 1/1, b: 1/2, c dropped (no trial ran); pass^2 undefined with a at one trial
-    assert s["pass_hat_1"] == 0.75 and "pass_hat_2" not in s
+    assert s["pass_hat_1"] == 0.75 and "pass_hat_2" not in s and "pass_at_2" not in s
     assert (s["n_tasks"], s["n_simulations"], s["simulations_failed"], s["simulations_total"]) == (2, 3, 3, 6)
     assert s["avg_reward"] == pytest.approx(2 / 3) and s["per_trial_pass_1"] == [1.0, 0.0]
 
@@ -162,6 +164,9 @@ def test_aggregate_is_mean_of_core_domains_and_limit(tmp_path, monkeypatch):
     out = b.run("http://vllm/v1", "served")
     # per domain pass^1: airline .5, retail 0, telecom .5 -> mean 1/3
     assert out["value"] == pytest.approx(1 / 3)
+    how = "mean over domains; a task counts if any of its k trials has reward 1"
+    pak = {"k": 2, "pass_at_1": pytest.approx(1 / 3), "pass_at_k": pytest.approx(1 / 3), "n": 6, "how": how}
+    assert out["pass_at_k"] == {**pak, "pass_hat_k": pytest.approx(1 / 3)}
     assert set(out["domains"]) == {"airline", "retail", "telecom"}
     assert out["n"] == 6 and len(seen) == 12
     assert {s[3] for s in seen} == set(tau.trial_seeds(300, 2))
