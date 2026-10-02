@@ -41,11 +41,11 @@ sandboxes. Results go to `$ROOT/runs/smoke-<jobid>/`, and `ROOT` defaults to
 | `IMAGE` | required | `us.icr.io/cil15-shared-registry/sage2-evals-<family>:<sha>` |
 | `BENCHMARK` | `swebench-verified` | |
 | `MODEL` | `none` | A hub id, an absolute path (mounted), or `none` for gold/oracle modes |
-| `LIMIT` / `REPEATS` / `WORKERS` | `2` / `1` / `2` | |
+| `LIMIT` / `REPEATS` / `WORKERS` | `2` / `1` / `2` | `REPEATS=k`: headline pass@1[avg-of-k], plus `details.pass_at_k` (README, Repeats). `bfcl-v4`, `profbench`, `gdpval` take only 1 |
 | `OPTIONS` | `""` | Space-separated `key=value` |
 | `PHASE` | `all` | `generate` or `score` for a split run (below) |
 | `RUN` | `$ROOT/runs/smoke-<jobid>` | Output dir; a score job takes its generate job's |
-| `EXTRA_ARGS` | `""` | More `sage2-evals run` flags, e.g. `--max-model-len 131072` |
+| `EXTRA_ARGS` | `""` | More `sage2-evals run` flags, e.g. `--max-model-len 262144` |
 | `JUDGE_ENV` | `~/.config/sage2/judge.env` | Mode-600 env file holding `SAGE2_JUDGE_API_KEY` / `SAGE2_USER_API_KEY`. `/dev/null` means no paid API |
 | `SPEND_LEDGER` / `SPEND_BUDGET_USD` | `$ROOT/spend/ledger.jsonl` / `50` | Every job shares one ledger and one cap |
 
@@ -76,7 +76,13 @@ behind the first. The paid judge keys are needed only by the score job (the tau 
 simulator runs in generate).
 
 For gold and oracle modes (`MODEL=none`), drop `-gpu`. `ruler-*` needs a tokenizer
-even in gold mode, so keep `MODEL`. It also needs `EXTRA_ARGS="--max-model-len 131072"`.
+even in gold mode, so keep `MODEL`; its gold cap is the sample length, so it needs no
+`--max-model-len`. A model run's context cap is the served `max_model_len` (the
+checkpoint's own unless `EXTRA_ARGS="--max-model-len N"`), which must hold a full sample:
+`ruler-256k`, `ruler-512k` and `ruler-1m` need `--max-model-len` 262144, 524288 and
+1048576 and a model that supports them (granite-4.2 is only verified to 128k). Thinking
+generates up to that cap, so a sample is long; one over the cap or cut off before an
+answer scores 0 and is logged to `$RUN/failures.jsonl`.
 
 A smoke passes when:
 

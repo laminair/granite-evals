@@ -1158,7 +1158,10 @@ def _arena_url(ref: str, path: str) -> str:
 class ArenaHardV2(NemoSkillsBenchmark):
     """Arena-Hard-Auto v2.0 (750: 500 hard prompts vs o3-mini-2025-01-31, 250 creative
     writing vs gemini-2.0-flash-001), judged pairwise both orders by ns's arena judge;
-    win rate from ns's bootstrapped Bradley-Terry fit (no style control)."""
+    win rate from ns's bootstrapped Bradley-Terry fit (no style control). The judge
+    is the family's ``judge_model`` (aws/claude-sonnet-5), not the official GPT-4.1
+    (``official_judge``, recorded in results.json), so scores are not directly
+    comparable with published Arena-Hard-V2 numbers."""
 
     id = "arena-hard-v2"
     metric = "win rate"

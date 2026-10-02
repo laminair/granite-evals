@@ -26,27 +26,66 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 
 | Implemented | Metric | Image extra |
 |---|---|---|
-| `swebench-verified` | pass@1[avg-of-3] resolve rate | `swebench` |
-| `aime25`, `hmmt-feb25`, `gpqa` (Diamond), `mmlu-pro`, `arena-hard-v2` | NeMo-Skills metrics (see suite) | `nemoskills` |
-| `livecodebench-v6`, `scicode`, `ruler-128k`, `ruler-64k` | NeMo-Skills metrics (see suite) | `nemoskills` |
-| `mmlu-prox-lite` (lm-eval, 11 Granite languages) | exact match (custom-extract) | `lmeval` |
-| `ifbench` (NeMo-Skills + IFBench verifiers) | pass@1[avg-of-2] loose accuracy | `ifbench` |
-| `swebench-pro` | pass@1[avg-of-3] resolve rate | `swebench` |
-| `swebench-multilingual` | pass@1[avg-of-3] resolve rate | `swebench` |
-| `terminal-bench-2.1` | pass@1[avg-of-8] resolve rate | `tbench` |
+| `swebench-verified` | pass@1 resolve rate | `swebench` |
+| `aime25`, `hmmt-feb25`, `gpqa` (Diamond) | pass@1 symbolic correct | `nemoskills` |
+| `mmlu-pro` | 5-shot CoT symbolic correct (ns's per-category examples; `--option shots=0` for 0-shot) | `nemoskills` |
+| `arena-hard-v2` | win rate (judge below) | `nemoskills` |
+| `livecodebench-v6`, `scicode` | pass@1 accuracy, pass@1 subtask accuracy | `nemoskills` |
+| `ruler-64k`, `ruler-128k`, `ruler-256k`, `ruler-512k`, `ruler-1m` | accuracy, thinking on up to the context cap (below) | `nemoskills` |
+| `mmlu-prox-lite` (lm-eval, 11 Granite languages) | exact match (custom-extract); deviations below | `lmeval` |
+| `ifbench` (NeMo-Skills + IFBench verifiers) | pass@1 prompt loose accuracy (headline) / strict; instruction loose / strict in `details.metrics` | `ifbench` |
+| `swebench-pro` | pass@1 resolve rate | `swebench` |
+| `swebench-multilingual` | pass@1 resolve rate | `swebench` |
+| `terminal-bench-2.1` | pass@1 resolve rate | `tbench` |
 | `tau3-bench` | pass@1 (avg of 3): mean pass^1 over airline, retail, telecom | `tau` |
-| `tau3-airline` | pass@1 (pass^1 over 4 trials) | `tau` |
-| `tau3-retail` | pass@1 (pass^1 over 4 trials) | `tau` |
-| `tau3-telecom` | pass@1 (pass^1 over 4 trials) | `tau` |
-| `tau3-banking-knowledge` | pass@1 (pass^1 over 4 trials, BM25 + grep retrieval) | `tau` |
+| `tau3-airline` | pass@1 (pass^1; 1 trial by default, the published protocol is `--repeats 4`) | `tau` |
+| `tau3-retail` | pass@1 (pass^1, as airline) | `tau` |
+| `tau3-telecom` | pass@1 (pass^1, as airline) | `tau` |
+| `tau3-banking-knowledge` | pass@1 (pass^1, as airline; BM25 + grep retrieval) | `tau` |
 | `bfcl-v4` | overall_accuracy accuracy (web search via IBM search MCP, not SerpAPI) | `bfcl` |
 | `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
-| `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000); `details.elo_is_approximation` | `judged` |
+| `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000). It is relative to the expert, not on the scale of IBM's published Granite GDPval numbers; `details.elo_is_approximation` | `judged` |
 | `profbench` | overall (ProfBench report generation, lite, LLM-judged rubrics) | `judged` |
 
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
-add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
-official GPT-4.1 judge, and without style control; results record both judges.
+add one).
+
+Judges and simulators. `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM,
+metered), not the official GPT-4.1 judge, and without style control; results record both
+judges. The τ³ user simulator and the retail NL-assertion judge are `aws/claude-sonnet-5`
+too, where tau2 upstream hard-codes gpt-4.1. Scores of these benchmarks are therefore not
+directly comparable with published numbers.
+
+`mmlu-prox-lite` samples with Granite 4.2's card settings for thinking (temperature 1.0,
+top_p 0.95, 8192 tokens), not NeMo Evaluator's lm-eval chat protocol (2048 tokens, near-greedy),
+which cuts off almost every thinking trace. "(IBM)" is read as the 11 Granite languages that
+MMLU-ProX has (the card's list minus Dutch); neither the card nor the blog defines the set,
+so it is unconfirmed. `--option languages=all` or a comma list changes it.
+
+`ruler-*` keeps thinking on (Granite's default) and lets each sample generate up to the
+context cap (the served `max_model_len`, or `--option context_cap=N`). A sample over the cap,
+with a context-length error, or cut off before an answer scores 0 and is logged to
+`<output_dir>/failures.jsonl`; `details.failures` counts them. `enable_thinking=false` runs
+ns's RULER exactly. `ruler-256k`, `ruler-512k` and `ruler-1m` need a server with that much
+context; granite-4.2 is only verified to 128k.
+
+## Repeats
+
+Every benchmark defaults to one sample per example (`--repeats 1`, pass@1). `--repeats k`
+keeps the headline at pass@1[avg-of-k] (the mean over the k samples) and adds
+`details.pass_at_k`, one shape for every benchmark:
+
+```json
+{"k": 4, "pass_at_1": 0.61, "pass_at_k": 0.78, "n": 30, "how": "..."}
+```
+
+`pass_at_k` is the fraction of examples with a correct sample among the k (for a graded
+score, the best of the k), and `how` says how the benchmark computed it. `tau3-*` keeps
+pass^1 as the headline and adds `pass_hat_k` (all k trials succeed); its per-domain
+details carry `pass_hat_<j>` and `pass_at_<j>`. `bfcl-v4`, `profbench` and `gdpval` take
+only `--repeats 1`: BFCL keeps one result per test id and its overall is a weighted mix of
+categories, and the judged benchmarks score one response per task. Their `pass_at_k` is
+the k = 1 record (GDPval's `pass_at_k` is null: an Elo has none).
 
 ## Layout
 
