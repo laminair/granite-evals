@@ -21,7 +21,7 @@ make publish-image EXTRA=<family>   # -> us.icr.io/cil15-shared-registry/sage2-e
 | `tau` | `tau3-*` |
 | `bfcl` | `bfcl-v4` |
 | `judged` | `gdpval`, `profbench` |
-| `nemoskills` | `aime25`, `hmmt-feb25`, `gpqa`, `mmlu-pro`, `arena-hard-v2`, `livecodebench-v6`, `scicode`, `ruler-*` |
+| `nemoskills` | `aime25`, `hmmt-feb25`, `gpqa`, `mmlu-pro`, `arena-hard-v2`, `livecodebench-v6`, `scicode`, `ruler-*`, `hle`, `omniscience`, `omniscience-hallucination`, `critpt`, `aa-lcr`, `wmt24pp` |
 | `lmeval` | `mmlu-prox-lite` |
 | `ifbench` | `ifbench` |
 

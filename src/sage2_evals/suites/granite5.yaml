@@ -20,7 +20,7 @@ benchmarks:
   - {id: aime25, group: reasoning, name: AIME25 (no tools), metric: "pass@1 symbolic correct"}
   - {id: hmmt-feb25, group: reasoning, name: HMMT Feb25 (no tools), metric: "pass@1 symbolic correct"}
   - {id: gpqa, group: reasoning, name: GPQA (no tools), metric: "pass@1 symbolic correct"}
-  - {id: omniscience, group: reasoning, name: Omniscience, metric: "pass@1[avg-of-10] judge_correct"}
+  - {id: omniscience, group: reasoning, name: Omniscience, metric: pass@1 judge_correct}
   - {id: livecodebench-v6, group: reasoning, name: LiveCodeBench v6, metric: "pass@1 accuracy"}
   - {id: scicode, group: reasoning, name: SciCode (subtask), metric: "pass@1 subtask accuracy"}
   - {id: hle, group: reasoning, name: HLE (no tools), metric: pass@1 judge_correct}
@@ -39,7 +39,7 @@ benchmarks:
   - {id: strongreject, group: safety, name: StrongREJECT, metric: Harmlessness}
   # Extras
   - {id: wmt24pp, group: extras, name: WMT24++, metric: "en→xx comet"}
-  - {id: aa-lcr, group: extras, name: AA-LCR, metric: "pass@1[avg-of-2] judge correct"}
+  - {id: aa-lcr, group: extras, name: AA-LCR, metric: pass@1 judge correct}
   - {id: ruler-1m, group: extras, name: RULER 1M completions, metric: accuracy}
   - {id: ruler-512k, group: extras, name: RULER 512k completions, metric: accuracy}
   - {id: ruler-256k, group: extras, name: RULER 256k completions, metric: accuracy}
@@ -47,4 +47,4 @@ benchmarks:
   - {id: ruler-64k, group: extras, name: RULER 64k completions, metric: accuracy}
   - {id: profbench, group: extras, name: ProfBench, metric: overall}
   - {id: pinchbench, group: extras, name: PinchBench, metric: reward}
-  - {id: omniscience-hallucination, group: extras, name: Omniscience (hallucination), metric: "pass@1[avg-of-10] judge_omni_hallucination"}
+  - {id: omniscience-hallucination, group: extras, name: Omniscience (hallucination), metric: pass@1 judge_omni_hallucination}

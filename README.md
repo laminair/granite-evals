@@ -32,6 +32,7 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `arena-hard-v2` | win rate (judge below) | `nemoskills` |
 | `livecodebench-v6`, `scicode` | pass@1 accuracy, pass@1 subtask accuracy | `nemoskills` |
 | `ruler-64k`, `ruler-128k`, `ruler-256k`, `ruler-512k`, `ruler-1m` | accuracy, thinking on up to the context cap (below) | `nemoskills` |
+| `hle`, `omniscience`, `omniscience-hallucination`, `aa-lcr` (LLM-judged), `critpt` (graded by AA's CritPt API), `wmt24pp` (XCOMET-XXL) | NeMo-Skills metrics, pass@1 | `nemoskills` |
 | `mmlu-prox-lite` (lm-eval, 11 Granite languages) | exact match (custom-extract); deviations below | `lmeval` |
 | `ifbench` (NeMo-Skills + IFBench verifiers) | pass@1 prompt loose accuracy (headline) / strict; instruction loose / strict in `details.metrics` | `ifbench` |
 | `swebench-pro` | pass@1 resolve rate | `swebench` |
@@ -68,6 +69,13 @@ with a context-length error, or cut off before an answer scores 0 and is logged 
 `<output_dir>/failures.jsonl`; `details.failures` counts them. `enable_thinking=false` runs
 ns's RULER exactly. `ruler-256k`, `ruler-512k` and `ruler-1m` need a server with that much
 context; granite-4.2 is only verified to 128k.
+
+`hle`, `omniscience`(`-hallucination`) and `aa-lcr` use ns's judge prompts with the same
+judge instead of the official ones (o3-mini, Gemini 2.5 Flash, Qwen3-235B / gpt-4.1), and
+leave an unparseable judgement out of the score (ns scores it wrong). `critpt` needs an
+Artificial Analysis API key (`ARTIFICIAL_ANALYSIS_API_KEY`) to score; `wmt24pp` scores
+with XCOMET-XXL on a GPU in the image's separate `/opt/comet` env. See
+`benchmarks/nemo_skills_g5.py`.
 
 ## Repeats
 
@@ -118,6 +126,7 @@ see the same examples. `results.json` records `smoke: true` for such runs.
 | Variable | Purpose |
 |---|---|
 | `HF_TOKEN` | read access to gated upstream datasets |
+| `ARTIFICIAL_ANALYSIS_API_KEY` | `critpt` scoring (Artificial Analysis's CritPt grading API) |
 | `SAGE2_SANDBOX` | `enroot` (default), `podman`, `docker` |
 | `SAGE2_ENROOT_CACHE` | shared squashfs cache for sandbox images |
 | `SAGE2_SPEND_LEDGER` | JSONL ledger of paid API calls, shared by concurrent jobs |
