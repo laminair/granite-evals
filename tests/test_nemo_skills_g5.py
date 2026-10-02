@@ -53,7 +53,7 @@ def test_pins(tmp_path):
         assert len(ref.partition("@")[2]) == 40
 
 
-def test_judge_defaults_are_the_sage2_judge(tmp_path):
+def test_judge_defaults_are_the_sage2_judge(ns, tmp_path):
     for bid in ("hle", "omniscience", "omniscience-hallucination", "aa-lcr"):
         b = bench(bid, tmp_path)
         ep = b.judge_endpoint("http://v/v1", "m")

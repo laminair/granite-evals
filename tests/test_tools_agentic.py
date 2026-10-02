@@ -55,7 +55,7 @@ def test_registered_as_in_suite(bid, metric, tools, tmp_path):
     assert bench(bid, tmp_path).tool_names() == tools
 
 
-def test_tool_args_precede_user_overrides(tmp_path):
+def test_tool_args_precede_user_overrides(ns, tmp_path):
     b = bench("hle-tools", tmp_path, options={"ns.max_tool_calls": "7", "tools": "python,fetch"})
     args = b.generation_args(sandbox_args=[])
     cfg = tmp_path / "tools" / "tools.json"
