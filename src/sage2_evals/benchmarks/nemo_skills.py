@@ -156,6 +156,9 @@ class NemoSkillsBenchmark(Benchmark):
     official_judge: ClassVar[str] = ""
 
     gold_answer_key: ClassVar[str] = "expected_answer"
+    gold_judged: ClassVar[bool] = False
+    """Whether ``answers=gold`` runs a judge benchmark too: the reference answers
+    through the real judge, a check of the judge (expect ~100%)."""
 
     # -- options -----------------------------------------------------------
 
@@ -286,7 +289,7 @@ class NemoSkillsBenchmark(Benchmark):
     # -- entry point -------------------------------------------------------
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
-        if self.gold and self.uses_judge():
+        if self.gold and self.uses_judge() and not self.gold_judged:
             raise SystemExit(f"{self.id}: judge-scored, no reference answers for answers=gold")
         prepared, provenance = self.prepare_data()
         rows = self.load_rows(prepared)
