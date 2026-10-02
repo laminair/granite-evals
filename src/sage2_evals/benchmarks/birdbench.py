@@ -36,6 +36,10 @@ answer: it is left out of the accuracy, counted in ``details.questions_failed``
 finds without a generation (``status: "error:not_generated"``). Above ``--option
 max_failed_frac`` (default 0.05; 0 = any failure) the run fails; below it the
 result is flagged ``incomplete``.
+
+Repeats: 1 by default (pass@1). With ``--repeats k`` the value is the mean of
+the k repeats' accuracy (pass@1[avg-of-k]) and ``details.pass_at_k`` adds
+pass@k, the fraction of questions matched in any of their scored repeats.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ from pathlib import Path
 from typing import Any
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, failure_policy, register
+from sage2_evals.registry import Benchmark, failure_policy, pass_at_k, register
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +127,7 @@ class BirdBench(Benchmark):
         prompt = _prompt() if model else None
 
         per_repeat = []
+        by_question: dict[Any, list[bool]] = {}  # scored repeats' matches, for pass@k
         for k in range(self.repeats):
             rdir = self.config.output_dir / f"repeat-{k}"
             rdir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +138,8 @@ class BirdBench(Benchmark):
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.workers) as pool:
                 recs = list(pool.map(one, questions))
             scored = [r for r in recs if not r["status"].startswith("error:")]
+            for r in scored:
+                by_question.setdefault(r["question_id"], []).append(bool(r.get("correct")))
             per_repeat.append(summarize(scored) | {"repeat": k, "failed": len(recs) - len(scored)})
             log.info("%s repeat %d: %d/%d correct, %d failed", self.id, k, per_repeat[-1]["correct"], len(scored),
                      len(recs) - len(scored))  # fmt: skip
@@ -159,6 +166,7 @@ class BirdBench(Benchmark):
             "timeout_s": timeout,
             "prompt_config": PROMPT_CONFIG,
             "sampling": {} if self.gold else self.sampling(),
+            "pass_at_k": pass_at_k(by_question.values(), self.repeats, "matched in any scored repeat"),
             "per_repeat": per_repeat,
         }
 

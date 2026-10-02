@@ -312,7 +312,11 @@ def test_generate_then_score_equals_all(tmp_path, dev, monkeypatch):
     # Re-running score reuses the scored files (a hand edit shows they are not re-executed).
     rec["correct"], rec["status"] = False, "wrong"
     (tmp_path / "out" / "repeat-0" / "1.json").write_text(json.dumps(rec))
-    assert birdbench.BirdBench(_cfg(tmp_path, dev, "score", repeats=2)).run("", "served")["value"] == pytest.approx(1 / 6)
+    out = birdbench.BirdBench(_cfg(tmp_path, dev, "score", repeats=2)).run("", "served")
+    assert out["value"] == pytest.approx(1 / 6)
+    # question 1 now matches in repeat 1 only: pass@1 halves, pass@2 still counts it
+    pak = {"k": 2, "pass_at_1": pytest.approx(1 / 6), "pass_at_k": pytest.approx(1 / 3), "n": 3}
+    assert out["pass_at_k"] == {**pak, "how": "matched in any scored repeat"}
 
     # --phase all on fresh generations gives the same records and score.
     sent.clear()
