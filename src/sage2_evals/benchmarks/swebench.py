@@ -1,7 +1,9 @@
 """SWE-bench family (Sage2: SWE Bench Verified / Pro / Multilingual).
 
-Metric: pass@1[avg-of-3] resolve rate, i.e. the resolve rate of each of
-``repeats`` independent agent runs, averaged.
+Metric: pass@1 resolve rate, the resolve rate of one agent run per instance
+(``repeats`` 1). With ``--repeats k`` the value is pass@1[avg-of-k], the resolve
+rate of each of the k independent runs, averaged, and ``details.pass_at_k``
+adds pass@k: the fraction of instances resolved in at least one of the k.
 
 Verified and Multilingual share one pipeline: their HF datasets carry each
 instance's image, eval_script and log_parser, from which swebench's harness
@@ -40,7 +42,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, pass_at_k, register
 from sage2_evals.sandbox import make_sandbox
 from sage2_evals.sandbox.nodelock import NodeLock, node_locks  # noqa: F401
 
@@ -135,8 +137,7 @@ def _install_maven_mirror(sb) -> None:
 
 
 class SWEBench(Benchmark):
-    metric = "pass@1[avg-of-3] resolve rate"
-    default_repeats = 3
+    metric = "pass@1 resolve rate"
     splittable = True
     extra = "swebench"
     harness_packages = ("mini-swe-agent", "swebench")
@@ -232,7 +233,13 @@ class SWEBench(Benchmark):
             # Generated: a patch in every repeat (failed ones are retried by rerunning generate).
             ok = [all(not rs[i]["status"].startswith("error:") for rs in all_reports) for i in range(len(instances))]
             return {"n": sum(ok), **out}
-        return {"value": sum(r["resolve_rate"] for r in per_repeat) / len(per_repeat), "n": len(instances), **out}
+        resolved = [[bool(rs[i]["resolved"]) for rs in all_reports] for i in range(len(instances))]
+        return {
+            "value": sum(r["resolve_rate"] for r in per_repeat) / len(per_repeat),
+            "n": len(instances),
+            "pass_at_k": pass_at_k(resolved, self.repeats, "resolved in any of the k runs"),
+            **out,
+        }
 
     def _repeat_details(self, reports: list[dict]) -> dict[str, Any]:
         """Extra per-repeat counts for results.json."""

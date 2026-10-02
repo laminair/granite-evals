@@ -267,6 +267,8 @@ def test_run_aggregates_repeats_and_resumes(tmp_path, monkeypatch):
     assert out["n"] == 1 and out["instances"] == ["org__repo-1"]
     assert [r["resolved"] for r in out["per_repeat"]] == [1, 0]
     assert out["value"] == 0.5
+    # pass@2: resolved in one of the two runs
+    assert out["pass_at_k"] == {"k": 2, "pass_at_1": 0.5, "pass_at_k": 1.0, "n": 1, "how": "resolved in any of the k runs"}
     bench.run("http://x/v1", "m")  # resume: nothing regenerated
     assert calls == [0, 1]
 
@@ -406,7 +408,7 @@ def test_multilingual_is_registered_like_verified(tmp_path):
 
     cls = registry.get("swebench-multilingual")
     assert cls is sb_mod.SWEBenchMultilingual
-    assert cls.metric == "pass@1[avg-of-3] resolve rate" and cls.default_repeats == 3
+    assert cls.metric == "pass@1 resolve rate" and cls.default_repeats == 1
     assert cls.dataset == "SWE-bench/SWE-bench_Multilingual" and len(cls.dataset_revision) == 40
     bench = cls(RunConfig(model="m", output_dir=tmp_path))
     assert bench.dataset_config() is None
@@ -537,7 +539,7 @@ def test_pro_is_registered_with_its_pins():
     from sage2_evals import registry
 
     cls = registry.get("swebench-pro")
-    assert cls.metric == "pass@1[avg-of-3] resolve rate" and cls.default_repeats == 3
+    assert cls.metric == "pass@1 resolve rate" and cls.default_repeats == 1
     assert cls.dataset == "ScaleAI/SWE-bench_Pro" and len(cls.dataset_revision) == 40
     assert len(sb_mod.PRO_COMMIT) == 40 and len(sb_mod.PRO_SHA256SUMS_SHA256) == 64
 
