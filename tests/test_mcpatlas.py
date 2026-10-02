@@ -324,7 +324,9 @@ def test_generate_then_score_and_resume(tmp_path, monkeypatch):
     out = score.run("http://policy/v1", "served")
     # t1: coverage 0.5 (< 0.75, >= 0.5) twice; t2: 1.0 twice
     assert out["value"] == 0.5 and out["pass_rate_0.50"] == 1.0 and out["mean_coverage"] == 0.75
-    assert out["pass@2"] == 0.5 and out["n"] == 4
+    assert out["pass_at_k"] == {"k": 2, "pass_at_1": 0.5, "pass_at_k": 0.5, "n": 2,
+                                "how": "pass@2: a repeat with coverage >= 0.75, tasks with all k scored"}
+    assert out["n"] == 4
     assert len(client.requests) == 6
     again, client = bench_for(tmp_path, rows, monkeypatch, world=offline, phase="score", repeats=2,
                               options={"env_url": ""})  # fmt: skip

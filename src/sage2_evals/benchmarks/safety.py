@@ -94,7 +94,7 @@ from sage2_evals.benchmarks.judge_general import (
     _write_json,
     total_usage,
 )
-from sage2_evals.registry import failure_policy, register
+from sage2_evals.registry import failure_policy, pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -450,6 +450,10 @@ class ResponseJudgedBenchmark(JudgedBenchmark):
             "judge_usage": total_usage(usage, len(rows)),
             "deviations": list(self.deviations),
         }
+        if "pass_at_k" not in out:  # a graded rate: no meaningful best-of-k
+            out["pass_at_k"] = pass_at_k_record(
+                self.repeats, out["value"], out["value"] if self.repeats == 1 else None, out["n"],
+                "value over all graded responses; no pass@k for a safety rate" if self.repeats > 1 else "")
         if self.metric_note:
             out["metric_note"] = self.metric_note
         log.info("%s: %.4f over %d items (%d responses graded, %d failed)", self.id, out["value"], out["n"],

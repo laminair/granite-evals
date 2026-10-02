@@ -53,7 +53,7 @@ from sage2_evals.benchmarks.safety import (
     pinned_file,
     read_rows,
 )
-from sage2_evals.registry import register
+from sage2_evals.registry import pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -263,15 +263,16 @@ class MultiChallenge(ResponseJudgedBenchmark):
             "judge_request": "upstream src/evaluator.py JUDGE_PROMPT as the only user message, temperature 0"
                              + (", response_format JudgeResponse{reasoning, verdict}" if structured else ""),
         }
+        passk = pass1
         if self.repeats > 1:
             passk, axesk = macro({q: float(any(a)) for q, a in attempts.items()}, axis_of)
             by_k: dict[int, dict[str, float]] = collections.defaultdict(dict)
             for item, k, r in rows:
                 by_k[k][str(item["id"])] = float(r["passed"])
             out.update({
-                "pass_at_k": passk,
-                "pass_at_k_k": self.repeats,
                 "pass_at_k_axis_scores": {a: round(v, 6) for a, v in axesk.items()},
                 "per_repeat": [round(macro(by_k[k], axis_of)[0], 6) for k in sorted(by_k)],
             })
+        out["pass_at_k"] = pass_at_k_record(self.repeats, pass1, passk, len(attempts),
+                                            "macro over the 4 axes; pass@k: any attempt passes")
         return out

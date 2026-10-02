@@ -112,7 +112,7 @@ from sage2_evals.benchmarks.judge_general import (
     _write_json,
     total_usage,
 )
-from sage2_evals.registry import failure_policy, register
+from sage2_evals.registry import failure_policy, pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -999,12 +999,15 @@ class MCPAtlas(JudgedBenchmark):
             "stops": _count(g["stop"] for g in gens if g),
             **info,
         }  # fmt: skip
-        if self.repeats > 1:
-            k = self.repeats
+        k = self.repeats
+        if k > 1:  # over the tasks with all k repeats scored
             full = {t: cs for t, cs in per_task.items() if len(cs) == k}
-            out[f"pass@{k}"] = (sum(pass_at_k(k, sum(c >= threshold for c in cs), k) for cs in full.values())
-                                / len(full)) if full else None  # fmt: skip
-            out[f"pass@{k}_tasks"] = len(full)
+            pk = (sum(pass_at_k(k, sum(c >= threshold for c in cs), k) for cs in full.values())
+                  / len(full)) if full else None  # fmt: skip
+            out["pass_at_k"] = pass_at_k_record(k, out["value"], pk, len(full),
+                                                f"pass@{k}: a repeat with coverage >= {threshold}, tasks with all k scored")
+        else:
+            out["pass_at_k"] = pass_at_k_record(1, out["value"], out["value"], len(scores))
         replays = [g["replay"] for g in gens if g and g.get("replay")]
         if replays:
             out["replay"] = {"tool_calls": sum(x["calls"] for x in replays),

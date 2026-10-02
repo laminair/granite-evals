@@ -201,7 +201,7 @@ def test_gold_end_to_end_through_the_judge(ns, tmp_path, monkeypatch, bid, cls, 
         r = _gold(bid, tmp_path / "out", repeats=2, judge_url=judge.base_url).run("", "")
     assert (r["value"], r["n"]) == (1.0, len(rows))
     assert r["ns_metric"]["aggregation"] == "pass@1[avg-of-2]"
-    assert r["pass_at_k"] == {"k": 2, "aggregation": "pass@2", "judge_correct": 1.0}
+    assert r["pass_at_k"] == {"k": 2, "pass_at_1": 1.0, "pass_at_k": 1.0, "n": len(rows), "how": "ns metrics"}
     assert [p["judge_correct"] for p in r["per_repeat"]] == [1.0, 1.0]
     assert (r["judge_invalid"], r["judge_total"], r["incomplete"]) == (0, 2 * len(rows), False)
     assert r["judge_model"] == nsb.JUDGE_MODEL and r["judge_usage"]["requests"] == 2 * len(rows)
@@ -215,7 +215,7 @@ def test_hle_judge_scores_a_wrong_answer_wrong(ns, tmp_path, monkeypatch):
     monkeypatch.setattr(g5.HLE, "gold_generation", lambda self, row: "Answer: 1\nConfidence: 50%")
     with _Judge(hle_verdict) as judge:
         r = _gold("hle", tmp_path / "out", judge_url=judge.base_url).run("", "")
-    assert r["value"] == 0.0 and "pass_at_k" not in r
+    assert r["value"] == 0.0 and r["pass_at_k"]["k"] == 1 and r["pass_at_k"]["pass_at_k"] == 0.0
 
 
 def omni_verdict(prompt):

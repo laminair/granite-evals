@@ -90,7 +90,6 @@ from sage2_evals.benchmarks.nemo_skills import (
     NemoSkillsBenchmark,
     _GoldServer,
     _read_jsonl,
-    _scaled,
     _write_jsonl,
     log,
 )
@@ -139,18 +138,6 @@ class _G5(NemoSkillsBenchmark):
         if output.exists():
             _check_no_think(self.id, output, self.think_fields)
         super()._evaluate(output, args, what)
-
-    def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
-        result = super().run(base_url, served_model_name)
-        if result.get("value") is not None and self.repeats > 1:
-            m = result["ns_metrics"].get("_all_", {}).get(f"pass@{self.repeats}")
-            if isinstance(m, dict) and self.ns_metric in m:
-                result["pass_at_k"] = {
-                    "k": self.repeats,
-                    "aggregation": f"pass@{self.repeats}",
-                    self.ns_metric: _scaled(m[self.ns_metric], self.value_scale),
-                }
-        return result
 
 
 def _check_no_think(benchmark_id: str, path: Path, fields: tuple[str, ...]) -> None:

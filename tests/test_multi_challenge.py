@@ -83,7 +83,8 @@ def test_conversation_is_sent_and_judged(tmp_path, monkeypatch, env):
     judge = fake_judge(structured_judge)
     out = make(tmp_path, monkeypatch, judge).run("http://p/v1", "s")
     assert out["value"] == 0.75 and out["axis_scores"] == {"INFERENCE_MEMORY": 0.5, "SELF_COHERENCE": 1.0}
-    assert out["metric_name"] == "pass@1" and "pass_at_k" not in out and out["n"] == 3
+    assert out["metric_name"] == "pass@1" and out["n"] == 3
+    assert (out["pass_at_k"]["k"], out["pass_at_k"]["pass_at_1"], out["pass_at_k"]["pass_at_k"]) == (1, 0.75, 0.75)
     first = sorted(env.policy, key=lambda r: r["messages"][-1]["content"])[0]
     assert [m["role"] for m in first["messages"]] == ["user", "assistant", "user"]
     assert set(first) == {"model", "messages", "seed"}
@@ -103,7 +104,7 @@ def test_repeats_give_avg_of_k_and_pass_at_k(tmp_path, monkeypatch, env):
     env.answer = answer
     out = make(tmp_path, monkeypatch, fake_judge(structured_judge), repeats=2).run("http://p/v1", "s")
     # avg-of-2: IM = (0.5 + 0) / 2 = 0.25, SC = 1 -> 0.625; pass@2: IM 0.5, SC 1 -> 0.75
-    assert out["value"] == 0.625 and out["pass_at_k"] == 0.75 and out["pass_at_k_k"] == 2
+    assert out["value"] == 0.625 and out["pass_at_k"]["pass_at_k"] == 0.75 and out["pass_at_k"]["k"] == 2
     assert out["metric_name"] == "pass@1[avg-of-2]" and out["per_repeat"] == [0.75, 0.5]
 
 
