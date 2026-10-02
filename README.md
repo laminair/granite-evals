@@ -29,6 +29,7 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `swebench-verified` | pass@1[avg-of-3] resolve rate | `swebench` |
 | `aime25`, `hmmt-feb25`, `gpqa` (Diamond), `mmlu-pro`, `arena-hard-v2` | NeMo-Skills metrics (see suite) | `nemoskills` |
 | `livecodebench-v6`, `scicode`, `ruler-128k`, `ruler-64k` | NeMo-Skills metrics (see suite) | `nemoskills` |
+| `hle`, `omniscience`, `omniscience-hallucination`, `aa-lcr` (LLM-judged), `critpt` (graded by AA's CritPt API), `wmt24pp` (XCOMET-XXL) | NeMo-Skills metrics, pass@1 (see suite) | `nemoskills` |
 | `mmlu-prox-lite` (lm-eval, 11 Granite languages) | exact match (custom-extract) | `lmeval` |
 | `ifbench` (NeMo-Skills + IFBench verifiers) | pass@1[avg-of-2] loose accuracy | `ifbench` |
 | `swebench-pro` | pass@1[avg-of-3] resolve rate | `swebench` |
@@ -47,6 +48,12 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
 official GPT-4.1 judge, and without style control; results record both judges.
+`hle`, `omniscience`(`-hallucination`) and `aa-lcr` use ns's judge prompts with the same
+judge instead of the official ones (o3-mini, Gemini 2.5 Flash, Qwen3-235B / gpt-4.1), and
+leave an unparseable judgement out of the score (ns scores it wrong). `critpt` needs an
+Artificial Analysis API key (`ARTIFICIAL_ANALYSIS_API_KEY`) to score; `wmt24pp` scores
+with XCOMET-XXL on a GPU in the image's separate `/opt/comet` env. See
+`benchmarks/nemo_skills_g5.py`.
 
 ## Layout
 
@@ -79,6 +86,7 @@ see the same examples. `results.json` records `smoke: true` for such runs.
 | Variable | Purpose |
 |---|---|
 | `HF_TOKEN` | read access to gated upstream datasets |
+| `ARTIFICIAL_ANALYSIS_API_KEY` | `critpt` scoring (Artificial Analysis's CritPt grading API) |
 | `SAGE2_SANDBOX` | `enroot` (default), `podman`, `docker` |
 | `SAGE2_ENROOT_CACHE` | shared squashfs cache for sandbox images |
 | `SAGE2_SPEND_LEDGER` | JSONL ledger of paid API calls, shared by concurrent jobs |
