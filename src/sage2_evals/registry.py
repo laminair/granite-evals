@@ -18,6 +18,7 @@ from __future__ import annotations
 import abc
 import importlib
 import pkgutil
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -44,7 +45,9 @@ class RunConfig:
     limit: int | None = None
     """Evaluate only the first N examples (smoke mode). None = full dataset."""
     repeats: int | None = None
-    """Independent repetitions for pass@1[avg-of-k]. None = benchmark default."""
+    """Independent samples per example (k). None = the benchmark default, 1 for
+    every benchmark (pass@1 on one sample). With k > 1 the headline is
+    pass@1[avg-of-k] and ``details.pass_at_k`` adds pass@k (``pass_at_k``)."""
     workers: int = 8
     seed: int = 0
     dataset: str = ""
@@ -149,6 +152,31 @@ def failure_policy(
             "rerun to retry the failed ones"
         )
     return {key: failed, f"{what}_total": total, "incomplete": failed > 0}
+
+
+def pass_at_k_record(k: int, pass_at_1: float | None, pass_at_k: float | None, n: int, how: str = "") -> dict[str, Any]:
+    """results.json ``details.pass_at_k``, one shape for every benchmark:
+    ``pass_at_1`` is the mean over examples of the mean over its k samples
+    (pass@1[avg-of-k], the headline unless the benchmark says otherwise),
+    ``pass_at_k`` the fraction of examples with a correct sample among the k
+    (any-correct; for a graded score, the best of the k). ``pass_at_k`` is None
+    where it has no meaning, and ``how`` says why or how it was computed."""
+    rec: dict[str, Any] = {"k": k, "pass_at_1": pass_at_1, "pass_at_k": pass_at_k, "n": n}
+    if how:
+        rec["how"] = how
+    return rec
+
+
+def pass_at_k(scores: Iterable[Sequence[float]], k: int, how: str = "") -> dict[str, Any]:
+    """``pass_at_k_record`` from each example's scores over its samples (1 =
+    correct; bool or a fraction). An example with no sample counts 0 in both."""
+    rows = [[float(x) for x in s] for s in scores]
+    n = len(rows)
+    if not n:
+        return pass_at_k_record(k, None, None, 0, how)
+    p1 = sum(sum(s) / len(s) for s in rows if s) / n
+    pk = sum(max(s) for s in rows if s) / n
+    return pass_at_k_record(k, p1, pk, n, how)
 
 
 def register(cls: type[Benchmark]) -> type[Benchmark]:
