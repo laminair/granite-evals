@@ -32,11 +32,11 @@ benchmarks:
   - {id: mmlu-prox-lite, group: chat-if, name: MMLU-ProX lite (IBM), metric: exact match (custom-extract)}
   - {id: arena-hard-v2, group: chat-if, name: Arena-Hard-V2, metric: win rate}
   - {id: ifbench, group: chat-if, name: IFBench (prompt), metric: "pass@1 prompt loose / strict accuracy"}
-  - {id: multi-challenge, group: chat-if, name: Scale AI Multi-Challenge, metric: "pass@1[avg-of-8] correct"}
+  - {id: multi-challenge, group: chat-if, name: Scale AI Multi-Challenge, metric: "pass@1 correct (--repeats 8: pass@1[avg-of-8])"}
   # Safety
-  - {id: fortress-adversity, group: safety, name: Fortress, metric: Adversity resilience}
-  - {id: fortress-benign, group: safety, name: Fortress, metric: Benign compliance}
-  - {id: strongreject, group: safety, name: StrongREJECT, metric: Harmlessness}
+  - {id: fortress-adversity, group: safety, name: Fortress, metric: "Adversity resilience (1 - ARS/100)"}
+  - {id: fortress-benign, group: safety, name: Fortress, metric: "Benign compliance (1 - ORS/100)"}
+  - {id: strongreject, group: safety, name: StrongREJECT, metric: "Harmlessness (1 - StrongREJECT score)"}
   # Extras
   - {id: wmt24pp, group: extras, name: WMT24++, metric: "en→xx comet"}
   - {id: aa-lcr, group: extras, name: AA-LCR, metric: pass@1 judge correct}

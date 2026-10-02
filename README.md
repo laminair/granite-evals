@@ -50,6 +50,10 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `hle-tools` (HLE text-only, python + web search tools) | pass@1 judge_correct | `nemoskills` |
 | `critpt-tools` (python tool; graded by Artificial Analysis's CritPt API) | Challenge Accuracy | `nemoskills` |
 | `browsecomp` (web search + page fetch tools) | mean reward (simple-evals grader) | `nemoskills` |
+| `multi-challenge` | pass@1 correct (Scale AI MultiChallenge, judged YES/NO per conversation, macro over 4 axes; `--repeats k`: pass@1[avg-of-k] and pass@k) | `judged` |
+| `fortress-adversity` | Adversity resilience = 1 - ARS/100 (FORTRESS adversarial prompts, per-prompt Y/N rubrics, inspect_evals grading) | `judged` |
+| `fortress-benign` | Benign compliance = 1 - ORS/100 (FORTRESS benign prompts, judged refusal rate) | `judged` |
+| `strongreject` | Harmlessness = 1 - mean StrongREJECT score (313 forbidden prompts, no jailbreak, StrongREJECT rubric judge) | `judged` |
 
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one).
@@ -105,6 +109,12 @@ fetch. URLs that would leak the benchmark's answers are blocked. `hle-tools` and
 `browsecomp` are judged by `aws/claude-sonnet-5` instead of o3-mini and GPT-4.1, using the
 official prompts. `critpt-tools` needs an approved `ARTIFICIAL_ANALYSIS_API_KEY`, and each
 grading response is cached because the API allows 10 requests a day.
+
+`multi-challenge`, `fortress-*` and `strongreject` (`benchmarks/multi_challenge.py`,
+`benchmarks/safety.py`) use the same single judge instead of the official ones (GPT-4o;
+FORTRESS's o3 / Claude 3.7 / Gemini 2.5 panel and GPT-4o-mini; StrongREJECT's gpt-4o-mini);
+`details.deviations` lists every departure. `--option responses=refusal` (safety) or
+`responses=<shipped model>` (multi-challenge) grades reference responses with no served model.
 
 ## Layout
 
