@@ -75,6 +75,8 @@ Knobs (all optional; ``None`` / empty means "what the ns dataset module says"):
 - ``gold_answer_key`` / ``gold_generation(row)``: the oracle answer for
   ``--option answers=gold``, which serves reference answers from a local fake
   endpoint through the *same* ns generate + evaluate + metrics path (~100%).
+  ``gold_judged``: a judge benchmark whose gold answers go through the real
+  judge (default: no gold mode for judge benchmarks).
 - ``prepare_rows(rows)``: filter/reorder prepared rows before ``--limit``.
 
 Options (``--option k=v``): ``temperature``, ``top_p``, ``top_k``,
@@ -156,6 +158,7 @@ class NemoSkillsBenchmark(Benchmark):
     official_judge: ClassVar[str] = ""
 
     gold_answer_key: ClassVar[str] = "expected_answer"
+    gold_judged: ClassVar[bool] = False
 
     # -- options -----------------------------------------------------------
 
@@ -286,7 +289,7 @@ class NemoSkillsBenchmark(Benchmark):
     # -- entry point -------------------------------------------------------
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
-        if self.gold and self.uses_judge():
+        if self.gold and self.uses_judge() and not self.gold_judged:
             raise SystemExit(f"{self.id}: judge-scored, no reference answers for answers=gold")
         prepared, provenance = self.prepare_data()
         rows = self.load_rows(prepared)
