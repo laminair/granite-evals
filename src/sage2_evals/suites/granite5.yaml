@@ -2,10 +2,10 @@
 name: granite5
 benchmarks:
   # Agentic (Coding)
-  - {id: swebench-verified, group: agentic-coding, name: SWE Bench Verified, metric: "pass@1[avg-of-3] resolve rate"}
-  - {id: swebench-pro, group: agentic-coding, name: SWE Bench Pro, metric: "pass@1[avg-of-3] resolve rate"}
-  - {id: swebench-multilingual, group: agentic-coding, name: SWE Bench Multilingual, metric: "pass@1[avg-of-3] resolve rate"}
-  - {id: terminal-bench-2.1, group: agentic-coding, name: Terminal-Bench 2.1, metric: "pass@1[avg-of-8] resolve rate"}
+  - {id: swebench-verified, group: agentic-coding, name: SWE Bench Verified, metric: "pass@1 resolve rate"}
+  - {id: swebench-pro, group: agentic-coding, name: SWE Bench Pro, metric: "pass@1 resolve rate"}
+  - {id: swebench-multilingual, group: agentic-coding, name: SWE Bench Multilingual, metric: "pass@1 resolve rate"}
+  - {id: terminal-bench-2.1, group: agentic-coding, name: Terminal-Bench 2.1, metric: "pass@1 resolve rate"}
   # Agentic (General)
   - {id: tau3-airline, group: agentic-general, name: "τ³-bench Airline", metric: pass@1}
   - {id: tau3-banking-knowledge, group: agentic-general, name: "τ³-bench Banking Knowledge (BM25 + grep)", metric: pass@1}
@@ -17,21 +17,21 @@ benchmarks:
   - {id: mcpatlas, group: agentic-general, name: MCPAtlas, metric: pass rate}
   - {id: toolathlon, group: agentic-general, name: toolathlon, metric: success rate}
   # Reasoning
-  - {id: aime25, group: reasoning, name: AIME25 (no tools), metric: "pass@1[avg-of-4] symbolic correct"}
-  - {id: hmmt-feb25, group: reasoning, name: HMMT Feb25 (no tools), metric: "pass@1[avg-of-4] symbolic correct"}
-  - {id: gpqa, group: reasoning, name: GPQA (no tools), metric: "pass@1[avg-of-2] symbolic correct"}
+  - {id: aime25, group: reasoning, name: AIME25 (no tools), metric: "pass@1 symbolic correct"}
+  - {id: hmmt-feb25, group: reasoning, name: HMMT Feb25 (no tools), metric: "pass@1 symbolic correct"}
+  - {id: gpqa, group: reasoning, name: GPQA (no tools), metric: "pass@1 symbolic correct"}
   - {id: omniscience, group: reasoning, name: Omniscience, metric: "pass@1[avg-of-10] judge_correct"}
-  - {id: livecodebench-v6, group: reasoning, name: LiveCodeBench v6, metric: "pass@1[avg-of-2] accuracy"}
-  - {id: scicode, group: reasoning, name: SciCode (subtask), metric: "pass@1[avg-of-2] subtask accuracy"}
+  - {id: livecodebench-v6, group: reasoning, name: LiveCodeBench v6, metric: "pass@1 accuracy"}
+  - {id: scicode, group: reasoning, name: SciCode (subtask), metric: "pass@1 subtask accuracy"}
   - {id: hle, group: reasoning, name: HLE (no tools), metric: pass@1 judge_correct}
   - {id: hle-tools, group: reasoning, name: HLE (with tools), metric: pass@1 judge_correct}
   - {id: critpt, group: reasoning, name: CritPt (no tools), metric: Challenge Accuracy}
   - {id: critpt-tools, group: reasoning, name: CritPt (with tools), metric: Challenge Accuracy}
   # Chat & Instruction Following
-  - {id: mmlu-pro, group: chat-if, name: MMLU-Pro, metric: symbolic correct}
+  - {id: mmlu-pro, group: chat-if, name: MMLU-Pro, metric: "5-shot CoT symbolic correct"}
   - {id: mmlu-prox-lite, group: chat-if, name: MMLU-ProX lite (IBM), metric: exact match (custom-extract)}
   - {id: arena-hard-v2, group: chat-if, name: Arena-Hard-V2, metric: win rate}
-  - {id: ifbench, group: chat-if, name: IFBench (prompt), metric: "pass@1[avg-of-2] loose accuracy"}
+  - {id: ifbench, group: chat-if, name: IFBench (prompt), metric: "pass@1 prompt loose / strict accuracy"}
   - {id: multi-challenge, group: chat-if, name: Scale AI Multi-Challenge, metric: "pass@1[avg-of-8] correct"}
   # Safety
   - {id: fortress-adversity, group: safety, name: Fortress, metric: Adversity resilience}
