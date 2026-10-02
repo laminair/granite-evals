@@ -1,4 +1,4 @@
-"""RULER through NeMo-Skills (Sage2: RULER 128k / 64k completions).
+"""RULER through NeMo-Skills (Sage2: RULER 64k / 128k / 256k / 512k / 1M completions).
 
 ns's RULER setup, run locally: ``nemo_skills/dataset/ruler/prepare.py`` (pinned ns)
 generates the 13 synthetic tasks with NVIDIA/RULER's generators (pinned commit,
@@ -24,24 +24,39 @@ default for Granite: ``enable_thinking`` unset or true):
 
 * the data are ns's own ``--data_format chat``: no answer-prefix prefill, the chat
   endpoint, and the chat template's thinking;
-* each task generates ``thinking_budget`` (default ``DEFAULT_THINKING_BUDGET``)
-  plus its ns/RULER answer budget;
+* each sample generates up to the context cap: ``max_tokens = cap - prompt
+  tokens``, counted per sample with the model's tokenizer and chat template. The
+  cap is the served ``max_model_len`` (``--option context_cap=N`` lowers it);
+  ``--option max_tokens=N`` bounds the per-sample budget further;
 * only the post-thinking content is scored. ns scores ``generation``, which is the
   message content after vLLM's reasoning parser; the thinking goes to
   ``reasoning_content``. A generation cut off inside its thinking has no content
   and scores 0, so a needle quoted in the thinking cannot match. A ``<think>`` or
   ``</think>`` in any ``generation`` (no reasoning parser) fails the run.
 
-RULER's samples fill ``max_seq_length`` minus the answer budget, so thinking needs
-``max_seq_length + thinking_budget`` of served context. When the server has less
-(granite-4.2-3b has 131072 positions and no rope scaling, so it cannot do this at
-128k), the run stops before building data and names the options. One is
-``--option sample_length=N``, which builds shorter samples. That is a second
-departure: the headline is then RULER at N tokens, not at ``max_seq_length``.
-``enable_thinking=false`` runs ns's RULER exactly (text endpoint, answer prefix,
-task budgets). results.json records ``thinking`` (mode, budget, per-task
-``tokens_to_generate``, data format, scoring source, cut-off counts and token
-percentiles) and ``departures``.
+RULER sizes a sample to ``max_seq_length`` minus the task's answer budget, so at
+``max_model_len == max_seq_length`` (granite-4.2 at 128k) thinking gets only the
+slack RULER leaves; a longer served context leaves more. A sample scores 0, and
+does not stop the run, when its prompt plus the answer budget exceeds the cap
+(``prompt_exceeds_cap``: no request is sent), when the server answers with a
+context-length error (``context_length_error``), or when generation reaches the
+cap before any answer (``length_before_answer``). Each is appended, flushed, as
+one json line to ``<output_dir>/failures.jsonl`` as it happens (task, repeat,
+sample index, reason, prompt and generated tokens); results.json ``failures``
+counts them by reason and task from the output rows (the log is append-only: a
+sample retried after a crash can appear twice there, not in the counts).
+
+``--option sample_length=N`` builds shorter samples: a departure (the headline is
+RULER at N tokens, not at ``max_seq_length``). ``enable_thinking=false`` runs ns's
+RULER exactly (text endpoint, answer prefix, task budgets; a sample whose prompt
+plus budget exceeds the cap is still recorded as ``prompt_exceeds_cap``).
+results.json records ``context_cap``, ``thinking`` (mode, budget rule, per-task
+answer budgets, prompt and max-token percentiles, data format, scoring source,
+cut-off counts), ``failures`` and ``departures``.
+
+Lengths: ruler-64k and ruler-128k (Granite 4.2); ruler-256k, ruler-512k and
+ruler-1m (Granite 5) need a server with that much context. granite-4.2 is only
+verified to 128k.
 
 Phases: ``--phase generate`` checks the served context, builds the data (the
 tokenizer) and generates each task with ns's evaluation off; ``--phase score``
@@ -49,12 +64,13 @@ runs ns's RULER match, the think-tag check and the metrics on those files, on
 the data generate built (no tokenizer, no model).
 
 Options: ``tokenizer`` (default: ``--model``), ``enable_thinking``,
-``thinking_budget``, ``sample_length`` (default ``max_seq_length``), ``tasks``
+``context_cap``, ``sample_length`` (default ``max_seq_length``), ``tasks``
 (comma-separated subset, for debugging; the headline then averages only those),
 ``ruler_dir``, the sampling options and ``ns.<key>=<value>`` of the NeMo-Skills
-family (``max_tokens`` replaces every task's ``tokens_to_generate``), and
-``answers=gold`` (serves each sample's expected outputs; needs a tokenizer but no
-GPU).
+family (``max_tokens`` replaces every task's ``tokens_to_generate`` with thinking
+off, and bounds ``cap - prompt tokens`` with thinking on), and ``answers=gold``
+(serves each sample's expected outputs; needs a tokenizer but no GPU; the cap is
+then ``context_cap`` or ``sample_length``).
 """
 
 from __future__ import annotations
@@ -75,7 +91,6 @@ import httpx
 
 from sage2_evals import data
 from sage2_evals.benchmarks.nemo_skills import (
-    GENERATE_MODULE,
     NS_COMMIT,
     NS_REPO,
     NemoSkillsBenchmark,
@@ -134,13 +149,13 @@ TOKENS_TO_GENERATE = {"niah": 128, "vt": 30, "cwe": 120, "fwe": 50, "qa": 32}
 """ns/RULER's per-task answer budget (ns prepare.py). RULER sizes each sample to
 leave room for it within ``max_seq_length``."""
 
-DEFAULT_THINKING_BUDGET = 32768
-"""Thinking tokens added to each task's answer budget when thinking is on. From the
-granite-4.2-3b RULER-64k thinking smoke (BV 1957312: 5 samples x 13 tasks, chat
-format, 32768-token cap): generated tokens p50 1696, p90 17943, p95 26369; the
-longest completed generation 26369. The 3 of 65 that hit the cap were degenerate
-loops (re-quoting the haystack, a repeated "> ..." line), which a larger budget
-would not rescue."""
+FAILURES_FILE = "failures.jsonl"
+"""Per-sample failures (scored 0), appended as they happen: ``<output_dir>/failures.jsonl``."""
+
+FAILURE_REASONS = ("prompt_exceeds_cap", "context_length_error", "length_before_answer")
+
+SPEC_ARG = "--sage2-spec="
+"""``_generate_main``'s argument: the json spec of one task/repeat generation."""
 
 SCORING_SOURCES = {
     # thinking on: ns's chat format on the chat endpoint
@@ -180,9 +195,6 @@ class RulerBenchmark(NemoSkillsBenchmark):
         """Thinking on unless ``enable_thinking=false`` (the chat template's default is on)."""
         return self.opt("enable_thinking", True)
 
-    def thinking_budget(self) -> int:
-        return self.opt("thinking_budget", DEFAULT_THINKING_BUDGET) if self.thinking() else 0
-
     def data_format(self) -> str:
         """ns prepare's format: ``chat`` for thinking, ns's ``default`` (answer prefix) otherwise."""
         return "chat" if self.thinking() else "default"
@@ -196,27 +208,51 @@ class RulerBenchmark(NemoSkillsBenchmark):
     def setup_name(self) -> str:
         return f"sage2_{self.sample_length()}" + ("_chat" if self.data_format() == "chat" else "")
 
-    def tokens_to_generate(self, task: str) -> int:
-        """The task's generation budget: ns/RULER's answer budget plus the thinking
-        budget, or ``max_tokens`` for every task."""
+    def answer_budget(self, task: str) -> int:
+        """ns/RULER's answer budget for the task (RULER leaves room for it in the sample)."""
+        return TOKENS_TO_GENERATE[task.split("_")[0]]
+
+    def tokens_to_generate(self, task: str) -> int | None:
+        """The ns ``tokens_to_generate``: thinking off, the task's answer budget or
+        ``max_tokens``; thinking on, ``max_tokens`` or None (the per-sample budget is
+        ``cap - prompt tokens``, bounded by it)."""
         s = self.sampling()
         if s["max_tokens"] is not None:
             return s["max_tokens"]
-        return TOKENS_TO_GENERATE[task.split("_")[0]] + self.thinking_budget()
+        return None if self.thinking() else self.answer_budget(task)
 
     def required_context(self) -> int:
-        """Served context for a full sample plus the largest generation beyond the
-        answer budget that RULER already left room for."""
-        extra = max(self.tokens_to_generate(t) - TOKENS_TO_GENERATE[t.split("_")[0]] for t in self.tasks())
-        return self.sample_length() + max(extra, 0)
+        """Served context for a full sample (generation fills what is left of the cap)."""
+        return self.sample_length()
 
-    def departures(self) -> list[str]:
+    def context_cap(self, served: int | None) -> int:
+        """Prompt plus generation per sample: ``context_cap``, else the served
+        max_model_len; ``sample_length`` for gold answers or thinking off when the
+        server does not say."""
+        if "thinking_budget" in self.config.options:
+            raise SystemExit(
+                f"{self.id}: thinking_budget was replaced by max_tokens = context cap - prompt tokens per sample; "
+                "use --option context_cap=N or --option max_tokens=N to bound it"
+            )
+        cap = self.opt("context_cap", 0) or served
+        if served is not None and cap > served:
+            raise SystemExit(f"{self.id}: context_cap={cap} > the served max_model_len={served}")
+        if cap is None:
+            if self.thinking() and not self.gold:
+                raise SystemExit(f"{self.id}: could not read the served max_model_len; pass --option context_cap=N")
+            cap = self.sample_length()
+        if cap < self.sample_length():
+            raise SystemExit(f"{self.id}: context_cap={cap} < sample_length={self.sample_length()}")
+        return cap
+
+    def departures(self, cap: int | None) -> list[str]:
         out = []
         if self.thinking():
             out.append(
-                f"thinking on: ns --data_format chat (no answer-prefix prefill); tokens_to_generate = "
-                f"thinking_budget {self.thinking_budget()} + ns/RULER answer budget (ns/RULER: the answer "
-                "budget only, for non-reasoning generation); scored on the post-thinking content only"
+                f"thinking on: ns --data_format chat (no answer-prefix prefill); max_tokens per sample = context "
+                f"cap {cap} - prompt tokens (ns/RULER: the task's answer budget, for non-reasoning generation); "
+                "prompt + answer budget over the cap, context-length errors and generations that reach the cap "
+                f"before an answer score 0 ({FAILURES_FILE}); scored on the post-thinking content only"
             )
         if self.sample_length() != self.max_seq_length:
             out.append(f"samples built at {self.sample_length()} tokens, not {self.max_seq_length}")
@@ -359,27 +395,24 @@ class RulerBenchmark(NemoSkillsBenchmark):
         if self.data_format() == "chat":
             args.append("++inference.endpoint_type=chat")
         if s["max_tokens"] is not None or self.data_format() == "chat":  # ns's task value otherwise
-            args.append(f"++inference.tokens_to_generate={self.tokens_to_generate(task)}")
+            # thinking on: a bound on (null: no bound on) cap - prompt tokens (capped_generation_task)
+            args.append(f"++inference.tokens_to_generate={_hydra(self.tokens_to_generate(task))}")
         if "enable_thinking" in self.config.options:
             args.append(f"++chat_template_kwargs.enable_thinking={str(self.opt('enable_thinking', True)).lower()}")
         return args + _passthrough(self.config.options, "ns.")
 
     def check_context(self, base_url: str, served: str) -> int | None:
-        """The served max_model_len must hold a full sample plus the thinking budget."""
+        """The served max_model_len (the context cap) must hold a full sample."""
         with contextlib.suppress(httpx.HTTPError, ValueError, KeyError):
             models = httpx.get(base_url.rstrip("/") + "/models", timeout=30).json()["data"]
             lens = [m.get("max_model_len") for m in models if m.get("id") == served] or [m.get("max_model_len") for m in models]
             n = next((x for x in lens if x), None)
-            need, extra = self.required_context(), self.required_context() - self.sample_length()
+            need = self.required_context()
             if n is not None and n < need:
-                msg = f"{self.id}: {served} is served with max_model_len={n} < {need}"
-                if not extra:
-                    raise SystemExit(f"{msg}; serve with --max-model-len {need}")
                 raise SystemExit(
-                    f"{msg} ({self.sample_length()}-token samples + {extra} generated tokens beyond RULER's answer "
-                    f"budget). Serve with --max-model-len {need} if the model supports it; otherwise "
-                    f"--option sample_length={n - extra} (shorter samples: a departure), a smaller "
-                    "--option thinking_budget, or --option enable_thinking=false (ns's RULER)"
+                    f"{self.id}: {served} is served with max_model_len={n} < {need}-token samples; serve with "
+                    f"--max-model-len {need} if the model supports it, otherwise --option sample_length=N "
+                    "(shorter samples: a departure)"
                 )
             return n
         return None
@@ -395,15 +428,21 @@ class RulerBenchmark(NemoSkillsBenchmark):
                 "split off (serve with the model's --reasoning-parser); not scoring thinking"
             )
 
+    def _task_rows(self, out: Path, task: str) -> list[dict]:
+        return [r for k in range(self.repeats) for r in _read_jsonl(out / task / f"output-rs{k}.jsonl")]
+
     def thinking_record(self, out: Path, tasks: list[str]) -> dict[str, Any]:
         """What was generated and scored: mode, budgets, cut-offs, token percentiles."""
         per_task = {}
         for t in tasks:
-            rows = [r for k in range(self.repeats) for r in _read_jsonl(out / t / f"output-rs{k}.jsonl")]
+            rows = self._task_rows(out, t)
             toks = sorted(int(r.get("num_generated_tokens") or 0) for r in rows)
             cut = [r for r in rows if r.get("finish_reason") == "length"]
             per_task[t] = {
+                "answer_budget": self.answer_budget(t),
                 "tokens_to_generate": self.tokens_to_generate(t),
+                "prompt_tokens": _percentiles(_ints(rows, "sage2_prompt_tokens")),
+                "max_tokens": _percentiles(_ints(rows, "sage2_max_tokens")),
                 "generations": len(rows),
                 # cut off before any content: nothing to score (0)
                 "length_no_content": sum(not (r.get("generation") or "").strip() for r in cut),
@@ -414,12 +453,32 @@ class RulerBenchmark(NemoSkillsBenchmark):
         return {
             "enabled": self.thinking(),
             "enable_thinking": self.config.options.get("enable_thinking", "unset (chat template default)"),
-            "budget": self.thinking_budget(),
+            "budget": self.budget_rule(),
             "data_format": self.data_format(),
             "endpoint": "chat" if self.data_format() == "chat" else "text (answer prefix prefilled)",
             "scoring_source": self.scoring_source(),
             "per_task": per_task,
         }
+
+    def budget_rule(self) -> str:
+        bound = self.sampling()["max_tokens"]
+        if self.thinking():
+            return "context cap - prompt tokens" + (f", at most {bound}" if bound else "")
+        return f"max_tokens {bound}" if bound else "ns/RULER task budget"
+
+    def failures_record(self, out: Path, tasks: list[str]) -> dict[str, Any]:
+        """Samples scored 0 for a context reason, from the output rows (resume-safe)."""
+        by_reason = dict.fromkeys(FAILURE_REASONS, 0)
+        per_task = {}
+        for t in tasks:
+            counts: dict[str, int] = {}
+            for r in self._task_rows(out, t):
+                if r.get("sage2_failure"):
+                    counts[r["sage2_failure"]] = counts.get(r["sage2_failure"], 0) + 1
+                    by_reason[r["sage2_failure"]] = by_reason.get(r["sage2_failure"], 0) + 1
+            if counts:
+                per_task[t] = counts
+        return {"file": FAILURES_FILE, "total": sum(by_reason.values()), "by_reason": by_reason, "per_task": per_task}
 
     def _generated_detail(self, key: str) -> Any:
         """A value the generate phase recorded (generation.json details)."""
@@ -434,9 +493,11 @@ class RulerBenchmark(NemoSkillsBenchmark):
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         # Before building (128k) data for a server that cannot hold it.
-        max_model_len = self.check_context(base_url, served_model_name) if self.generating and not self.gold else None
-        if not self.generating:
-            max_model_len = self._generated_detail("served_max_model_len")
+        if self.generating:
+            max_model_len = self.check_context(base_url, served_model_name) if not self.gold else None
+            cap = self.context_cap(max_model_len)
+        else:
+            max_model_len, cap = self._generated_detail("served_max_model_len"), self._generated_detail("context_cap")
         setup_dir, provenance = self.prepare_data()
         tasks = self.tasks()
         out = self.config.output_dir / "ruler"
@@ -446,7 +507,7 @@ class RulerBenchmark(NemoSkillsBenchmark):
             inputs[t] = out / t / "input.jsonl"
             if self.generating:
                 _write_jsonl(inputs[t], rows)
-                _reset_task_if_input_changed(out / t)
+                _reset_task_if_input_changed(out / t, self.config.output_dir / FAILURES_FILE)
             else:
                 _check_input(self, out / t / "input.sha256", rows)
         n = sum(len(_read_jsonl(p)) for p in inputs.values())
@@ -461,7 +522,7 @@ class RulerBenchmark(NemoSkillsBenchmark):
                 for k in range(self.repeats):
                     output = inputs[t].parent / f"output-rs{k}.jsonl"
                     if self.generating:
-                        self._generate_task(setup_dir, t, inputs[t], base_url, served_model_name, k)
+                        self._generate_task(setup_dir, t, inputs[t], base_url, served_model_name, k, cap)
                     if self.scoring:
                         self.check_generations(output)
                         self._evaluate(output, self.task_generation_args(setup_dir, t), what=f"{t} repeat {k} ({output})")
@@ -472,9 +533,11 @@ class RulerBenchmark(NemoSkillsBenchmark):
                 "ns_benchmark": f"ruler.{self.setup_name()}",
                 "sample_length": self.sample_length(),
                 "served_max_model_len": max_model_len,
+                "context_cap": cap,
                 "required_context": self.required_context(),
                 "thinking": self.thinking_record(out, tasks),
-                "departures": self.departures(),
+                "failures": self.failures_record(out, tasks),
+                "departures": self.departures(cap),
                 "tasks": tasks,
                 "statuses": _merge_counts(_statuses(f) for f in files),
                 "data_provenance": provenance,
@@ -513,9 +576,11 @@ class RulerBenchmark(NemoSkillsBenchmark):
             "max_seq_length": self.max_seq_length,
             "sample_length": self.sample_length(),
             "served_max_model_len": max_model_len,
+            "context_cap": cap,
             "required_context": self.required_context(),
             "thinking": self.thinking_record(out, tasks),
-            "departures": self.departures(),
+            "failures": self.failures_record(out, tasks),
+            "departures": self.departures(cap),
             "tasks": tasks,
             "partial_task_set": set(tasks) != set(TASKS),
             "per_task": per_task,
@@ -527,12 +592,22 @@ class RulerBenchmark(NemoSkillsBenchmark):
             "ns_metrics": _jsonable(per_task_metrics),
         }
 
-    def _generate_task(self, setup_dir: Path, task: str, input_file: Path, base_url: str, served: str, k: int) -> None:
+    def _generate_task(self, setup_dir: Path, task: str, input_file: Path, base_url: str, served: str, k: int, cap: int) -> None:
         output = input_file.parent / f"output-rs{k}.jsonl"
         if output.exists():
             return
+        spec = {
+            "task": task,
+            "repeat": k,
+            "cap": cap,
+            "answer_budget": self.answer_budget(task),
+            "thinking": self.thinking(),
+            "failures_file": str(self.config.output_dir / FAILURES_FILE),
+        }
+        spec_path = input_file.parent / f"output-rs{k}.sage2.json"
+        spec_path.write_text(json.dumps(spec, indent=2))
         cmd = [
-            sys.executable, "-m", GENERATE_MODULE,
+            sys.executable, "-c", f"from {__name__} import _generate_main; _generate_main()", f"{SPEC_ARG}{spec_path}",
             f"++input_file={input_file}",
             f"++output_file={output}",
             "++server.server_type=vllm",
@@ -556,14 +631,144 @@ def _percentiles(sorted_toks: list[int]) -> dict[str, int]:
     return {"p50": sorted_toks[round(0.5 * last)], "p95": sorted_toks[round(0.95 * last)], "max": sorted_toks[-1]}
 
 
-def _reset_task_if_input_changed(task_dir: Path) -> None:
+def _ints(rows: list[dict], key: str) -> list[int]:
+    return sorted(int(r[key]) for r in rows if r.get(key) is not None)
+
+
+def _reset_task_if_input_changed(task_dir: Path, failures: Path | None = None) -> None:
     stamp = task_dir / "input.sha256"
     digest = _sha256(task_dir / "input.jsonl")
     if stamp.exists() and stamp.read_text().strip() != digest:
         log.warning("%s: input changed since the last run; discarding old generations", task_dir.name)
         for f in task_dir.glob("output-rs*"):
             f.unlink()
+        if failures is not None and failures.exists():  # and the task's logged failures
+            _write_jsonl(failures, [r for r in _read_jsonl(failures) if r.get("task") != task_dir.name])
     stamp.write_text(digest + "\n")
+
+
+# -- generation with a per-sample budget ------------------------------------------
+
+
+def sample_budget(spec: dict, prompt_tokens: int, bound: int | None) -> tuple[int | None, str | None]:
+    """``(max_tokens, failure)`` for one sample. Thinking on: ``cap - prompt``
+    (at most ``bound``), failing when that leaves less than the answer budget.
+    Thinking off: ns's task budget ``bound``, failing when it does not fit."""
+    room = spec["cap"] - prompt_tokens
+    if spec["thinking"]:
+        n = room if bound is None else min(room, bound)
+        return n, ("prompt_exceeds_cap" if room < spec["answer_budget"] else None)
+    return bound, ("prompt_exceeds_cap" if bound is None or room < bound else None)
+
+
+_CONTEXT_ERRORS = ("context_window_exceeded", "maximum context length", "max_model_len", "context length")
+"""In ns's soft-fail ``error`` / ``detailed_error`` (ns's reason, vLLM's 400 messages)."""
+
+
+def classify_result(result: dict) -> str | None:
+    """The context failure behind an ns result (soft-failed request or cut-off), if any."""
+    if result.get("error") or result.get("finish_reason") == "error":
+        text = f"{result.get('error', '')} {result.get('detailed_error', '')}".lower()
+        return "context_length_error" if any(e in text for e in _CONTEXT_ERRORS) else None
+    if result.get("finish_reason") == "length" and not (result.get("generation") or "").strip():
+        return "length_before_answer"
+    return None
+
+
+def count_prompt_tokens(tokenizer, prompt: Any, chat_template_kwargs: dict | None) -> int:
+    """Tokens of the prompt as vLLM sees it: the chat template with the generation
+    prompt (and the request's template kwargs) for messages; the completions
+    endpoint's encoding (special tokens added) for a text prompt."""
+    if isinstance(prompt, str):
+        return len(tokenizer.encode(prompt, add_special_tokens=True))
+    ids = tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True, **(chat_template_kwargs or {}))
+    return len(ids if isinstance(ids, list) else ids["input_ids"])
+
+
+def capped_generation_task(base):
+    """ns's GenerationTask (``base``) with RULER's per-sample budget: counts each
+    prompt, generates ``sample_budget``'s max_tokens, scores a context failure 0
+    (an empty generation) and appends it to the failures file at once."""
+    from dataclasses import asdict, is_dataclass
+
+    class CappedGeneration(base):
+        def __init__(self, cfg, spec: dict):
+            self.sage2_spec = spec
+            super().__init__(cfg)
+            from transformers import AutoTokenizer
+
+            self.sage2_tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer or cfg.server["model"], trust_remote_code=True)
+
+        def sage2_template_kwargs(self) -> dict:
+            # ns moves chat_template_kwargs into extra_body for the chat endpoint
+            return dict(self.cfg.inference.extra_body.get("chat_template_kwargs") or self.cfg.chat_template_kwargs or {})
+
+        async def process_single_datapoint(self, data_point, all_data, prompt_format=None):
+            # ns's process_single_datapoint, with the sample's tokens_to_generate
+            prompt = self.fill_prompt(data_point=data_point, data=all_data, prompt_format=prompt_format)
+            n_prompt = count_prompt_tokens(self.sage2_tokenizer, prompt, self.sage2_template_kwargs())
+            inference = asdict(self.cfg.inference) if is_dataclass(self.cfg.inference) else dict(self.cfg.inference)
+            max_tokens, failure = sample_budget(self.sage2_spec, n_prompt, inference["tokens_to_generate"])
+            if failure:  # the answer cannot fit: no request
+                result = {"generation": "", "num_generated_tokens": 0, "error": failure, "finish_reason": "error"}
+            else:
+                params = {
+                    **inference,
+                    **self.extra_generate_params,
+                    "prompt": prompt,
+                    "stop_phrases": [self.cfg.stop_phrase] if self.cfg.stop_phrase else None,
+                    "tokens_to_generate": max_tokens,
+                }
+                result = await self.generate_with_semaphore(**params)
+                failure = classify_result(result)
+            result.update(sage2_prompt_tokens=n_prompt, sage2_max_tokens=max_tokens, sage2_failure=failure)
+            if failure:
+                self.sage2_log_failure(data_point, result)
+            return result
+
+        def sage2_log_failure(self, data_point: dict, result: dict) -> None:
+            spec = self.sage2_spec
+            rec = {
+                "task": spec["task"],
+                "repeat": spec["repeat"],
+                "index": data_point.get("index"),
+                "reason": result["sage2_failure"],
+                "prompt_tokens": result["sage2_prompt_tokens"],
+                "generated_tokens": int(result.get("num_generated_tokens") or 0),
+                "cap": spec["cap"],
+                "max_tokens": result["sage2_max_tokens"],
+                "finish_reason": result.get("finish_reason"),
+                "detail": str(result.get("detailed_error") or "")[:500],
+            }
+            with open(spec["failures_file"], "a") as f:
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+
+    return CappedGeneration
+
+
+def _generate_main() -> None:
+    """ns generate (``nemo_skills.inference.generate``'s Hydra config and ``++``
+    overrides) with ``capped_generation_task``; argv carries ``--sage2-spec=<json>``."""
+    import hydra
+    from nemo_skills.inference.generate import GenerationTask, GenerationTaskConfig
+    from nemo_skills.utils import setup_logging
+
+    arg = next(a for a in sys.argv[1:] if a.startswith(SPEC_ARG))
+    sys.argv.remove(arg)
+    spec_path = Path(arg[len(SPEC_ARG) :])
+    spec = json.loads(spec_path.read_text())
+    # Hydra's run dir next to the outputs, not ./outputs in the job's cwd
+    sys.argv += [f"hydra.run.dir={spec_path.parent}", "hydra.output_subdir=null"]
+    task_cls = capped_generation_task(GenerationTask)
+    setup_logging()
+
+    @hydra.main(version_base=None, config_name="base_generation_config")
+    def generate(cfg) -> None:
+        cfg = GenerationTaskConfig(_init_nested=True, **cfg)
+        task_cls(cfg, spec).generate()
+
+    generate()
 
 
 class RulerGoldServer(_GoldServer):
@@ -594,3 +799,27 @@ class Ruler128k(RulerBenchmark):
 class Ruler64k(RulerBenchmark):
     id = "ruler-64k"
     max_seq_length = 65536
+
+
+@register
+class Ruler256k(RulerBenchmark):
+    """Granite 5: needs a 256k-context server (granite-4.2 is verified to 128k only)."""
+
+    id = "ruler-256k"
+    max_seq_length = 262144
+
+
+@register
+class Ruler512k(RulerBenchmark):
+    """Granite 5: needs a 512k-context server."""
+
+    id = "ruler-512k"
+    max_seq_length = 524288
+
+
+@register
+class Ruler1m(RulerBenchmark):
+    """Granite 5: needs a 1M-context server."""
+
+    id = "ruler-1m"
+    max_seq_length = 1048576

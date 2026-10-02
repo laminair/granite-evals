@@ -1,6 +1,7 @@
 """RULER through NeMo-Skills: config, source pinning, per-task args (thinking on:
-chat format and budgets; off: ns's text/prefill), gold server, context check, the
-think-tag guard, and the ns metrics/ruler_score path (with the nemoskills extra)."""
+chat format, cap - prompt budgets; off: ns's text/prefill), the per-sample budget
+and failure log, gold server, context check, the think-tag guard, and the ns
+metrics/ruler_score path (with the nemoskills extra)."""
 
 import hashlib
 import json
@@ -13,7 +14,7 @@ from sage2_evals.benchmarks import nemo_skills as nsb
 from sage2_evals.benchmarks import nemo_skills_ruler as nsr
 from sage2_evals.registry import RunConfig
 
-IDS = {"ruler-128k": 131072, "ruler-64k": 65536}
+IDS = {"ruler-128k": 131072, "ruler-64k": 65536, "ruler-256k": 262144, "ruler-512k": 524288, "ruler-1m": 1048576}
 
 ARGS = (  # ns prepare --data_format default (thinking off)
     '"++prompt_config=generic/default ++eval_type=ruler ++eval_config.match_type=all '
@@ -95,7 +96,7 @@ def _setup(tmp_path, tasks=nsr.TASKS, n=nsr.NUM_SAMPLES, args=CHAT_ARGS):
 def test_task_generation_args_thinking_off_is_ns(tmp_path):
     d = _setup(tmp_path, tasks=["vt"], args=ARGS)
     b = bench("ruler-128k", tmp_path, options=OFF)
-    assert (b.data_format(), b.thinking_budget(), b.setup_name()) == ("default", 0, "sage2_131072")
+    assert (b.data_format(), b.tokens_to_generate("vt"), b.setup_name()) == ("default", 30, "sage2_131072")
     args = b.task_generation_args(d, "vt")
     assert args[:6] == [
         "++prompt_config=generic/default",
@@ -108,7 +109,7 @@ def test_task_generation_args_thinking_off_is_ns(tmp_path):
     assert "++tokenizer=/models/granite" in args and "++inference.temperature=null" in args
     assert sum(a.startswith("++inference.tokens_to_generate=") for a in args) == 1  # the task's own
     assert args[-1] == "++chat_template_kwargs.enable_thinking=false"
-    assert b.required_context() == 131072 and b.departures() == []
+    assert b.required_context() == 131072 and b.departures(131072) == []
     b = bench("ruler-128k", tmp_path, options={"max_tokens": "64", **OFF, "tokenizer": "/tok"})
     args = b.task_generation_args(d, "vt")
     assert args[-2:] == ["++inference.tokens_to_generate=64", "++chat_template_kwargs.enable_thinking=false"]
@@ -122,19 +123,17 @@ def test_task_generation_args_thinking_on(tmp_path):
     args = b.task_generation_args(d, "vt")
     assert not any(a.startswith("++start_assistant_response_key") for a in args)  # no answer-prefix prefill
     assert not any("enable_thinking" in a for a in args)
-    assert args[-2:] == ["++inference.endpoint_type=chat", f"++inference.tokens_to_generate={nsr.DEFAULT_THINKING_BUDGET + 30}"]
-    budgets = {t: b.tokens_to_generate(t) for t in ("vt", "niah_single_1", "qa_2")}
-    assert budgets == {t: nsr.DEFAULT_THINKING_BUDGET + n for t, n in (("vt", 30), ("niah_single_1", 128), ("qa_2", 32))}
-    b = bench("ruler-64k", tmp_path, options={"thinking_budget": "1000", "enable_thinking": "true"})
-    assert b.task_generation_args(d, "niah_single_1")[-2:] == [
-        "++inference.tokens_to_generate=1128",
-        "++chat_template_kwargs.enable_thinking=true",
-    ]
-    assert b.required_context() == 65536 + 1000
-    assert len(b.departures()) == 1 and "thinking_budget 1000" in b.departures()[0]
-    # max_tokens still replaces every task's budget
+    # no fixed budget: each sample gets cap - prompt tokens (capped_generation_task)
+    assert args[-2:] == ["++inference.endpoint_type=chat", "++inference.tokens_to_generate=null"]
+    assert {t: b.answer_budget(t) for t in ("vt", "niah_single_1", "qa_2")} == {"vt": 30, "niah_single_1": 128, "qa_2": 32}
+    assert b.required_context() == 65536
+    assert len(b.departures(65536)) == 1 and "cap 65536 - prompt tokens" in b.departures(65536)[0]
+    b = bench("ruler-64k", tmp_path, options={"enable_thinking": "true"})
+    assert b.task_generation_args(d, "vt")[-1] == "++chat_template_kwargs.enable_thinking=true"
+    # max_tokens bounds cap - prompt
     b = bench("ruler-64k", tmp_path, options={"max_tokens": "4096"})
-    assert b.tokens_to_generate("qa_2") == 4096 and b.required_context() == 65536 + 4096 - 30  # vt: the smallest answer budget
+    assert b.task_generation_args(d, "qa_2")[-1] == "++inference.tokens_to_generate=4096" and b.required_context() == 65536
+    assert b.budget_rule() == "context cap - prompt tokens, at most 4096"
 
 
 def test_data_format_must_match_thinking(tmp_path):
@@ -147,8 +146,8 @@ def test_data_format_must_match_thinking(tmp_path):
 
 def test_sample_length(tmp_path):
     b = bench("ruler-128k", tmp_path, options={"sample_length": "114688"})
-    assert (b.sample_length(), b.setup_name(), b.required_context()) == (114688, "sage2_114688_chat", 114688 + nsr.DEFAULT_THINKING_BUDGET)
-    assert any("114688 tokens, not 131072" in d for d in b.departures())
+    assert (b.sample_length(), b.setup_name(), b.required_context()) == (114688, "sage2_114688_chat", 114688)
+    assert any("114688 tokens, not 131072" in d for d in b.departures(131072))
     with pytest.raises(SystemExit, match="sample_length"):
         bench("ruler-64k", tmp_path, options={"sample_length": "70000"}).sample_length()
 
@@ -194,31 +193,83 @@ def test_context_check(tmp_path):
     b = bench("ruler-128k", tmp_path, options=OFF)
     with _Models(131072) as s:
         assert b.check_context(s.base_url, "served") == 131072
-    with _Models(32768) as s, pytest.raises(SystemExit, match="--max-model-len 131072$"):
+    with _Models(32768) as s, pytest.raises(SystemExit, match="--max-model-len 131072 .*sample_length=N"):
         b.check_context(s.base_url, "served")
     assert b.check_context("http://127.0.0.1:9/v1", "served") is None  # unknown: not fatal
 
 
 def test_context_check_thinking(tmp_path):
-    """Thinking needs the sample plus its budget; at the model's limit the message
-    names the options instead of picking one."""
-    b = bench("ruler-128k", tmp_path)
-    need = 131072 + nsr.DEFAULT_THINKING_BUDGET
-    with _Models(131072) as s, pytest.raises(SystemExit) as e:
-        b.check_context(s.base_url, "served")
-    msg = str(e.value)
-    assert f"< {need}" in msg and f"--max-model-len {need}" in msg
-    assert f"sample_length={131072 - nsr.DEFAULT_THINKING_BUDGET}" in msg and "enable_thinking=false" in msg
+    """Thinking fills the cap: a server holding a full sample is enough."""
     with _Models(131072) as s:
+        assert bench("ruler-128k", tmp_path).check_context(s.base_url, "served") == 131072
         assert bench("ruler-64k", tmp_path).check_context(s.base_url, "served") == 131072
-        small = {"sample_length": str(131072 - nsr.DEFAULT_THINKING_BUDGET)}
-        assert bench("ruler-128k", tmp_path, options=small).check_context(s.base_url, "served") == 131072
+    with _Models(131072) as s, pytest.raises(SystemExit, match="max_model_len=131072 < 262144"):
+        bench("ruler-256k", tmp_path).check_context(s.base_url, "served")
+
+
+def test_context_cap(tmp_path):
+    b = bench("ruler-128k", tmp_path)
+    assert b.context_cap(131072) == 131072 and b.context_cap(262144) == 262144  # the served max_model_len
+    with pytest.raises(SystemExit, match="context_cap=N"):  # thinking needs to know it
+        b.context_cap(None)
+    assert bench("ruler-128k", tmp_path, options=OFF).context_cap(None) == 131072  # ns RULER's sizing
+    assert bench("ruler-128k", tmp_path, options={"answers": "gold"}).context_cap(None) == 131072
+    assert bench("ruler-64k", tmp_path, options={"context_cap": "100000"}).context_cap(131072) == 100000
+    with pytest.raises(SystemExit, match="> the served max_model_len"):
+        bench("ruler-64k", tmp_path, options={"context_cap": "200000"}).context_cap(131072)
+    with pytest.raises(SystemExit, match="< sample_length"):
+        bench("ruler-128k", tmp_path, options={"context_cap": "65536"}).context_cap(None)
+    with pytest.raises(SystemExit, match="thinking_budget was replaced"):
+        bench("ruler-128k", tmp_path, options={"thinking_budget": "1000"}).context_cap(131072)
 
 
 def test_context_checked_before_data(tmp_path, monkeypatch):
     monkeypatch.setattr(nsr.RulerBenchmark, "prepare_data", lambda self: pytest.fail("built data first"))
-    with _Models(65536) as s, pytest.raises(SystemExit, match="max_model_len=65536"):
+    with _Models(32768) as s, pytest.raises(SystemExit, match="max_model_len=32768"):
         bench("ruler-64k", tmp_path).run(s.base_url, "served")
+
+
+SPEC = {"task": "vt", "repeat": 0, "cap": 1000, "answer_budget": 30, "thinking": True, "failures_file": ""}
+
+
+def test_sample_budget():
+    assert nsr.sample_budget(SPEC, 900, None) == (100, None)  # cap - prompt
+    assert nsr.sample_budget(SPEC, 900, 64) == (64, None)  # bounded by max_tokens
+    assert nsr.sample_budget(SPEC, 970, None) == (30, None)  # exactly the answer budget fits
+    assert nsr.sample_budget(SPEC, 971, None) == (29, "prompt_exceeds_cap")
+    off = {**SPEC, "thinking": False}
+    assert nsr.sample_budget(off, 970, 30) == (30, None)  # ns's task budget, unchanged
+    assert nsr.sample_budget(off, 971, 30) == (30, "prompt_exceeds_cap")
+
+
+def test_classify_result():
+    ctx = {"generation": "", "error": "context_window_exceeded", "detailed_error": "No strategy configured.", "finish_reason": "error"}
+    assert nsr.classify_result(ctx) == "context_length_error"
+    vllm = {"generation": "", "error": "See detailed_error", "finish_reason": "error",
+            "detailed_error": "This model's maximum context length is 131072 tokens. However, you requested 131100"}  # fmt: skip
+    assert nsr.classify_result(vllm) == "context_length_error"
+    assert nsr.classify_result({"generation": "", "error": "See detailed_error", "detailed_error": "timeout"}) is None
+    assert nsr.classify_result({"generation": "", "finish_reason": "length"}) == "length_before_answer"
+    assert nsr.classify_result({"generation": " 12", "finish_reason": "length"}) is None  # an answer, cut: ns scores it
+    assert nsr.classify_result({"generation": "12", "finish_reason": "stop"}) is None
+
+
+class _Tok:
+    """One token per character; the chat template wraps each message in 2 tokens
+    (and kwargs add one)."""
+
+    def encode(self, text, add_special_tokens):
+        return list(text) + ([0] if add_special_tokens else [])
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, **kwargs):
+        return [0] * (sum(len(m["content"]) + 2 for m in messages) + add_generation_prompt + len(kwargs))
+
+
+def test_count_prompt_tokens():
+    assert nsr.count_prompt_tokens(_Tok(), "abc", None) == 4
+    msgs = [{"role": "user", "content": "abcd"}]
+    assert nsr.count_prompt_tokens(_Tok(), msgs, None) == 7
+    assert nsr.count_prompt_tokens(_Tok(), msgs, {"enable_thinking": True}) == 8
 
 
 def test_think_tags_in_generation_fail(tmp_path):
@@ -256,15 +307,17 @@ def ns():
 def _fake_generate(correct_every, cut_every=0):
     """Rows ``index % cut_every == 1`` stop at the length cap inside their thinking."""
 
-    def gen(self, setup_dir, task, input_file, base_url, served, k):
+    def gen(self, setup_dir, task, input_file, base_url, served, k, cap):
         rows = [json.loads(line) for line in Path(input_file).read_text().splitlines()]
         out = Path(input_file).parent / f"output-rs{k}.jsonl"
         lines = []
         for r in rows:
             cut = bool(cut_every) and r["index"] % cut_every == 1
-            g = {"generation": "", "reasoning_content": "v1 ...", "finish_reason": "length", "num_generated_tokens": 100}
+            g = {"generation": "", "reasoning_content": "v1 ...", "finish_reason": "length", "num_generated_tokens": 100,
+                 "sage2_failure": "length_before_answer"}  # fmt: skip
             if not cut:
                 g = {"generation": "g", "reasoning_content": "r", "finish_reason": "stop", "num_generated_tokens": 10 + r["index"]}
+            g.update(sage2_prompt_tokens=40, sage2_max_tokens=1000 - 40)
             lines.append(json.dumps({**r, **g, "is_correct": not cut and r["index"] % correct_every == 0}) + "\n")
         out.write_text("".join(lines))
 
@@ -284,14 +337,16 @@ def test_run_scores_with_ns_ruler_score(ns, tmp_path, monkeypatch):
     th = r["thinking"]
     assert (th["enabled"], th["budget"], th["data_format"], th["scoring_source"]) == (
         True,
-        nsr.DEFAULT_THINKING_BUDGET,
+        "context cap - prompt tokens",
         "chat",
         nsr.SCORING_SOURCES["chat"],
     )
-    assert th["per_task"]["vt"]["tokens_to_generate"] == nsr.DEFAULT_THINKING_BUDGET + 30
+    assert th["per_task"]["vt"]["answer_budget"] == 30 and th["per_task"]["vt"]["tokens_to_generate"] is None
     assert th["per_task"]["vt"]["generated_tokens"] == {"p50": 12, "p95": 13, "max": 13}
-    assert r["sample_length"] == 131072 and r["required_context"] == 131072 + nsr.DEFAULT_THINKING_BUDGET
-    assert len(r["departures"]) == 1 and r["generation_args"]["vt"][-1].startswith("++inference.tokens_to_generate=")
+    assert th["per_task"]["vt"]["max_tokens"] == {"p50": 1000 - 40, "p95": 1000 - 40, "max": 1000 - 40}
+    assert r["sample_length"] == 131072 and r["required_context"] == 131072 and r["context_cap"] == 131072
+    assert r["failures"] == {"file": nsr.FAILURES_FILE, "total": 0, "by_reason": dict.fromkeys(nsr.FAILURE_REASONS, 0), "per_task": {}}
+    assert len(r["departures"]) == 1 and r["generation_args"]["vt"][-1] == "++inference.tokens_to_generate=null"
 
 
 def test_run_cut_off_thinking_scores_zero(ns, tmp_path, monkeypatch):
@@ -303,6 +358,8 @@ def test_run_cut_off_thinking_scores_zero(ns, tmp_path, monkeypatch):
     assert r["value"] == pytest.approx(0.5)  # indices 1 and 3 cut off inside the thinking
     vt = r["thinking"]["per_task"]["vt"]
     assert (vt["length_no_content"], vt["length_with_content"], vt["with_reasoning"]) == (2, 0, 4)
+    assert r["failures"]["total"] == 2 and r["failures"]["by_reason"]["length_before_answer"] == 2
+    assert r["failures"]["per_task"] == {"vt": {"length_before_answer": 2}}
 
 
 def test_run_thinking_off_record(ns, tmp_path, monkeypatch):
@@ -311,7 +368,7 @@ def test_run_thinking_off_record(ns, tmp_path, monkeypatch):
     monkeypatch.setattr(nsr.RulerBenchmark, "prepare_data", lambda self: (d, {"source": "fake"}))
     monkeypatch.setattr(nsr.RulerBenchmark, "_generate_task", _fake_generate(1))
     r = b.run("", "")
-    assert r["thinking"]["enabled"] is False and r["thinking"]["budget"] == 0 and r["departures"] == []
+    assert r["thinking"]["enabled"] is False and r["thinking"]["budget"] == "ns/RULER task budget" and r["departures"] == []
     assert r["thinking"]["per_task"]["vt"]["tokens_to_generate"] == 30
     assert r["thinking"]["scoring_source"] == nsr.SCORING_SOURCES["default"]
     assert r["thinking"]["endpoint"] == "text (answer prefix prefilled)"
@@ -334,6 +391,67 @@ def test_run_task_subset(ns, tmp_path, monkeypatch):
     monkeypatch.setattr(nsr.RulerBenchmark, "_generate_task", _fake_generate(1))
     r = b.run("", "")
     assert r["value"] == 1.0 and r["partial_task_set"] and r["tasks"] == ["vt", "cwe"]
+
+
+def _word_tokenizer(path):
+    """A local HF tokenizer: one token per word; the chat template adds 2 per message and 1 to prompt."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    tok = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    template = "{% for m in messages %}[UNK] {{ m['content'] }} [UNK] {% endfor %}{% if add_generation_prompt %}[UNK]{% endif %}"
+    PreTrainedTokenizerFast(tokenizer_object=tok, unk_token="[UNK]", chat_template=template).save_pretrained(path)
+    return str(path)
+
+
+class _CapServer(nsb._Server):
+    """A chat endpoint: ``LENGTH`` samples stop at the cap in the thinking, ``CTX``
+    samples get vLLM's context-length 400; others answer. Records max_tokens."""
+
+    def __init__(self):
+        self.max_tokens = {}
+
+    def handle(self, method, path, headers, body):
+        if not path.rstrip("/").endswith("/completions"):
+            return nsb._json_response({"data": [{"id": "m"}]})
+        req = json.loads(body)
+        q = req["messages"][-1]["content"]
+        self.max_tokens[q.split()[0]] = req.get("max_tokens") or req.get("max_completion_tokens")
+        if "CTX" in q:
+            msg = "This model's maximum context length is 1000 tokens. However, you requested 1001 tokens."
+            return nsb._json_response({"object": "error", "message": msg, "type": "BadRequestError", "code": 400}, 400)
+        content, finish = ("", "length") if "LENGTH" in q else ("v0 w", "stop")
+        choice = {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}
+        usage = {"prompt_tokens": 1, "completion_tokens": 7, "total_tokens": 8}
+        return nsb._json_response({"id": "x", "object": "chat.completion", "created": 0, "model": "m", "choices": [choice], "usage": usage})
+
+
+def test_capped_generation_through_ns(ns, tmp_path):
+    """ns generate with the per-sample budget, end to end (Hydra, ns's chat model,
+    soft fail): max_tokens = cap - prompt; context failures score 0 and are logged."""
+    pytest.importorskip("transformers")
+    tok = _word_tokenizer(tmp_path / "tok")
+    setup = _setup(tmp_path, tasks=["vt"], n=4)
+    questions = ["s0 short", "s1 LENGTH", "s2 " + "word " * 980, "s3 CTX"]  # s2: 981 words + 3 template tokens
+    rows = [{"index": i, "question": q, "expected_answer": ["v0", "w"]} for i, q in enumerate(questions)]
+    out = tmp_path / "out"
+    b = bench("ruler-64k", out, options={"tokenizer": tok, "tasks": "vt"})
+    inp = out / "ruler" / "vt" / "input.jsonl"
+    nsb._write_jsonl(inp, rows)
+    with _CapServer() as s:
+        b._generate_task(setup, "vt", inp, s.base_url, "m", 0, 1000)
+    got = {r["index"]: r for r in nsb._read_jsonl(inp.parent / "output-rs0.jsonl")}
+    assert [got[i]["sage2_failure"] for i in range(4)] == [None, "length_before_answer", "prompt_exceeds_cap", "context_length_error"]
+    assert got[0]["sage2_prompt_tokens"] == 2 + 3 and got[0]["sage2_max_tokens"] == 1000 - 5
+    assert s.max_tokens == {"s0": 995, "s1": 995, "s3": 995}  # s2 is never sent
+    assert got[2]["sage2_max_tokens"] == 1000 - 984 and got[2]["generation"] == ""
+    log = [json.loads(line) for line in (out / nsr.FAILURES_FILE).read_text().splitlines()]
+    assert sorted((r["index"], r["reason"]) for r in log) == [(1, "length_before_answer"), (2, "prompt_exceeds_cap"), (3, "context_length_error")]
+    assert {r["task"] for r in log} == {"vt"} and next(r for r in log if r["index"] == 2)["prompt_tokens"] == 984
+    assert next(r for r in log if r["index"] == 1)["generated_tokens"] == 7
+    assert b.failures_record(out / "ruler", ["vt"])["by_reason"] == {
+        "prompt_exceeds_cap": 1, "context_length_error": 1, "length_before_answer": 1}  # fmt: skip
 
 
 def test_ns_ruler_evaluator_accepts_gold_answers(ns, tmp_path):
@@ -417,10 +535,10 @@ def test_run_generate_then_score(ns, tmp_path, monkeypatch):
     kw = {"limit": 4, "options": {"tasks": "vt,qa_1"}}
     _prepared(monkeypatch)
     monkeypatch.setattr(nsr, "_run_ns", _fake_ns(calls := []))
-    monkeypatch.setattr(nsr.RulerBenchmark, "check_context", lambda b, url, served: 131072 + nsr.DEFAULT_THINKING_BUDGET)
+    monkeypatch.setattr(nsr.RulerBenchmark, "check_context", lambda b, url, served: 262144)
     out = tmp_path / "split"
     g = bench("ruler-128k", out, phase="generate", **kw).run("http://127.0.0.1:9/v1", "m")
-    assert g["n"] == 8 and "value" not in g and g["served_max_model_len"] == 131072 + nsr.DEFAULT_THINKING_BUDGET
+    assert g["n"] == 8 and "value" not in g and g["served_max_model_len"] == g["context_cap"] == 262144
     assert g["thinking"]["scoring_source"] == nsr.SCORING_SOURCES["chat"] and set(g["generation_args"]) == {"vt", "qa_1"}
     vt = out / "ruler" / "vt" / "output-rs0.jsonl"
     assert all("is_correct" not in r for r in nsb._read_jsonl(vt)) and nsb._unscored(vt).exists()
@@ -432,13 +550,14 @@ def test_run_generate_then_score(ns, tmp_path, monkeypatch):
         monkeypatch.setattr(nsr.RulerBenchmark, name, lambda *a, **k: pytest.fail(f"score phase ran {a}"))
     s = bench("ruler-128k", out, phase="score", **kw).run("", "m")
     assert (s["value"], s["n"]) == (pytest.approx(0.5), 8) and not nsb._unscored(vt).exists()
-    assert s["served_max_model_len"] == g["served_max_model_len"]
+    assert s["served_max_model_len"] == g["served_max_model_len"] and s["context_cap"] == 262144
+    assert "cap 262144" in s["departures"][0] and s["failures"] == g["failures"]
     assert s["thinking"]["per_task"]["vt"]["generated_tokens"] == {"p50": 12, "p95": 13, "max": 13}
     monkeypatch.undo()
 
     _prepared(monkeypatch)
     monkeypatch.setattr(nsr, "_run_ns", _fake_ns(calls_all := []))
-    monkeypatch.setattr(nsr.RulerBenchmark, "check_context", lambda b, url, served: 131072 + nsr.DEFAULT_THINKING_BUDGET)
+    monkeypatch.setattr(nsr.RulerBenchmark, "check_context", lambda b, url, served: 262144)
     a = bench("ruler-128k", tmp_path / "all", **kw).run("http://127.0.0.1:9/v1", "m")
     strip = ("data_provenance", "generation_args")  # paths under each output dir
     assert {k: v for k, v in a.items() if k not in strip} == {k: v for k, v in s.items() if k not in strip}
