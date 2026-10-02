@@ -38,6 +38,8 @@ nemoskills = [
     # wmt24pp: ns's BLEU tokenizes Japanese with sacrebleu's ja-mecab, which ns's
     # metrics pip-install at run time (patched out; nemo_skills_g5.WMT24pp).
     "sacrebleu[ja]==2.6.0",
+    # browsecomp: the fetch_url tool's PDF text.
+    "pypdf>=5.0",
 ]
 # IFBench through NeMo-Skills (the `nemoskills` extra) plus the requirements of
 # allenai/IFBench's run_eval.py, which ns's ifbench evaluator runs from

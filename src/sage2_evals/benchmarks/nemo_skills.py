@@ -165,6 +165,8 @@ class NemoSkillsBenchmark(Benchmark):
 
     gold_answer_key: ClassVar[str] = "expected_answer"
     gold_judged: ClassVar[bool] = False
+    """Whether ``answers=gold`` runs a judge benchmark too: the reference answers
+    through the real judge, a check of the judge (expect ~100%)."""
 
     # -- options -----------------------------------------------------------
 
