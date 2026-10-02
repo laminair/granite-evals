@@ -68,7 +68,8 @@ def test_gold_disables_server(tmp_path):
 def test_gold_generation_formats(tmp_path):
     row = {"expected_answer": "C", "problem": "p"}
     assert bench("gpqa", tmp_path).gold_generation(row) == "Answer: C"
-    assert bench("mmlu-pro", tmp_path).gold_generation(row) == "Answer: C"
+    assert bench("mmlu-pro", tmp_path).gold_generation(row) == "\\boxed{C}"  # 5-shot CoT
+    assert bench("mmlu-pro", tmp_path, options={"shots": "0"}).gold_generation(row) == "Answer: C"
     assert bench("aime25", tmp_path).gold_generation({"expected_answer": "70"}) == "\\boxed{70}"
 
 
@@ -151,6 +152,37 @@ def test_module_generation_args(ns, tmp_path):
     assert arena.uses_judge() and not bench("aime25", tmp_path).uses_judge()
     assert arena.judge_module() == "nemo_skills.inference.eval.arena_judge"
     assert "++inference.top_p=null" in arena.judge_overrides()
+
+
+def test_mmlu_pro_shots(ns, tmp_path):
+    five = bench("mmlu-pro", tmp_path).generation_args([])
+    assert five[:2] == ["++prompt_config=generic/general-boxed", "++examples_type='{examples_type}'"]
+    assert "++eval_type=multichoice" in five and sum(a.startswith("++prompt_config=") for a in five) == 1
+    zero = bench("mmlu-pro", tmp_path, options={"shots": "0"}).generation_args([])
+    assert zero[0] == "++prompt_config=eval/aai/mcq-10choices" and not any("examples_type" in a for a in zero)
+    with pytest.raises(SystemExit, match="use 0 or 5"):
+        bench("mmlu-pro", tmp_path, options={"shots": "3"}).shots()
+
+
+def test_mmlu_pro_five_shot_prompt_is_ns_per_category(ns, tmp_path):
+    """The args reach ns as a per-row examples_type: Hydra keeps the string, and
+    ns fills the row's category's 5 validation CoT examples before the question."""
+    from hydra import compose, initialize
+    from nemo_skills.dataset.utils import get_mcq_fields
+    from nemo_skills.inference import generate  # noqa: F401  registers base_generation_config
+    from nemo_skills.prompt.few_shot_examples.mmlu_pro import examples_map
+    from nemo_skills.prompt.utils import get_prompt
+
+    args = bench("mmlu-pro", tmp_path).generation_args([])
+    with initialize(version_base=None):
+        cfg = compose(config_name="base_generation_config", overrides=[a for a in args if a.split("=")[0] in ("++prompt_config", "++examples_type")])
+    assert cfg.examples_type == "{examples_type}"
+    prompt = get_prompt(prompt_config=cfg.prompt_config, examples_type=cfg.examples_type)
+    row = {"examples_type": "mmlu_pro_few_shot_computer_science", **get_mcq_fields("What is 2+2?", ["3", "4"])}
+    text = prompt.fill(row)[-1]["content"]
+    shots = examples_map["mmlu_pro_few_shot_computer_science"]
+    assert len(shots) == 5 and all(s["solution"] in text for s in shots)
+    assert text.count("The answer is \\boxed{") == 5 and text.endswith("What is 2+2?\n\nA) 3\nB) 4")
 
 
 def _math_rows(tmp_path, name, correct):

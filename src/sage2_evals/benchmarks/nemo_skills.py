@@ -1080,8 +1080,25 @@ class GPQA(NemoSkillsBenchmark):
         return f"Answer: {row[self.gold_answer_key]}"
 
 
+MMLU_PRO_SHOTS = 5
+"""ns ships 5 CoT examples per MMLU-Pro category, so ``shots`` is 0 or 5."""
+
+MMLU_PRO_FEW_SHOT_ARGS = ("++prompt_config=generic/general-boxed", "++examples_type='{examples_type}'")
+"""ns's few-shot mechanism for MMLU-Pro: prepare.py writes each row's
+``examples_type`` (``mmlu_pro_few_shot_<category>``), ns formats it per row into
+the 5 examples of ``prompt/few_shot_examples/mmlu_pro.py`` (MMLU-Pro's validation
+split CoT, ending ``The answer is \\boxed{X}``), and ``generic/general-boxed``
+puts them before the question. The quotes keep Hydra from reading ``{...}`` as
+a dict (no shell here)."""
+
+
 @register
 class MMLUPro(NemoSkillsBenchmark):
+    """MMLU-Pro (12032), 5-shot CoT by default: ns's per-category validation-split
+    examples (``MMLU_PRO_FEW_SHOT_ARGS``), graded by ns's multichoice match on the
+    ``\\boxed{}`` letter. ``--option shots=0``: ns's default 0-shot prompt
+    (``eval/aai/mcq-10choices``, ``Answer: X``)."""
+
     id = "mmlu-pro"
     metric = "symbolic correct"
     default_repeats = 1
@@ -1090,7 +1107,24 @@ class MMLUPro(NemoSkillsBenchmark):
     dataset = "TIGER-Lab/MMLU-Pro"
     dataset_revision = "b189ec765aa7ed75c8acfea42df31fdae71f97be"
 
+    def shots(self) -> int:
+        n = self.opt("shots", MMLU_PRO_SHOTS)
+        if n not in (0, MMLU_PRO_SHOTS):
+            raise SystemExit(f"{self.id}: shots={n}: ns has {MMLU_PRO_SHOTS} examples per category; use 0 or {MMLU_PRO_SHOTS}")
+        return n
+
+    def generation_args(self, sandbox_args: list[str]) -> list[str]:
+        args = super().generation_args(sandbox_args)
+        if not self.shots():
+            return args
+        return [*MMLU_PRO_FEW_SHOT_ARGS, *(a for a in args if not a.startswith("++prompt_config="))]
+
+    def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
+        return {**super().run(base_url, served_model_name), "shots": self.shots()}
+
     def gold_generation(self, row: dict) -> str:
+        if self.shots():
+            return super().gold_generation(row)  # \boxed{X}
         return f"Answer: {row[self.gold_answer_key]}"
 
 
