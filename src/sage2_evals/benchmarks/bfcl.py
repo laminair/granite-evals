@@ -34,6 +34,13 @@ evaluation on those files, which replays multi-turn calls in BFCL's local
 simulators and never calls the model or web search. Every selected test id
 needs a result: BFCL itself refuses a full evaluation with missing ones (and
 silently drops them from a partial one), so a missing one fails the score phase.
+
+Repeats: one generation per test id only (``--repeats 1``). BFCL keeps one
+result per test id under one project root and its "Overall Acc" is a weighted
+mix of category accuracies from its own score files, so k samples would mean k
+BFCL runs and a re-implemented overall formula over them, i.e. a number BFCL
+does not define. ``details.pass_at_k`` is the k = 1 record (both values the
+headline) to keep results.json's shape.
 """
 
 from __future__ import annotations
@@ -51,7 +58,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from sage2_evals.registry import Benchmark, register
+from sage2_evals.registry import Benchmark, pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -101,7 +108,10 @@ class BFCLv4(Benchmark):
 
     def run(self, base_url: str, served_model_name: str) -> dict[str, Any]:
         if self.repeats != 1:
-            raise SystemExit("bfcl-v4 is a single-run metric; use --repeats 1")
+            raise SystemExit(
+                "bfcl-v4 is a single-run metric (one BFCL result per test id; Overall Acc is BFCL's weighted "
+                "mix of category scores, undefined over k samples); use --repeats 1"
+            )
         root = self.config.output_dir / "bfcl"
         root.mkdir(parents=True, exist_ok=True)
         categories = [c for c in self.opt("categories", "all_scoring").split(",") if c]
@@ -148,9 +158,10 @@ class BFCLv4(Benchmark):
         for cat, s in per_category.items():
             log.info("%s: %s accuracy=%.4f (%d/%d)", self.id, cat, s["accuracy"], s["correct_count"], s["total_count"])
         log.info("%s: overall_accuracy=%.4f", self.id, overall["overall"])
+        n = sum(s["total_count"] for s in per_category.values())
         return {
             "value": overall["overall"],
-            "n": sum(s["total_count"] for s in per_category.values()),
+            "n": n,
             "dataset": self.dataset,
             "dataset_revision": self.dataset_revision,
             "harness": f"{HARNESS}=={HARNESS_VERSION}",
@@ -159,6 +170,7 @@ class BFCLv4(Benchmark):
             "categories": categories,
             "partial": self.config.limit is not None,
             "groups": overall["groups"],
+            "pass_at_k": pass_at_k_record(1, overall["overall"], overall["overall"], n, "BFCL Overall Acc, one sample"),
             "per_category": per_category,
             "web_search_backend": {
                 "type": f"mcp:{SEARCH_TOOL}",

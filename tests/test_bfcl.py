@@ -195,6 +195,8 @@ def test_run_collects_child_results(tmp_path, monkeypatch):
     b = bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path / "out", limit=3, options={"temperature": "0.5"}))
     out = b.run("http://srv/v1", "m")
     assert out["value"] == pytest.approx(0.1234) and out["n"] == 3
+    pak = {"k": 1, "pass_at_1": pytest.approx(0.1234), "pass_at_k": pytest.approx(0.1234), "n": 3}
+    assert out["pass_at_k"] == {**pak, "how": "BFCL Overall Acc, one sample"}
     assert out["web_search_backend"]["url"] == bfcl.DEFAULT_SEARCH_MCP_URL
     assert out["per_category"]["simple_python"]["correct_count"] == 2
 
@@ -342,3 +344,11 @@ def test_child_score_phase_evaluates_saved_results_only(tmp_path, harness_env):
     subprocess.run(child, check=True)
     assert bfcl.read_category_scores(root / "score" / bfcl.REGISTRY_NAME)["simple_python"]["total_count"] == 1
     assert (root / "score" / "data_overall.csv").exists()
+
+
+def test_repeats_unsupported(tmp_path):
+    from sage2_evals.registry import RunConfig
+
+    b = bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path, repeats=2))
+    with pytest.raises(SystemExit, match="single-run metric"):
+        b.run("http://srv/v1", "m")
