@@ -20,7 +20,7 @@ make publish-image EXTRA=<family>   # -> us.icr.io/cil15-shared-registry/sage2-e
 | `bird` | `birdbench` |
 | `tau` | `tau3-*` |
 | `bfcl` | `bfcl-v4` |
-| `judged` | `gdpval`, `profbench` |
+| `judged` | `gdpval`, `profbench`, `mcpatlas` (also pulls `ghcr.io/scaleapi/mcp-atlas`) |
 | `nemoskills` | `aime25`, `hmmt-feb25`, `gpqa`, `mmlu-pro`, `arena-hard-v2`, `livecodebench-v6`, `scicode`, `ruler-*` |
 | `lmeval` | `mmlu-prox-lite` |
 | `ifbench` | `ifbench` |

@@ -43,6 +43,7 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `birdbench` | pass@1 execution match (NeMo-Skills protocol, no evidence) | `bird` |
 | `gdpval` | Elo. **Approximation, not GDPval-AA's Elo**: an Elo-style score from the pairwise LLM-judged win rate against the gold set's expert deliverables (expert = 1000); `details.elo_is_approximation` | `judged` |
 | `profbench` | overall (ProfBench report generation, lite, LLM-judged rubrics) | `judged` |
+| `mcpatlas` | pass rate (claim coverage >= 0.75). Default `subset=keyless`: the 30 of 500 tasks whose tools need no API key (`subset=all` needs 16 servers' keys); upstream's environment image + ported harness loop; claims judged by `aws/claude-sonnet-5`, not upstream's Gemini | `judged` |
 
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one). `arena-hard-v2` is judged by `aws/claude-sonnet-5` (IBM LiteLLM, metered), not the
