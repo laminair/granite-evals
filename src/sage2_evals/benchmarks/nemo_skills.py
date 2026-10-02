@@ -1,6 +1,6 @@
 """NVIDIA NeMo-Skills family (Sage2: AIME25, HMMT Feb25, GPQA, MMLU-Pro, Arena-Hard-V2, ...).
 
-The suite names these metrics the way NeMo-Skills reports them ("pass@1[avg-of-4]
+The suite names these metrics the way NeMo-Skills reports them ("pass@1
 symbolic correct", "judge_correct", ...), so NeMo-Skills (``ns``) is the harness:
 its own dataset preparation, prompts, generation loop, evaluators and metrics run
 unchanged. This module is only the glue that runs them *locally*, against the vLLM
@@ -25,6 +25,10 @@ server the step already started (no Slurm, no NeMo-Run cluster config):
 4. metrics: ns's ``ComputeMetrics`` over all repeats. ``value`` is
    ``metrics["_all_"][<aggregation>][<ns_metric>]`` scaled to a fraction; the
    full ns metrics dict (all aggregations, subsets) goes to ``details``.
+   ``details.pass_at_k`` (``registry.pass_at_k_record``) is ns's own
+   ``pass@1[avg-of-k]`` and ``pass@k`` of ``ns_metric`` over the k repeats
+   (default 1: pass@1 on one sample), ``details.metrics`` the
+   ``ns_report_metrics`` next to the headline, from the same aggregation.
 
 Everything is under ``<output_dir>`` and ns resumes a partial output file
 (``++skip_filled``), so granite.build retries resume. A failed request is a
@@ -46,8 +50,7 @@ Subclass ``NemoSkillsBenchmark`` and ``@register`` it; class attributes do the r
     @register
     class HMMTFeb25(NemoSkillsBenchmark):
         id = "hmmt-feb25"                       # the suite id
-        metric = "pass@1[avg-of-4] symbolic correct"  # the suite metric string
-        default_repeats = 4
+        metric = "pass@1 symbolic correct"      # the suite metric string
         ns_benchmark = "hmmt_feb25"             # dir in nemo_skills/dataset
         ns_metric = "symbolic_correct"          # key inside the ns aggregation
         dataset = "MathArena/hmmt_feb_2025"     # what prepare.py reads ...
@@ -62,6 +65,8 @@ Knobs (all optional; ``None`` / empty means "what the ns dataset module says"):
 - ``pinned_urls``: {url prepare.py fetches: (pinned url, sha256)}.
 - ``prepared_sha256``: expected sha256 of the prepared ``<split>.jsonl``.
 - ``ns_aggregation``: default ``pass@1[avg-of-<repeats>]`` (``pass@1`` if 1).
+- ``ns_report_metrics``: other keys of that aggregation reported in
+  ``details.metrics`` (scaled like the value), e.g. IFBench's strict accuracy.
 - ``ns_metrics_type`` / ``ns_metrics_kwargs``: ns METRICS_TYPE override + kwargs.
 - ``value_scale``: ns reports percentages; 0.01 turns them into fractions.
 - ``ns_generation_args``: extra ``++key=value`` generation overrides (after the
@@ -108,7 +113,7 @@ from typing import Any, ClassVar, Iterator
 import httpx
 
 from sage2_evals import data
-from sage2_evals.registry import Benchmark, failure_policy, register
+from sage2_evals.registry import Benchmark, failure_policy, pass_at_k_record, register
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +144,7 @@ class NemoSkillsBenchmark(Benchmark):
     prepared_sha256: ClassVar[str | None] = None
 
     ns_metric: ClassVar[str] = "symbolic_correct"
+    ns_report_metrics: ClassVar[tuple[str, ...]] = ()
     ns_aggregation: ClassVar[str | None] = None
     ns_metrics_type: ClassVar[str | None] = None
     ns_metrics_kwargs: ClassVar[dict[str, Any]] = {}
@@ -332,6 +338,7 @@ class NemoSkillsBenchmark(Benchmark):
             raw = metrics["_all_"][agg][key]
         except KeyError:
             raise RuntimeError(f"{self.id}: ns metrics have no [_all_][{agg}][{key}]: {_keys(metrics)}") from None
+        reported = {m: _scaled(metrics["_all_"][agg].get(m), self.value_scale) for m in (key, *self.ns_report_metrics)}
         per_repeat = []
         for k, f in enumerate(files):
             m = self.compute_metrics([f])["_all_"].get("pass@1", {})
@@ -350,12 +357,22 @@ class NemoSkillsBenchmark(Benchmark):
             "answers": "gold" if self.gold else "model",
             "sampling": self.sampling(),
             "generation_args": self.generation_args(sandbox_args=[]),
+            "metrics": reported,
+            "pass_at_k": self.pass_at_k(metrics, len(rows)),
             "per_repeat": per_repeat,
             "statuses": _merge_counts(r["statuses"] for r in per_repeat),
             "generation_tokens": _token_stats(gen_dir, self.repeats),
             **judge_details,
             "ns_metrics": _jsonable(metrics),
         }
+
+    def pass_at_k(self, metrics: dict[str, Any], n: int) -> dict[str, Any]:
+        """ns's ``pass@1[avg-of-k]`` and ``pass@k`` of ``ns_metric`` (k = repeats;
+        for k = 1 both are ns's pass@1)."""
+        k, agg = self.repeats, metrics.get("_all_", {})
+        p1 = agg.get(f"pass@1[avg-of-{k}]" if k > 1 else "pass@1", {}).get(self.ns_metric)
+        pk = agg.get(f"pass@{k}", {}).get(self.ns_metric)
+        return pass_at_k_record(k, _scaled(p1, self.value_scale), _scaled(pk, self.value_scale), n, "ns metrics")
 
     def _write_input(self, input_file: Path, rows: list[dict]) -> None:
         """The generation input; the score phase only checks that it is what was generated."""
@@ -1045,8 +1062,7 @@ class AIME25(NemoSkillsBenchmark):
     """AIME 2025 I+II (30 problems), shipped in the ns repo (dataset/aime25/test.txt)."""
 
     id = "aime25"
-    metric = "pass@1[avg-of-4] symbolic correct"
-    default_repeats = 4
+    metric = "pass@1 symbolic correct"
     ns_benchmark = "aime25"
     dataset = f"{NS_REPO}/tree/{NS_COMMIT}/nemo_skills/dataset/aime25"
     dataset_revision = NS_COMMIT
@@ -1056,8 +1072,7 @@ class AIME25(NemoSkillsBenchmark):
 @register
 class HMMTFeb25(NemoSkillsBenchmark):
     id = "hmmt-feb25"
-    metric = "pass@1[avg-of-4] symbolic correct"
-    default_repeats = 4
+    metric = "pass@1 symbolic correct"
     ns_benchmark = "hmmt_feb25"
     dataset = "MathArena/hmmt_feb_2025"
     dataset_revision = "6fdc4277120810ff75aa22d2d5489b91f7a262a1"
@@ -1068,8 +1083,7 @@ class GPQA(NemoSkillsBenchmark):
     """GPQA Diamond (198), ns's 4-choice prompt; choices shuffled with ns's seed 42."""
 
     id = "gpqa"
-    metric = "pass@1[avg-of-2] symbolic correct"
-    default_repeats = 2
+    metric = "pass@1 symbolic correct"
     ns_benchmark = "gpqa"
     ns_split = "diamond"
     ns_prepare_args = ("--split", "diamond")
@@ -1100,7 +1114,7 @@ class MMLUPro(NemoSkillsBenchmark):
     (``eval/aai/mcq-10choices``, ``Answer: X``)."""
 
     id = "mmlu-pro"
-    metric = "symbolic correct"
+    metric = "5-shot CoT symbolic correct"
     default_repeats = 1
     ns_benchmark = "mmlu-pro"
     ns_prepare_args = ("--split", "test")

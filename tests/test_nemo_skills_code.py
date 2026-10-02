@@ -16,8 +16,8 @@ from sage2_evals.benchmarks import scicode_prefill as scp
 from sage2_evals.registry import RunConfig
 
 IDS = {
-    "livecodebench-v6": ("pass@1[avg-of-2] accuracy", 2, "accuracy"),
-    "scicode": ("pass@1[avg-of-2] subtask accuracy", 2, "subtask_accuracy"),
+    "livecodebench-v6": ("pass@1 accuracy", 1, "accuracy"),
+    "scicode": ("pass@1 subtask accuracy", 1, "subtask_accuracy"),
 }
 
 
@@ -424,7 +424,7 @@ def _scicode_split(tmp_path, monkeypatch, phase, events):
     monkeypatch.setattr(nsc.SciCode, "ns_sandbox", fake_sandbox)
     monkeypatch.setattr(nsc.SciCode, "sandbox_report", lambda self, rows: events.append(("report",)) or {"ok": True})
     monkeypatch.setattr(nsb.NemoSkillsBenchmark, "_evaluate", fake_evaluate)
-    b = bench("scicode", tmp_path, phase=phase)
+    b = bench("scicode", tmp_path, phase=phase, repeats=2)
     monkeypatch.setattr(b, "prepare_data", lambda: (prepared, {"sha256": "x"}))
     return b.run("http://127.0.0.1:9/v1" if phase != "score" else "", "m")
 

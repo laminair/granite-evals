@@ -11,10 +11,10 @@ from sage2_evals.benchmarks import nemo_skills as nsb
 from sage2_evals.registry import RunConfig
 
 IDS = {
-    "aime25": ("pass@1[avg-of-4] symbolic correct", 4),
-    "hmmt-feb25": ("pass@1[avg-of-4] symbolic correct", 4),
-    "gpqa": ("pass@1[avg-of-2] symbolic correct", 2),
-    "mmlu-pro": ("symbolic correct", 1),
+    "aime25": ("pass@1 symbolic correct", 1),
+    "hmmt-feb25": ("pass@1 symbolic correct", 1),
+    "gpqa": ("pass@1 symbolic correct", 1),
+    "mmlu-pro": ("5-shot CoT symbolic correct", 1),
     "arena-hard-v2": ("win rate", 1),
 }
 
@@ -56,8 +56,8 @@ def test_passthrough_options():
 
 
 def test_aggregation_follows_repeats(tmp_path):
-    assert bench("aime25", tmp_path).aggregation() == "pass@1[avg-of-4]"
-    assert bench("aime25", tmp_path, repeats=1).aggregation() == "pass@1"
+    assert bench("aime25", tmp_path).aggregation() == "pass@1"  # one sample by default
+    assert bench("aime25", tmp_path, repeats=4).aggregation() == "pass@1[avg-of-4]"
 
 
 def test_gold_disables_server(tmp_path):
@@ -201,6 +201,9 @@ def test_ns_math_metrics_map_to_value(ns, tmp_path):
     m = b.compute_metrics(files)
     assert m["_all_"][b.aggregation()]["symbolic_correct"] == pytest.approx(75.0)
     assert m["_all_"]["pass@2"]["symbolic_correct"] == pytest.approx(100.0)
+    assert b.pass_at_k(m, 2) == {"k": 2, "pass_at_1": 0.75, "pass_at_k": 1.0, "n": 2, "how": "ns metrics"}
+    one = bench("aime25", tmp_path)
+    assert one.pass_at_k(one.compute_metrics(files[:1]), 2) == {"k": 1, "pass_at_1": 0.5, "pass_at_k": 0.5, "n": 2, "how": "ns metrics"}
 
 
 def _arena_file(tmp_path, verdicts):
@@ -233,6 +236,8 @@ def test_aime25_gold_end_to_end_and_resume(ns, tmp_path):
     b = bench("aime25", tmp_path, limit=3, repeats=2, workers=3, options={"answers": "gold"})
     r = b.run("", "")
     assert (r["value"], r["n"]) == (1.0, 3)
+    assert r["pass_at_k"] == {"k": 2, "pass_at_1": 1.0, "pass_at_k": 1.0, "n": 3, "how": "ns metrics"}
+    assert r["metrics"] == {"symbolic_correct": 1.0}
     assert r["data_provenance"]["sha256"] == nsb.AIME25.prepared_sha256
     assert r["statuses"] == {"stop": 6}
     gen = tmp_path / "generation" / "output-rs0.jsonl"

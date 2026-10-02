@@ -122,8 +122,7 @@ from both platforms."""
 @register
 class LiveCodeBenchV6(NemoSkillsBenchmark):
     id = "livecodebench-v6"
-    metric = "pass@1[avg-of-2] accuracy"
-    default_repeats = 2
+    metric = "pass@1 accuracy"
     ns_benchmark = "livecodebench"
     ns_split = "test_v6_2408_2505"
     ns_prepare_args = ("--release_version", "v6", "--start_date", "2024-08", "--end_date", "2025-05", "--keep_all_columns")
@@ -181,8 +180,7 @@ def sandbox_env(python: Path) -> dict[str, str]:
 @register
 class SciCode(NemoSkillsBenchmark):
     id = "scicode"
-    metric = "pass@1[avg-of-2] subtask accuracy"
-    default_repeats = 2
+    metric = "pass@1 subtask accuracy"
     ns_benchmark = "scicode"
     ns_metric = "subtask_accuracy"
     dataset = SCICODE_DATASET
