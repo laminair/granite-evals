@@ -596,7 +596,11 @@ class IFBench(NemoSkillsBenchmark):
     pins, see docker/extras/ifbench.sh) and ns's ``if`` metrics. The value is
     the prompt-level loose accuracy (a prompt counts if all its instructions
     are followed by the response or one of IFBench's loose variants of it:
-    first/last line or markdown ``*`` removed), mean over 2 generations.
+    first/last line or markdown ``*`` removed), pass@1 on one generation (mean
+    over k with ``--repeats k``). ``details.metrics`` adds, from the same ns
+    aggregation, the prompt-level strict accuracy (the response itself must
+    follow every instruction) and the instruction-level loose and strict
+    accuracies (the fraction of all instructions followed).
 
     Splits like every NeMo-Skills benchmark: ``--phase generate`` writes the
     responses, ``--phase score`` runs the verifiers on them (CPU only).
@@ -604,12 +608,12 @@ class IFBench(NemoSkillsBenchmark):
     No gold mode: IFBench has no reference responses."""
 
     id = "ifbench"
-    metric = "pass@1[avg-of-2] loose accuracy"
-    default_repeats = 2
+    metric = "pass@1 prompt loose / strict accuracy"
     extra = "ifbench"
     harness_packages = ("nemo-skills", "litellm", "spacy", "nltk", "syllapy", "emoji", "langdetect")
     ns_benchmark = "ifbench"
     ns_metric = "prompt_loose_accuracy"
+    ns_report_metrics = ("prompt_strict_accuracy", "instruction_loose_accuracy", "instruction_strict_accuracy")
     dataset = f"https://github.com/allenai/IFBench/blob/{IFBENCH_DATA_COMMIT}/data/IFBench_test.jsonl"
     dataset_revision = IFBENCH_DATA_COMMIT
     # ns prepare's test.jsonl from the pinned data (BV job 1956210, image ifbench:952082c).

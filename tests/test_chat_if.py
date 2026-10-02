@@ -459,10 +459,12 @@ def test_ifbench_registered_and_pinned(tmp_path):
 
     cls = get("ifbench")
     assert cls is chat_if.IFBench
-    assert cls.metric == "pass@1[avg-of-2] loose accuracy" and cls.default_repeats == 2
+    assert cls.metric == "pass@1 prompt loose / strict accuracy" and cls.default_repeats == 1
     assert cls.extra == "ifbench" and cls.ns_metric == "prompt_loose_accuracy"
+    assert cls.ns_report_metrics == ("prompt_strict_accuracy", "instruction_loose_accuracy", "instruction_strict_accuracy")
     b = cls(RunConfig(model="m", output_dir=tmp_path))
-    assert b.repeats == 2 and b.aggregation() == "pass@1[avg-of-2]"
+    assert b.repeats == 1 and b.aggregation() == "pass@1"
+    assert cls(RunConfig(model="m", output_dir=tmp_path, repeats=2)).aggregation() == "pass@1[avg-of-2]"
     assert b.pins() == {}  # a GitHub file, pinned by URL + sha256, not an HF repo
     pinned, sha = cls.pinned_urls[chat_if.IFBENCH_TEST_URL]
     assert chat_if.IFBENCH_DATA_COMMIT in pinned and len(sha) == 64
@@ -506,7 +508,7 @@ def _if_rows(path, loose, strict):
 
 def test_ifbench_value_is_prompt_loose_accuracy_avg_of_2(tmp_path):
     pytest.importorskip("nemo_skills")
-    b = chat_if.IFBench(RunConfig(model="m", output_dir=tmp_path))
+    b = chat_if.IFBench(RunConfig(model="m", output_dir=tmp_path, repeats=2))
     files = [
         _if_rows(tmp_path / "output-rs0.jsonl", [[True, True], [True, False]], [[True, False], [False, False]]),
         _if_rows(tmp_path / "output-rs1.jsonl", [[True, True], [True, True]], [[True, True], [False, False]]),
@@ -515,6 +517,9 @@ def test_ifbench_value_is_prompt_loose_accuracy_avg_of_2(tmp_path):
     assert m["prompt_loose_accuracy"] == pytest.approx(75.0)  # (1/2 + 2/2) / 2
     assert m["prompt_strict_accuracy"] == pytest.approx(25.0)
     assert m["instruction_loose_accuracy"] == pytest.approx(87.5)
+    assert m["instruction_strict_accuracy"] == pytest.approx(37.5)
+    # pass@2: a prompt counts if either generation followed all its instructions
+    assert b.pass_at_k(b.compute_metrics(files), 2) == {"k": 2, "pass_at_1": 0.75, "pass_at_k": 1.0, "n": 2, "how": "ns metrics"}
 
 
 def test_ifbench_puts_the_pinned_nltk_data_first(tmp_path, monkeypatch):
@@ -562,15 +567,22 @@ def test_ifbench_generate_then_score(tmp_path, monkeypatch):
     pytest.importorskip("nemo_skills")
     monkeypatch.setenv("NLTK_DATA", "/elsewhere")
     g = _ifbench_phase(tmp_path, monkeypatch, "generate", events := [])
-    assert g["n"] == 2 and "value" not in g and events == [("generate", "++eval_type=null")] * 2
+    assert g["n"] == 2 and "value" not in g and events == [("generate", "++eval_type=null")]
     assert os.environ["NLTK_DATA"] == "/elsewhere"  # only scoring needs the pinned nltk data
     s = _ifbench_phase(tmp_path, monkeypatch, "score", events := [])
     graded = ("evaluate", ["++eval_type=ifbench"], chat_if.IFBENCH_NLTK_DATA)
-    assert events == [graded, graded] and (s["value"], s["n"]) == (pytest.approx(0.5), 2)
+    assert events == [graded] and (s["value"], s["n"]) == (pytest.approx(0.5), 2)
+    assert s["metrics"] == {
+        "prompt_loose_accuracy": 0.5,
+        "prompt_strict_accuracy": 0.5,
+        "instruction_loose_accuracy": 0.5,
+        "instruction_strict_accuracy": 0.5,
+    }
+    assert s["pass_at_k"]["k"] == 1 and s["pass_at_k"]["pass_at_k"] == pytest.approx(0.5)
     assert _ifbench_phase(tmp_path, monkeypatch, "score", events := [])["value"] == pytest.approx(0.5)
     assert events == []  # re-scored from the graded files
-    (tmp_path / "generation" / "output-rs1.jsonl").unlink()
-    with pytest.raises(RuntimeError, match="no generation for repeat 1"):
+    (tmp_path / "generation" / "output-rs0.jsonl").unlink()
+    with pytest.raises(RuntimeError, match="no generation for repeat 0"):
         _ifbench_phase(tmp_path, monkeypatch, "score", [])
 
 
