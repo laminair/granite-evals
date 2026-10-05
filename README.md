@@ -192,8 +192,7 @@ Tags are the git short SHA. Pin that tag in the granite.build recipe.
 
 [docs/bluevela.md](docs/bluevela.md) covers image families, direct BlueVela runs
 (`scripts/bv-smoke.sh`, secrets, gold checks). Favored configs per benchmark are in
-granite.build's `recipes/sage2/lsf/eval-granite42/README.md` (that fork's step/recipe
-directories still use the pre-rename `sage2-*` names pending a follow-up update there).
+granite.build's `recipes/granite-evals/lsf/eval-granite42/README.md`.
 
 ## Adding a benchmark
 
@@ -201,6 +200,5 @@ directories still use the pre-rename `sage2-*` names pending a follow-up update 
    module there is registered automatically). Import the harness inside methods,
    and add it to an optional extra of its own.
 2. Pin the upstream dataset on the class: `dataset` and `dataset_revision`.
-3. Copy `steps/sage2-swebench-verified` in granite.build to `steps/sage2-<id>` (that fork's
-   step names are still pre-rename pending a follow-up there). Change
+3. Copy `steps/granite-swebench-verified` in granite.build to `steps/granite-<id>`. Change
    the name, `BENCHMARK` and the defaults, then add a target to the suite recipes.

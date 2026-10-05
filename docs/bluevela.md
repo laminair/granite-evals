@@ -1,7 +1,6 @@
 # Running on BlueVela
 
-Normal runs go through granite.build: the `recipes/sage2/lsf/eval-granite42` recipe
-(that fork's recipe directory still uses the pre-rename `sage2` name pending a follow-up there),
+Normal runs go through granite.build: the `recipes/granite-evals/lsf/eval-granite42` recipe,
 whose README lists the secrets, the gold checks and the favored config of every
 benchmark. This page covers the other two paths: building images and running one
 image directly on BlueVela with `scripts/bv-smoke.sh` (smokes, gold checks, debugging).
