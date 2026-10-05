@@ -22,12 +22,14 @@ GDPval (metric "Elo")
     of Artificial Analysis' GDPval-AA) with a code-exec tool in a sage2 sandbox
     holding the task's reference files; its deliverable files are compared
     pairwise, in both orders, with the expert deliverable by the judge. GDPval-AA's
-    judge prompt, judge panel and reference submissions are not public, so its
-    Elo cannot be reproduced: ``value`` is an Elo-style score derived from the
-    win rate against the expert (expert = ``elo_anchor``), flagged as an
-    approximation in results.json (``details.elo_is_approximation``,
-    ``details.metric_note``) and in the log. It is relative (the expert sits
-    at the anchor), not on the scale of IBM's published Granite GDPval numbers.
+    judge prompt and reference submissions are not public, so its Elo cannot be
+    reproduced here; the actual IBM BlueVela run judged with gemini-3.1-pro-preview
+    (per gbansible), not this benchmark's default judge (Claude Sonnet 5 on IBM's
+    gateway). ``value`` is an Elo-style score derived from the win rate against the
+    expert (expert = ``elo_anchor``), flagged as an approximation in results.json
+    (``details.elo_is_approximation``, ``details.metric_note``) and in the log. It
+    is relative (the expert sits at the anchor), not on the scale of IBM's
+    published Granite GDPval numbers.
 
 Both judge one response per task (``--repeats 1``); ``details.pass_at_k`` is
 the k = 1 record (GDPval: the win rate, no pass@k).
@@ -781,8 +783,10 @@ class ProfBench(JudgedBenchmark):
 # ---------------------------------------------------------------------------
 
 GDPVAL_METRIC_NOTE = (
-    "APPROXIMATION, not GDPval-AA Elo: GDPval-AA's judge prompt, judge panel and reference "
-    "submissions are not public. This is an Elo-style score from the pairwise win rate "
+    "APPROXIMATION, not GDPval-AA Elo: GDPval-AA's judge prompt and reference "
+    "submissions are not public (the actual IBM BlueVela run judged with "
+    "gemini-3.1-pro-preview, per gbansible, not this benchmark's default judge). This is an "
+    "Elo-style score from the pairwise win rate "
     "(ties = 0.5, both presentation orders) of the model's deliverables against the expert "
     "deliverables of the GDPval gold set, judged by {judge}: elo = anchor + 400*log10(p/(1-p)) "
     "with the expert at anchor={anchor} and p smoothed as (score+0.5)/(n+1). Not comparable "
@@ -1112,7 +1116,7 @@ class GDPval(JudgedBenchmark):
       judge_thinking, judge_effort, judge_extra_body
                                   provider thinking fields (JudgedBenchmark.judge_extra_body)
       judge_orders=2             1 = model as A only; 2 = both orders
-      elo_anchor=1000             Elo-style value of the expert
+      elo_anchor=1290             Elo-style value of the expert
       max_failed_frac=0.05        fail the run above this fraction of failed tasks (0 = any)
 
     A task whose agent, sandbox or judge call raised (error:*), or whose judge
@@ -1382,7 +1386,7 @@ class GDPval(JudgedBenchmark):
         if total and not n:
             raise SystemExit("gdpval: no task was graded")
         score = sum(r["score"] for r in graded)
-        anchor = self.opt("elo_anchor", 1000.0)
+        anchor = self.opt("elo_anchor", 1290.0)
         usage = [u for r in reports for u in r.get("judge_usage", [])]
         judged = [r for r in reports if r["status"] == "judged"]
         elo = elo_style(score, n, anchor)

@@ -649,7 +649,7 @@ def test_gdpval_expert_vs_expert_is_even_and_flagged(tmp_path, monkeypatch, gdp_
     assert not bench.needs_server()
     with caplog.at_level(logging.WARNING):
         out = bench.run("", "none")
-    assert out["value"] == pytest.approx(1000) and out["win_rate"] == 0.5 and out["n"] == 1
+    assert out["value"] == pytest.approx(1290) and out["win_rate"] == 0.5 and out["n"] == 1
     assert out["elo_is_approximation"] is True and "APPROXIMATION" in out["metric_note"]
     assert "IBM's published" in out["metric_note"]
     assert out["pass_at_k"] == {"k": 1, "pass_at_1": 0.5, "pass_at_k": None, "n": 1,
@@ -678,7 +678,7 @@ def test_gdpval_model_run_judges_both_orders_and_resumes(tmp_path, monkeypatch, 
     judge = fake_judge(model_prefers("MODEL memo"))
     out = make_gdp(tmp_path, monkeypatch, gdp_env, judge).run("http://p/v1", "s")
     assert agents == [("t1", ["input.txt"])]
-    assert out["win_rate"] == 1.0 and out["value"] == pytest.approx(jg.elo_style(1, 1, 1000), abs=0.1)
+    assert out["win_rate"] == 1.0 and out["value"] == pytest.approx(jg.elo_style(1, 1, 1290), abs=0.1)
     assert out["position_consistency"] == 1.0 and len(judge._client.requests) == 2
     report = json.loads((tmp_path / "run/tasks/t1/report.json").read_text())
     assert report["verdicts"] == [1.0, 1.0] and report["agent"]["turns"] == 3
@@ -695,7 +695,7 @@ def test_gdpval_no_submission_is_a_loss_without_a_judge_call(tmp_path, monkeypat
     monkeypatch.setattr(jg.GDPval, "_agent", gave_up)
     judge = fake_judge(lambda r: pytest.fail("no judge call"))
     out = make_gdp(tmp_path, monkeypatch, gdp_env, judge, tasks="t1").run("http://p/v1", "s")
-    assert out["statuses"] == {"no_submission": 1} and out["win_rate"] == 0.0 and out["value"] < 1000
+    assert out["statuses"] == {"no_submission": 1} and out["win_rate"] == 0.0 and out["value"] < 1290
 
 
 def test_gdpval_broken_task_does_not_sink_the_run(tmp_path, monkeypatch, gdp_env):
@@ -815,7 +815,7 @@ def test_gdpval_expert_gold_in_both_phases(tmp_path, monkeypatch, gdp_env):
     score = make_gdp(tmp_path, monkeypatch, gdp_env, judge, deliverables="expert")
     score.config.phase = "score"
     out = score.run("", "none")
-    assert out["value"] == pytest.approx(1000) and out["n"] == 1 and len(judge._client.requests) == 2
+    assert out["value"] == pytest.approx(1290) and out["n"] == 1 and len(judge._client.requests) == 2
     assert jg.GDPval(RunConfig(model="m", output_dir=tmp_path, options={"judge_model": "self"})).score_needs_server()
 
 

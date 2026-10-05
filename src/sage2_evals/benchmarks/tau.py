@@ -12,8 +12,9 @@ the harness's ``user_simulator`` on an OpenAI-compatible endpoint
 uses the served model). Retail's NL-assertion checks call an LLM judge, which
 the harness hard-codes to gpt-4.1; here it is ``judge_*`` (same pattern).
 Both default to aws/claude-sonnet-5 on IBM's gateway, not the harness's
-gpt-4.1 (user simulator and NL judge), so scores are not directly comparable
-with published τ³ numbers.
+gpt-4.1 default nor the actual official judge/user-sim (Azure gpt-4o-ncf,
+confirmed via gbansible's litellm cost-shim logs), so scores are not
+directly comparable with published τ³ numbers.
 
 Metric, per domain: the harness's pass^1, i.e. the mean over tasks of the
 fraction of trials with reward 1 (``tau2.metrics.agent_metrics``). The

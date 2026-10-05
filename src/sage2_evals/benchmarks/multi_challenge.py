@@ -22,7 +22,7 @@ averaged per axis, then over axes; ``details.pass_at_k`` is upstream's own
 score over those k attempts (a question passes if any attempt does).
 
 Deviations (``details.deviations``): judge Claude Sonnet 5 via the gateway
-instead of gpt-4o-2024-08-06; judge failures (errors, refusals, unparseable
+instead of gemini-3.1-flash-lite (gemini-3.1-pro fallback); judge failures (errors, refusals, unparseable
 verdicts) and generation errors are recorded failures left out of the score
 (upstream counts them as NO), bounded by ``max_failed_frac``; an empty final
 answer fails without a judge call.
@@ -160,7 +160,7 @@ class MultiChallenge(ResponseJudgedBenchmark):
     metric_note = ("value = pass@1[avg-of-k] (k = repeats, default 1): per-question pass rate, mean per axis, "
                    "unweighted mean over the 4 axes (upstream result_parser); pass_at_k = any attempt passes")
     deviations = (
-        "judge Claude Sonnet 5 via the gateway instead of gpt-4o-2024-08-06",
+        "judge Claude Sonnet 5 via the gateway instead of gemini-3.1-flash-lite (gemini-3.1-pro fallback)",
         "judge failures and generation errors are recorded failures left out of the score "
         "(upstream counts them as NO), bounded by max_failed_frac",
         "an empty final answer fails without a judge call",

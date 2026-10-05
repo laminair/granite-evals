@@ -219,9 +219,10 @@ class HLETools(ToolBenchmark):
     web search. Gated on HF (``HF_TOKEN`` with access to cais/hle).
 
     The judge is ns's ``judge/hle`` (the official HLE judge prompt) with
-    claude-sonnet-5 instead of o3-mini (the HLE leaderboard / ns default; NVIDIA's
-    "HLE with tools" numbers use gpt-4o). A judgement without a yes/no verdict is
-    re-judged (``max_judge_invalid_frac``), not counted wrong as ns would."""
+    Azure/gpt-4o-ncf, IBM's actual official judge (per gbansible/Alexei Karve),
+    not the HLE leaderboard/ns default (o3-mini) nor NVIDIA's "HLE with tools"
+    judge (gpt-4o). A judgement without a yes/no verdict is re-judged
+    (``max_judge_invalid_frac``), not counted wrong as ns would."""
 
     id = "hle-tools"
     metric = "pass@1 judge_correct"
@@ -233,8 +234,12 @@ class HLETools(ToolBenchmark):
     dataset = "cais/hle"  # gated
     dataset_revision = "5a81a4c7271a2a2a312b9a690f0c2fde837e4c29"
     official_judge = (
-        "o3-mini-2025-01-31 (HLE leaderboard, ns default); gpt-4o (Artificial Analysis / NVIDIA HLE with tools)"
+        "o3-mini-2025-01-31 (HLE leaderboard, ns default); gpt-4o (Artificial Analysis / NVIDIA HLE with tools); "
+        "Azure/gpt-4o-ncf (IBM's actual official judge, per gbansible/Alexei Karve)"
     )
+    # judge_model/judge_base_url overrides pending team sign-off on switching
+    # the actual runtime judge to Azure/gpt-4o-ncf; shared Sonnet-5 default
+    # stays in effect for now.
     gold_judged = True
     default_tools = ("python", "search")
     blocked_url_patterns = (

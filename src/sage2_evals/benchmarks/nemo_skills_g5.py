@@ -12,12 +12,16 @@ What is common here (``_G5``):
 * Only post-thinking text is scored. vLLM's reasoning parser puts the thinking in
   ``reasoning_content``; a ``<think>`` or ``</think>`` left in a scored
   ``generation`` (no reasoning parser) fails the run, as for RULER.
-* LLM judges (hle, omniscience, aa-lcr) are ns's judge prompts with the Sage2
-  judge: ``aws/claude-sonnet-5`` on the IBM LiteLLM gateway, temperature 0,
-  through the spend meter, as for arena-hard-v2 (``official_judge`` records the
-  judge ns / the benchmark authors use; this is a documented deviation). A
-  judgement ns cannot parse is left out of the score (``registry.failure_policy``:
-  counted in ``judge_invalid``, re-judged on resume, fatal above
+* LLM judges (hle, omniscience, aa-lcr) are ns's judge prompts, temperature 0,
+  through the spend meter. aa-lcr uses the Sage2 default judge
+  (``aws/claude-sonnet-5`` on the IBM LiteLLM gateway), as for arena-hard-v2;
+  hle and omniscience use their own confirmed-official judge instead
+  (``judge_model_default`` / ``judge_base_url_default`` on the class, see
+  ``nemo_skills.judge_endpoint``), not the shared default (``official_judge``
+  records the judge ns / the benchmark authors use; still a documented
+  deviation where it isn't an exact match). A judgement ns cannot parse is
+  left out of the score (``registry.failure_policy``: counted in
+  ``judge_invalid``, re-judged on resume, fatal above
   ``max_judge_invalid_frac``), where ns would score it wrong.
 * ``--option answers=gold`` (where reference answers exist) serves them through
   the same ns generate path and then the *real* judge (or COMET), so it checks
@@ -26,7 +30,11 @@ What is common here (``_G5``):
 HLE (``hle``)
     ``cais/hle`` (gated: HF_TOKEN), ns's ``text`` split (the questions without an
     image), ns's HLE answer-format prompt, ns's HLE judge prompt; ns metric
-    ``judge_correct``. Official judge: o3-mini-2025-01-31.
+    ``judge_correct``. Judge: Azure/gpt-4o-ncf, IBM's actual official judge (per
+    gbansible/Alexei Karve) via the IBM LiteLLM gateway, keyed the same as the
+    shared Sage2 judge default (``SAGE2_JUDGE_API_KEY``) since it's the same
+    gateway (the HLE leaderboard's own default is o3-mini-2025-01-31; see
+    ``official_judge``).
 
 AA-Omniscience (``omniscience``, ``omniscience-hallucination``)
     ``ArtificialAnalysis/AA-Omniscience-Public`` (600 questions), ns's ``text``
@@ -35,8 +43,10 @@ AA-Omniscience (``omniscience``, ``omniscience-hallucination``)
     ``omniscience-hallucination`` reports ``judge_omni_hallucination`` = incorrect /
     (all not correct), lower is better. ns's ``++parse_reasoning=True`` is turned
     off: the server already strips the thinking, and ns would blank every answer
-    without a ``</think>``. ``omniscience-hallucination`` with
-    ``--option generations_from=<omniscience output dir>`` scores that run's
+    without a ``</think>``. Judge: gpt-oss-20b via NVIDIA's API
+    (Nemo-Gym's official judge; needs ``NVIDIA_API_KEY``), not the shared
+    Sage2 default. 8 repeats by default (Nemo-Gym). ``omniscience-hallucination``
+    with ``--option generations_from=<omniscience output dir>`` scores that run's
     generations and judgements (copied in, nothing regenerated or re-judged unless
     invalid); without it, it is a full run of its own.
 
@@ -127,6 +137,12 @@ COMET_ENCODER_FILES = (
 
 THINK_TAGS = ("<think>", "</think>")
 
+NVIDIA_JUDGE_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_JUDGE_MODEL = "openai/gpt-oss-20b"
+NVIDIA_JUDGE_API_KEY_ENV = "NVIDIA_API_KEY"
+"""Nemo-Gym's official Omniscience judge: gpt-oss-20b via NVIDIA's API, a
+different gateway than the shared IBM LiteLLM JUDGE_BASE_URL."""
+
 
 class _G5(NemoSkillsBenchmark):
     """The shared Granite 5 behaviour (module doc)."""
@@ -193,7 +209,10 @@ class HLE(_Judged):
     ns_metric = "judge_correct"
     dataset = HLE_DATASET  # gated: needs HF_TOKEN
     dataset_revision = HLE_REVISION
-    official_judge = "o3-mini-2025-01-31 (HLE; NeMo-Skills default)"
+    official_judge = "o3-mini-2025-01-31 (HLE leaderboard, NeMo-Skills default); Azure/gpt-4o-ncf (IBM's actual official judge, per gbansible/Alexei Karve)"
+    # judge_model/judge_base_url overrides pending team sign-off on switching
+    # the actual runtime judge to Azure/gpt-4o-ncf; shared Sonnet-5 default
+    # stays in effect for now.
 
     def judge_valid(self, judgement: str) -> bool:
         from nemo_skills.evaluation.metrics.utils import is_correct_judgement
@@ -215,12 +234,17 @@ class Omniscience(_Judged):
     ns_split = "text"
     ns_prepare_args = ("--splits", "text")
     ns_metric = "judge_correct"
+    default_repeats = 8
+    """Nemo-Gym's official repeat count."""
     # The server strips the thinking; ns's parse_reasoning would blank every
     # generation without a "</think>".
     ns_generation_args = ("++parse_reasoning=False",)
     dataset = OMNI_DATASET
     dataset_revision = OMNI_REVISION
-    official_judge = "gemini-2.5-flash-preview-09-2025 (NeMo-Skills default; AA's Omniscience judge)"
+    official_judge = "gpt-oss-20b via NVIDIA API (Nemo-Gym's official judge)"
+    # judge_model/judge_base_url/judge_api_key_env overrides pending team
+    # sign-off on provisioning NVIDIA_API_KEY and switching the runtime
+    # judge; shared Sonnet-5 default stays in effect for now.
 
     def judge_valid(self, judgement: str) -> bool:
         # ns's OmniMetrics: the stripped judgement is exactly one of a/b/c/d.
@@ -362,6 +386,8 @@ class CritPt(_G5):
 class AALCR(_Judged):
     id = "aa-lcr"
     metric = "pass@1 judge correct"
+    default_repeats = 16
+    """Nemo-Gym's official repeat count."""
     ns_benchmark = "aalcr"
     ns_metric = "judge_correct"
     dataset = LCR_DATASET

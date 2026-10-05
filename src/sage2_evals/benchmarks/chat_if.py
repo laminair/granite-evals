@@ -1,7 +1,7 @@
-"""Chat & instruction-following family: MMLU-ProX lite (IBM), IFBench.
+"""Chat & instruction-following family: MMLU-ProX lite, IFBench.
 
-MMLU-ProX lite (IBM): exact match (custom-extract)
----------------------------------------------------
+MMLU-ProX lite: exact match (custom-extract)
+---------------------------------------------
 lm-evaluation-harness's own ``mmlu_prox_lite_{lang}_{subject}`` tasks (5-shot
 CoT prompts, the ``custom-extract`` regex filter, ``exact_match``), sent to the
 served model in lm-eval's chat mode, as NeMo Evaluator's lm-eval container runs
@@ -13,11 +13,10 @@ answer), so lm-eval sends the description as the system turn, the 5 shots as 5
 user turns and the question as the last user turn; that is the harness's
 behaviour, kept as is.
 
-"(IBM)" is read as IBM's language subset: the Granite 4.x supported languages
-that MMLU-ProX covers (the card lists en, de, es, fr, ja, pt, ar, cs, it, ko, nl,
-zh; MMLU-ProX has no Dutch), i.e. 11 languages x 588 test questions. Neither the
-card nor the blog defines it, so this is the most defensible reading, not a
-confirmed one; ``--option languages=all`` (or a comma list) changes it.
+The default language scope is Nemo-Gym's official 6 (en, de, es, fr, it, ja),
+i.e. 6 languages x 588 test questions. ``--option languages=ibm`` selects the
+earlier 11-language IBM reading (adds pt, ar, cs, ko, zh) kept for comparison;
+``--option languages=all`` (or a comma list) changes it further.
 
 The headline value is the mean over languages of each language's exact match
 (lm-eval's ``mmlu_prox_lite_{lang}`` group: size-weighted over subjects). All
@@ -89,6 +88,8 @@ log = logging.getLogger(__name__)
 
 # Granite 4.x supported languages that MMLU-ProX has (no nl), in suite order.
 IBM_LANGUAGES = ("en", "de", "es", "fr", "ja", "pt", "ar", "cs", "it", "ko", "zh")
+# Nemo-Gym's official MMLU-ProX scope: 6 languages, not IBM's 11.
+OFFICIAL_LANGUAGES = ("en", "de", "es", "fr", "it", "ja")
 ALL_LANGUAGES = (
     "af", "ar", "bn", "cs", "de", "en", "es", "fr", "hi", "hu", "id", "it", "ja", "ko", "mr",
     "ne", "pt", "ru", "sr", "sw", "te", "th", "uk", "ur", "vi", "wo", "yo", "zh", "zu",
@@ -455,7 +456,9 @@ class MMLUProXLite(Benchmark):
         return not self.gold
 
     def languages(self) -> list[str]:
-        spec = self.opt("languages", "ibm")
+        spec = self.opt("languages", "official")
+        if spec == "official":
+            return list(OFFICIAL_LANGUAGES)
         if spec == "ibm":
             return list(IBM_LANGUAGES)
         if spec == "all":
@@ -643,6 +646,8 @@ class IFBench(NemoSkillsBenchmark):
 
     id = "ifbench"
     metric = "pass@1 prompt loose / strict accuracy"
+    default_repeats = 5
+    """Nemo-Gym's ifbench/config.yaml: num_repeats: 5."""
     extra = "ifbench"
     harness_packages = ("nemo-skills", "litellm", "spacy", "nltk", "syllapy", "emoji", "langdetect")
     ns_benchmark = "ifbench"

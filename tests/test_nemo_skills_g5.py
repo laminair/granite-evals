@@ -16,12 +16,12 @@ from sage2_evals.benchmarks import nemo_skills_g5 as g5
 from sage2_evals.registry import RunConfig
 
 IDS = {
-    "hle": "pass@1 judge_correct",
-    "omniscience": "pass@1 judge_correct",
-    "omniscience-hallucination": "pass@1 judge_omni_hallucination",
-    "critpt": "Challenge Accuracy",
-    "aa-lcr": "pass@1 judge correct",
-    "wmt24pp": "en→xx comet",
+    "hle": ("pass@1 judge_correct", 1),
+    "omniscience": ("pass@1 judge_correct", 8),
+    "omniscience-hallucination": ("pass@1 judge_omni_hallucination", 8),
+    "critpt": ("Challenge Accuracy", 1),
+    "aa-lcr": ("pass@1 judge correct", 16),
+    "wmt24pp": ("en→xx comet", 1),
 }
 KEY_ENV = "SAGE2_TEST_FAKE_JUDGE_KEY"
 
@@ -44,7 +44,7 @@ def mecab():  # sacrebleu[ja], in the nemoskills extra only (the bird image has 
 def test_registered_as_in_suite(bid):
     cls = registry.get(bid)
     assert issubclass(cls, nsb.NemoSkillsBenchmark) and cls.splittable
-    assert (cls.metric, cls.default_repeats) == (IDS[bid], 1)
+    assert (cls.metric, cls.default_repeats) == IDS[bid]
     assert len(cls.dataset_revision) == 40 and cls.dataset
     suite = yaml.safe_load((Path(registry.__file__).parent / "suites" / "granite5.yaml").read_text())
     assert {b["id"]: b["metric"] for b in suite["benchmarks"]}[bid] == cls.metric

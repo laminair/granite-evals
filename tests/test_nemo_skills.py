@@ -13,7 +13,7 @@ from sage2_evals.registry import RunConfig
 IDS = {
     "aime25": ("pass@1 symbolic correct", 1),
     "hmmt-feb25": ("pass@1 symbolic correct", 1),
-    "gpqa": ("pass@1 symbolic correct", 1),
+    "gpqa": ("pass@1 symbolic correct", 2),
     "mmlu-pro": ("5-shot CoT symbolic correct", 1),
     "arena-hard-v2": ("win rate", 1),
 }

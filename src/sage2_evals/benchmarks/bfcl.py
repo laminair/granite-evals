@@ -72,6 +72,11 @@ SEARCH_STATS = "web_search_stats.json"
 TEST_IDS_FILE = "test_case_ids_to_generate.json"  # BFCL's TEST_IDS_TO_GENERATE_PATH, under BFCL_PROJECT_ROOT
 MISSING_EXIT = 3  # the child's exit code when the score phase finds test ids without a result
 
+EXCLUDED_CATEGORIES = {"memory_vector"}
+"""IBM permanently excludes this category: granite-4.2's 128k context can't
+support it. Filtered out of every default/collection selection (21/22 scoring
+categories), still selectable with an explicit --option categories=."""
+
 # An inference error with one of these in its message is an infrastructure
 # failure, not a model failure: drop it on restart so the entry is regenerated.
 INFRA_ERROR = re.compile(
@@ -490,7 +495,11 @@ def child_main(config_path: str) -> None:
         sort_key,
     )
 
-    categories = parse_test_category_argument(cfg["categories"])
+    categories = [c for c in parse_test_category_argument(cfg["categories"]) if c not in EXCLUDED_CATEGORIES]
+    # Collection names (e.g. "all_scoring") re-expand to the full set inside
+    # generation_main/evaluation_main; pin the already-filtered category list
+    # explicitly so every downstream BFCL call sees the same 21/22 categories.
+    cfg["categories"] = categories
     entries = {c: sorted(load_dataset_entry(c), key=sort_key) for c in categories}
     ids = select_ids(entries, cfg["limit"])
     Path(TEST_IDS_TO_GENERATE_PATH).write_text(json.dumps(ids, indent=2))

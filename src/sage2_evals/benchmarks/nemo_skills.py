@@ -127,6 +127,11 @@ JUDGE_BASE_URL = "https://ete-litellm.ai-models.vpc-int.res.ibm.com/v1"
 JUDGE_MODEL = "aws/claude-sonnet-5"
 JUDGE_API_KEY_ENV = "SAGE2_JUDGE_API_KEY"
 
+AZURE_JUDGE_BASE_URL = JUDGE_BASE_URL
+AZURE_JUDGE_MODEL = "azure/gpt-4o-ncf"
+"""HLE's actual official judge (gbansible, per Alexei Karve), reached through
+the same IBM LiteLLM gateway as the shared judge default."""
+
 GENERATE_MODULE = "nemo_skills.inference.generate"
 GENERATION_ATTEMPTS = 3
 
@@ -162,6 +167,14 @@ class NemoSkillsBenchmark(Benchmark):
     judge_generation_module: ClassVar[str | None] = None
     judge_args: ClassVar[tuple[str, ...]] = ()
     official_judge: ClassVar[str] = ""
+    judge_model_default: ClassVar[str | None] = None
+    judge_base_url_default: ClassVar[str | None] = None
+    judge_api_key_env_default: ClassVar[str | None] = None
+    """A per-class judge override (e.g. a benchmark whose official judge needs a
+    different gateway/model than the shared JUDGE_MODEL/JUDGE_BASE_URL/
+    JUDGE_API_KEY_ENV). None means fall through to the shared module default;
+    still overridable per run by the usual judge_model/judge_base_url/
+    judge_api_key_env options."""
 
     gold_answer_key: ClassVar[str] = "expected_answer"
     gold_judged: ClassVar[bool] = False
@@ -187,7 +200,7 @@ class NemoSkillsBenchmark(Benchmark):
         return not self.gold
 
     def score_needs_server(self) -> bool:
-        return self.uses_judge() and self.opt("judge_model", JUDGE_MODEL) == "self"
+        return self.uses_judge() and self.opt("judge_model", self.judge_model_default or JUDGE_MODEL) == "self"
 
     # -- the ns dataset module ------------------------------------------------
 
@@ -522,13 +535,13 @@ class NemoSkillsBenchmark(Benchmark):
     # -- 3. judge ------------------------------------------------------------
 
     def judge_endpoint(self, base_url: str, served: str) -> dict[str, Any]:
-        model = self.opt("judge_model", JUDGE_MODEL)
+        model = self.opt("judge_model", self.judge_model_default or JUDGE_MODEL)
         if model == "self":
             return {"base_url": base_url, "model": served, "api_key_env": "", "is_self": True}
         return {
-            "base_url": self.opt("judge_base_url", JUDGE_BASE_URL),
+            "base_url": self.opt("judge_base_url", self.judge_base_url_default or JUDGE_BASE_URL),
             "model": model,
-            "api_key_env": self.opt("judge_api_key_env", JUDGE_API_KEY_ENV),
+            "api_key_env": self.opt("judge_api_key_env", self.judge_api_key_env_default or JUDGE_API_KEY_ENV),
             "is_self": False,
         }
 
@@ -1089,6 +1102,8 @@ class GPQA(NemoSkillsBenchmark):
 
     id = "gpqa"
     metric = "pass@1 symbolic correct"
+    default_repeats = 2
+    """avg-of-2: the granite-4.2 BlueVela run (gbansible) scored pass@1[avg-of-2]."""
     ns_benchmark = "gpqa"
     ns_split = "diamond"
     ns_prepare_args = ("--split", "diamond")

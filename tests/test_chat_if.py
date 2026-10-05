@@ -75,8 +75,9 @@ def test_languages_option(tmp_path):
     def langs(**options):
         return chat_if.MMLUProXLite(RunConfig(model="m", output_dir=tmp_path, options=options)).languages()
 
-    assert langs() == list(chat_if.IBM_LANGUAGES)
-    assert "nl" not in langs() and len(langs()) == 11
+    assert langs() == list(chat_if.OFFICIAL_LANGUAGES)
+    assert "nl" not in langs() and len(langs()) == 6
+    assert langs(languages="ibm") == list(chat_if.IBM_LANGUAGES)
     assert langs(languages="all") == list(chat_if.ALL_LANGUAGES)
     assert langs(languages="ja, en") == ["ja", "en"]
     with pytest.raises(SystemExit):
@@ -477,11 +478,11 @@ def test_ifbench_registered_and_pinned(tmp_path):
 
     cls = get("ifbench")
     assert cls is chat_if.IFBench
-    assert cls.metric == "pass@1 prompt loose / strict accuracy" and cls.default_repeats == 1
+    assert cls.metric == "pass@1 prompt loose / strict accuracy" and cls.default_repeats == 5
     assert cls.extra == "ifbench" and cls.ns_metric == "prompt_loose_accuracy"
     assert cls.ns_report_metrics == ("prompt_strict_accuracy", "instruction_loose_accuracy", "instruction_strict_accuracy")
     b = cls(RunConfig(model="m", output_dir=tmp_path))
-    assert b.repeats == 1 and b.aggregation() == "pass@1"
+    assert b.repeats == 5 and b.aggregation() == "pass@1[avg-of-5]"
     assert cls(RunConfig(model="m", output_dir=tmp_path, repeats=2)).aggregation() == "pass@1[avg-of-2]"
     assert b.pins() == {}  # a GitHub file, pinned by URL + sha256, not an HF repo
     pinned, sha = cls.pinned_urls[chat_if.IFBENCH_TEST_URL]
@@ -576,7 +577,7 @@ def _ifbench_phase(tmp_path, monkeypatch, phase, events):
 
     monkeypatch.setattr(nsb, "_run_ns", fake_generate)
     monkeypatch.setattr(nsb.NemoSkillsBenchmark, "_evaluate", fake_evaluate)
-    b = chat_if.IFBench(RunConfig(model="m", output_dir=tmp_path, phase=phase))
+    b = chat_if.IFBench(RunConfig(model="m", output_dir=tmp_path, phase=phase, repeats=1))
     monkeypatch.setattr(b, "prepare_data", lambda: (prepared, {"sha256": "x"}))
     return b.run("http://127.0.0.1:9/v1" if phase == "generate" else "", "m")
 
