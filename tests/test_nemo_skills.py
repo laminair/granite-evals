@@ -6,9 +6,9 @@ import json
 import httpx
 import pytest
 
-from sage2_evals import registry
-from sage2_evals.benchmarks import nemo_skills as nsb
-from sage2_evals.registry import RunConfig
+from granite_evals import registry
+from granite_evals.benchmarks import nemo_skills as nsb
+from granite_evals.registry import RunConfig
 
 IDS = {
     "aime25": ("pass@1 symbolic correct", 1),
@@ -121,7 +121,7 @@ def test_judge_endpoint_defaults_and_self(tmp_path):
     assert ep == {
         "base_url": nsb.JUDGE_BASE_URL,
         "model": "aws/claude-sonnet-5",
-        "api_key_env": "SAGE2_JUDGE_API_KEY",
+        "api_key_env": "GRANITE_EVALS_JUDGE_API_KEY",
         "is_self": False,
     }
     ep = bench("arena-hard-v2", tmp_path, options={"judge_model": "self"}).judge_endpoint("http://v/v1", "g")
@@ -251,7 +251,7 @@ def test_aime25_gold_end_to_end_and_resume(ns, tmp_path):
 
 
 def test_paid_judge_goes_through_meter(tmp_path, monkeypatch):
-    from sage2_evals import meter
+    from granite_evals import meter
 
     calls = []
     monkeypatch.setattr(meter, "metered", lambda url, role: calls.append((url, role)) or "http://127.0.0.1:9/metered")
@@ -267,10 +267,10 @@ def test_paid_judge_goes_through_meter(tmp_path, monkeypatch):
 
 
 def test_judge_calls_reach_the_meter_proxy(tmp_path, monkeypatch):
-    """End to end through the real sage2 meter: judge proxy -> meter -> upstream."""
-    from sage2_evals import meter
+    """End to end through the real granite meter: judge proxy -> meter -> upstream."""
+    from granite_evals import meter
 
-    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(tmp_path / "ledger.jsonl"))
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_LEDGER", str(tmp_path / "ledger.jsonl"))
     with _Upstream() as up, meter.Meters({}, {"benchmark": "arena-hard-v2"}) as meters:
         monkeypatch.setattr(nsb, "JUDGE_BASE_URL", up.base_url)
         b = bench("arena-hard-v2", tmp_path)

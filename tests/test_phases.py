@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from sage2_evals import cli, registry
-from sage2_evals.registry import Benchmark, RunConfig
+from granite_evals import cli, registry
+from granite_evals.registry import Benchmark, RunConfig
 
 
 class _Split(Benchmark):

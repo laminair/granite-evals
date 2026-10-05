@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
-from sage2_evals import meter
+from granite_evals import meter
 
 
 class _Upstream(BaseHTTPRequestHandler):
@@ -58,8 +58,8 @@ def _chat(base_url, **extra):
 
 def test_options_are_metered_and_spend_is_ledgered(upstream, tmp_path, monkeypatch):
     ledger = tmp_path / "spend.jsonl"
-    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(ledger))
-    monkeypatch.delenv("SAGE2_SPEND_BUDGET_USD", raising=False)
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_LEDGER", str(ledger))
+    monkeypatch.delenv("GRANITE_EVALS_SPEND_BUDGET_USD", raising=False)
     options = {"judge_base_url": upstream, "judge_model": "aws/claude-sonnet-5", "user_base_url": "self"}
     with meter.Meters(options, {"benchmark": "b", "job": "1"}) as meters:
         assert options["judge_base_url"] != upstream and options["user_base_url"] == "self"
@@ -81,8 +81,8 @@ def test_run_total_counts_earlier_attempts(upstream, tmp_path, monkeypatch):
     # A requeued score job resumes from saved judgements: its own process pays little,
     # the output dir's total still counts the first attempt.
     ledger = tmp_path / "spend.jsonl"
-    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(ledger))
-    monkeypatch.delenv("SAGE2_SPEND_BUDGET_USD", raising=False)
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_LEDGER", str(ledger))
+    monkeypatch.delenv("GRANITE_EVALS_SPEND_BUDGET_USD", raising=False)
     for run, n in (("/runs/a", 2), ("/runs/other", 1), ("/runs/a", 1)):
         options = {"judge_base_url": upstream}
         with meter.Meters(options, {"benchmark": "b", "run": run}) as meters:
@@ -96,7 +96,7 @@ def test_run_total_counts_earlier_attempts(upstream, tmp_path, monkeypatch):
 def test_roles_on_one_gateway_are_accounted_apart(upstream, tmp_path, monkeypatch):
     # tau's user simulator and judge share the gateway URL.
     ledger = tmp_path / "spend.jsonl"
-    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(ledger))
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_LEDGER", str(ledger))
     options = {"user_base_url": upstream, "judge_base_url": upstream}
     with meter.Meters(options, {"benchmark": "b"}) as meters:
         assert options["user_base_url"] != options["judge_base_url"]
@@ -110,8 +110,8 @@ def test_budget_is_shared_through_the_ledger(upstream, tmp_path, monkeypatch):
     ledger = tmp_path / "spend.jsonl"
     # Another job has already spent $49.49 of $50; the reserve leaves room for one call.
     ledger.write_text(json.dumps({"cost_usd": 49.49}) + "\n")
-    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(ledger))
-    monkeypatch.setenv("SAGE2_SPEND_BUDGET_USD", "50")
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_LEDGER", str(ledger))
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_BUDGET_USD", "50")
     with meter.Meters({}, {"benchmark": "b"}) as meters:
         url = meter.metered(upstream, "judge")
         assert _chat(url).status_code == 200
@@ -124,7 +124,7 @@ def test_budget_is_shared_through_the_ledger(upstream, tmp_path, monkeypatch):
 
 def test_no_cost_header_is_priced_high(upstream, tmp_path, monkeypatch):
     _Upstream.cost_header = False
-    monkeypatch.setenv("SAGE2_SPEND_LEDGER", str(tmp_path / "spend.jsonl"))
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_LEDGER", str(tmp_path / "spend.jsonl"))
     with meter.Meters({"judge_base_url": upstream}, {}) as meters:
         _chat(meters.options["judge_base_url"])
         spend = meters.summary()

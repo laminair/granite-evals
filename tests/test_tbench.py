@@ -14,10 +14,10 @@ import pytest
 
 pytest.importorskip("harbor.environments.base")
 
-from sage2_evals.benchmarks import tbench as tb  # noqa: E402
-from sage2_evals.registry import RunConfig  # noqa: E402
-from sage2_evals.sandbox import Sandbox  # noqa: E402
-from sage2_evals.sandbox import harbor_env  # noqa: E402
+from granite_evals.benchmarks import tbench as tb  # noqa: E402
+from granite_evals.registry import RunConfig  # noqa: E402
+from granite_evals.sandbox import Sandbox  # noqa: E402
+from granite_evals.sandbox import harbor_env  # noqa: E402
 
 TASK_TOML = """version = "1.0"
 [agent]
@@ -103,7 +103,7 @@ def test_run_scores_resumes_and_records(tmp_path, monkeypatch):
     }
     assert out["tasks_digest"] is None  # dataset override: no pin to check
     assert len(calls) == 6
-    assert json.loads((tmp_path / "out" / "repeat-1" / "a-task" / "sage2.json").read_text())["resolved"]
+    assert json.loads((tmp_path / "out" / "repeat-1" / "a-task" / "granite.json").read_text())["resolved"]
 
     calls.clear()
     assert b.run("", "")["value"] == pytest.approx(5 / 6)
@@ -143,7 +143,7 @@ def test_infra_errors_retry_and_are_not_persisted(tmp_path, monkeypatch, caplog)
     assert attempts == {"a": 3, "b": 2}
     assert out["per_repeat"][0]["statuses"] == {"error:RuntimeError": 1, "graded": 1}
     assert out["value"] == 0.5
-    assert not (tmp_path / "out" / "repeat-0" / "a" / "sage2.json").exists()
+    assert not (tmp_path / "out" / "repeat-0" / "a" / "granite.json").exists()
     assert (tmp_path / "out" / "repeat-0" / ".attempts").is_dir()  # earlier attempts kept
 
 
@@ -163,9 +163,9 @@ def test_default_exclusions_are_reported(tmp_path, monkeypatch):
 
 def test_fixed_port_tasks_hold_node_locks(tmp_path, monkeypatch):
     """Trials on one port never overlap, here or in another job on the node."""
-    from sage2_evals.sandbox import nodelock
+    from granite_evals.sandbox import nodelock
 
-    monkeypatch.setenv("SAGE2_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("GRANITE_EVALS_LOCK_DIR", str(tmp_path))
     assert tb.port_locks("pypi-server") == ["port-8080"] and tb.port_locks("a") == []
     assert tb.port_locks("qemu-startup") == ["port-2222", "port-6665"]
     assert set(tb.HOST_PORTS) == tb.HOST_PORT_TASKS and tb.HOST_PORT_TASKS.isdisjoint(tb.EXCLUDED)
@@ -338,18 +338,18 @@ def test_env_file_roundtrip(env, tmp_path):
 
 
 def test_env_enroot_passes_no_harness_secrets(env, monkeypatch):
-    monkeypatch.setenv("SAGE2_JUDGE_API_KEY", "secret")
+    monkeypatch.setenv("GRANITE_EVALS_JUDGE_API_KEY", "secret")
     monkeypatch.setenv("HF_TOKEN", "secret")
     monkeypatch.setenv("ENROOT_DATA_PATH", "/scratch/data")
     got = env._enroot_env()
-    assert "SAGE2_JUDGE_API_KEY" not in got and "HF_TOKEN" not in got
+    assert "GRANITE_EVALS_JUDGE_API_KEY" not in got and "HF_TOKEN" not in got
     assert got["ENROOT_DATA_PATH"] == "/scratch/data" and got["NVIDIA_VISIBLE_DEVICES"] == "void"
 
 
 def test_leftover_daemons_are_killed_by_root(monkeypatch):
     """Processes that drop the marker (nginx workers) are found by their root
     directory's inode: readlink() of another mount namespace's root gives "/"."""
-    rootfs = "/scratch/data/sage2-x"
+    rootfs = "/scratch/data/granite-x"
     inodes = {rootfs: (7, 42), "/": (7, 2), "/proc/10/root": (7, 42), "/proc/11/root": (7, 2),
               "/proc/12/root": (7, 42)}
     killed = []
@@ -368,7 +368,7 @@ def test_leftover_daemons_are_killed_by_root(monkeypatch):
     killed.clear()
     assert harbor_env._kill_rooted("/") == 0 and killed == []  # the host root: kill nothing
     monkeypatch.setenv("ENROOT_DATA_PATH", "/scratch/data")
-    assert harbor_env.enroot_rootfs("sage2-x") == "/scratch/data/sage2-x"
+    assert harbor_env.enroot_rootfs("granite-x") == "/scratch/data/granite-x"
 
 
 def test_no_paid_endpoints(tmp_path, monkeypatch):

@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from sage2_evals.sandbox import ovlfs
+from granite_evals.sandbox import ovlfs
 
 
 def _tree(root):

@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sage2_evals.benchmarks import chat_if
-from sage2_evals.registry import RunConfig
+from granite_evals.benchmarks import chat_if
+from granite_evals.registry import RunConfig
 
 LANGS = ("en", "de")
 CATEGORIES = ("biology", "math")
@@ -56,7 +56,7 @@ def dataset_dir(tmp_path, monkeypatch):
 
 
 def test_registered_with_suite_metadata():
-    from sage2_evals.registry import get
+    from granite_evals.registry import get
 
     cls = get("mmlu-prox-lite")
     assert cls is chat_if.MMLUProXLite
@@ -400,7 +400,7 @@ def test_samples_and_results_record_finish_reason_and_tokens(tmp_path, dataset_d
         sdir = tmp_path / "out/repeat-0/samples"
         return [json.loads(x) for f in sorted(sdir.glob("*.jsonl")) for x in f.read_text().splitlines()]
 
-    by_q = {(r["doc"]["question"], r["filter"]): r["sage2_request"] for r in rows()}
+    by_q = {(r["doc"]["question"], r["filter"]): r["granite_request"] for r in rows()}
     q0 = by_q[("[en] question 0 about biology?", "custom-extract")]
     assert q0 == {"finish_reason": "stop", "stop_reason": "Q:", "completion_tokens": 300, "prompt_tokens": 900,
                   "reasoning_chars": 7, "content_chars": 0}  # fmt: skip
@@ -417,7 +417,7 @@ def test_samples_and_results_record_finish_reason_and_tokens(tmp_path, dataset_d
     req2 = out2["per_repeat"][0]["requests"]
     assert req2["finish_reason"] == {"stop": 6, "length": 2}
     assert req2["completion_tokens"]["n"] == 8
-    assert all(r["sage2_request"] for r in rows())
+    assert all(r["granite_request"] for r in rows())
 
 
 def test_gold_has_no_request_records(tmp_path, dataset_dir):
@@ -425,7 +425,7 @@ def test_gold_has_no_request_records(tmp_path, dataset_dir):
     out = _bench(tmp_path, dataset_dir, answers="gold").run("", "")
     assert "requests" not in out["per_repeat"][0]
     rows = (tmp_path / "out/repeat-0/samples/mmlu_prox_lite_en_math.jsonl").read_text().splitlines()
-    assert "sage2_request" not in json.loads(rows[0])
+    assert "granite_request" not in json.loads(rows[0])
 
 
 def test_response_meta_and_request_key():
@@ -474,7 +474,7 @@ def test_drop_errors_from_cache(tmp_path):
 
 
 def test_ifbench_registered_and_pinned(tmp_path):
-    from sage2_evals.registry import get
+    from granite_evals.registry import get
 
     cls = get("ifbench")
     assert cls is chat_if.IFBench
@@ -544,7 +544,7 @@ def test_ifbench_value_is_prompt_loose_accuracy_avg_of_2(tmp_path):
 def test_ifbench_puts_the_pinned_nltk_data_first(tmp_path, monkeypatch):
     """IFBench's verifiers nltk.download() at build time; ~/nltk_data would win over
     the image's pinned copy unless NLTK_DATA names it (inherited by run_eval)."""
-    from sage2_evals.benchmarks.nemo_skills import NemoSkillsBenchmark
+    from granite_evals.benchmarks.nemo_skills import NemoSkillsBenchmark
 
     seen = {}
     monkeypatch.setattr(NemoSkillsBenchmark, "run", lambda self, *a: seen.setdefault("NLTK_DATA", __import__("os").environ["NLTK_DATA"]))
@@ -556,7 +556,7 @@ def test_ifbench_puts_the_pinned_nltk_data_first(tmp_path, monkeypatch):
 def _ifbench_phase(tmp_path, monkeypatch, phase, events):
     """IFBench on 2 prompts with ns's generation and evaluator faked: the evaluator
     grades each marked file (prompt 0 followed, prompt 1 not)."""
-    from sage2_evals.benchmarks import nemo_skills as nsb
+    from granite_evals.benchmarks import nemo_skills as nsb
 
     prepared = tmp_path / "prepared.jsonl"
     nsb._write_jsonl(prepared, [{"key": str(i), "prompt": f"p{i}", "instruction_id_list": ["a"]} for i in range(2)])

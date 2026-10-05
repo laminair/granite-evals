@@ -1,10 +1,10 @@
-# sage2-evals
+# granite-evals
 
-Runtime for the IBM **Sage2** benchmark suites, built to run as granite.build steps.
-Each benchmark is a `sage2-<id>` step in granite.build that calls:
+Runtime for the IBM **Granite** benchmark suites, built to run as granite.build steps.
+Each benchmark is a `granite-<id>` step in granite.build that calls:
 
 ```bash
-sage2-evals run <benchmark> --model <hf dir or hub id> --output-dir out [--limit N]
+granite-evals run <benchmark> --model <hf dir or hub id> --output-dir out [--limit N]
 ```
 
 Each run serves the model with vLLM in the job, runs one benchmark and writes
@@ -21,8 +21,8 @@ generates: an example without a generation fails like a failed generation.
 
 ## Suites
 
-`sage2-evals list --suite granite42` (or `granite5`) prints each benchmark and whether
-it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`.
+`granite-evals list --suite granite42` (or `extended`) prints each benchmark and whether
+it is implemented. The suite definitions live in `src/granite_evals/suites/*.yaml`.
 
 | Implemented | Metric | Image extra |
 |---|---|---|
@@ -56,6 +56,15 @@ it is implemented. The suite definitions live in `src/sage2_evals/suites/*.yaml`
 | `strongreject` | Harmlessness = 1 - mean StrongREJECT score (313 forbidden prompts, no jailbreak, StrongREJECT rubric judge) | `judged` |
 | `mcpatlas` | pass rate (claim coverage >= 0.75). Default `subset=keyless`: the 30 of 500 tasks whose tools need no API key (`subset=all` needs 16 servers' keys); upstream's environment image + ported harness loop; claims judged by `aws/claude-sonnet-5`, not upstream's Gemini | `judged` |
 
+**Overlap with granite.build's existing OLMES-based evals.** Two benchmarks here, `gpqa`
+and `mmlu-pro`, are already available in `ibm-granite/granite.build` via the older,
+hand-authored OLMES harness (`configurations/assets/environments/**/steps/*/step.yaml`,
+as `math-olmes-gpqa` and `general-olmes-mmlu-pro`). This is not a duplicate: that harness
+uses OLMES's own prompting/scoring, while this repo runs both through NeMo-Skills
+(symbolic-correct scorer; `gpqa` defaults to `--repeats 2`, avg-of-2). Both remain
+available as separate steps — pick whichever harness's protocol you need for a given
+comparison.
+
 NeMo-Skills benchmarks share `benchmarks/nemo_skills.py` (its docstring explains how to
 add one).
 
@@ -83,7 +92,7 @@ judge instead of the official ones (o3-mini, Gemini 2.5 Flash, Qwen3-235B / gpt-
 leave an unparseable judgement out of the score (ns scores it wrong). `critpt` needs an
 Artificial Analysis API key (`ARTIFICIAL_ANALYSIS_API_KEY`) to score; `wmt24pp` scores
 with XCOMET-XXL on a GPU in the image's separate `/opt/comet` env. See
-`benchmarks/nemo_skills_g5.py`.
+`benchmarks/nemo_skills_extended.py`.
 
 ## Repeats
 
@@ -136,7 +145,7 @@ FORTRESS's o3 / Claude 3.7 / Gemini 2.5 panel and GPT-4o-mini; StrongREJECT's gp
 uv sync --extra swebench
 uv run pytest
 # Check images, sandbox and grading without a model or GPU:
-SAGE2_SANDBOX=podman uv run sage2-evals run swebench-verified --model none \
+GRANITE_EVALS_SANDBOX=podman uv run granite-evals run swebench-verified --model none \
   --output-dir /tmp/gold --dataset SWE-bench/SWE-bench_Verified --limit 2 --option patch=gold
 ```
 
@@ -149,19 +158,19 @@ see the same examples. `results.json` records `smoke: true` for such runs.
 |---|---|
 | `HF_TOKEN` | read access to gated upstream datasets |
 | `ARTIFICIAL_ANALYSIS_API_KEY` | `critpt` scoring (Artificial Analysis's CritPt grading API) |
-| `SAGE2_SANDBOX` | `enroot` (default), `podman`, `docker` |
-| `SAGE2_ENROOT_CACHE` | shared squashfs cache for sandbox images |
-| `SAGE2_SPEND_LEDGER` | JSONL ledger of paid API calls, shared by concurrent jobs |
-| `SAGE2_SPEND_BUDGET_USD` | refuse paid API calls once the ledger's total reaches this |
+| `GRANITE_EVALS_SANDBOX` | `enroot` (default), `podman`, `docker` |
+| `GRANITE_EVALS_ENROOT_CACHE` | shared squashfs cache for sandbox images |
+| `GRANITE_EVALS_SPEND_LEDGER` | JSONL ledger of paid API calls, shared by concurrent jobs |
+| `GRANITE_EVALS_SPEND_BUDGET_USD` | refuse paid API calls once the ledger's total reaches this |
 
 ## Paid APIs (judges, user simulators)
 
-Calls to paid endpoints go through `sage2_evals.meter`, a local proxy that records
+Calls to paid endpoints go through `granite_evals.meter`, a local proxy that records
 each call's cost (the gateway's `x-litellm-response-cost`, or a deliberately high
 token-price fallback) in the ledger and answers HTTP 402 once the budget is spent.
 Options named `*_base_url` are metered automatically; a benchmark sends any other
 paid endpoint through `meter.metered(url, role)`. `results.json` carries the run's
-spend as `details.api_spend`; `sage2-evals spend <ledger>` totals a ledger by
+spend as `details.api_spend`; `granite-evals spend <ledger>` totals a ledger by
 benchmark, model, role and job.
 
 ## Datasets
@@ -176,14 +185,15 @@ Each benchmark class pins its upstream HF dataset and commit (`dataset`,
 Images are built on hg4os, because BlueVela cannot build them, and pushed to ICR:
 
 ```bash
-make publish-image EXTRA=swebench   # -> us.icr.io/cil15-shared-registry/sage2-evals-swebench:<sha>
+make publish-image EXTRA=swebench   # -> us.icr.io/cil15-shared-registry/granite-evals-swebench:<sha>
 ```
 
 Tags are the git short SHA. Pin that tag in the granite.build recipe.
 
 [docs/bluevela.md](docs/bluevela.md) covers image families, direct BlueVela runs
 (`scripts/bv-smoke.sh`, secrets, gold checks). Favored configs per benchmark are in
-granite.build's `recipes/sage2/lsf/eval-granite42/README.md`.
+granite.build's `recipes/sage2/lsf/eval-granite42/README.md` (that fork's step/recipe
+directories still use the pre-rename `sage2-*` names pending a follow-up update there).
 
 ## Adding a benchmark
 
@@ -191,5 +201,6 @@ granite.build's `recipes/sage2/lsf/eval-granite42/README.md`.
    module there is registered automatically). Import the harness inside methods,
    and add it to an optional extra of its own.
 2. Pin the upstream dataset on the class: `dataset` and `dataset_revision`.
-3. Copy `steps/sage2-swebench-verified` in granite.build to `steps/sage2-<id>`. Change
+3. Copy `steps/sage2-swebench-verified` in granite.build to `steps/sage2-<id>` (that fork's
+   step names are still pre-rename pending a follow-up there). Change
    the name, `BENCHMARK` and the defaults, then add a target to the suite recipes.

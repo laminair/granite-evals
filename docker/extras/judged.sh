@@ -1,7 +1,7 @@
 # Image setup for the `judged` extra (profbench, gdpval).
 # ProfBench's scripts are not a package: bake the pinned commit's files into
 # /opt/profbench/<commit>, verified by sha256 (same pins as
-# sage2_evals/benchmarks/judge_general.py PROFBENCH_FILES).
+# granite_evals/benchmarks/judge_general.py PROFBENCH_FILES).
 COMMIT=b06a29cda4d1433e9a9aad8171e4086299083e94
 DEST=/opt/profbench/$COMMIT
 mkdir -p "$DEST"

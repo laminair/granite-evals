@@ -11,11 +11,11 @@ import sys
 import httpx
 import pytest
 
-from sage2_evals import agent_tools as at
-from sage2_evals import registry
-from sage2_evals.benchmarks import nemo_skills as nsb
-from sage2_evals.benchmarks import tools_agentic as ta
-from sage2_evals.registry import RunConfig
+from granite_evals import agent_tools as at
+from granite_evals import registry
+from granite_evals.benchmarks import nemo_skills as nsb
+from granite_evals.benchmarks import tools_agentic as ta
+from granite_evals.registry import RunConfig
 
 LOCAL_PY = {"backend": "unsafe-local", "network": "on", "packages": [], "timeout_s": 5.0}
 
@@ -50,7 +50,7 @@ def test_registered_as_in_suite(bid, metric, tools, tmp_path):
 
     cls = registry.get(bid)
     assert issubclass(cls, ta.ToolBenchmark) and cls.extra == "nemoskills" and cls.default_repeats == 1
-    suite = yaml.safe_load((ta.Path(registry.__file__).parent / "suites" / "granite5.yaml").read_text())
+    suite = yaml.safe_load((ta.Path(registry.__file__).parent / "suites" / "extended.yaml").read_text())
     assert {b["id"]: b["metric"] for b in suite["benchmarks"]}[bid] == metric == cls.metric
     assert bench(bid, tmp_path).tool_names() == tools
 
@@ -59,7 +59,7 @@ def test_tool_args_precede_user_overrides(ns, tmp_path):
     b = bench("hle-tools", tmp_path, options={"ns.max_tool_calls": "7", "tools": "python,fetch"})
     args = b.generation_args(sandbox_args=[])
     cfg = tmp_path / "tools" / "tools.json"
-    assert "++tool_modules=[sage2_evals.agent_tools::SandboxPythonTool,sage2_evals.agent_tools::FetchUrlTool]" in args
+    assert "++tool_modules=[granite_evals.agent_tools::SandboxPythonTool,granite_evals.agent_tools::FetchUrlTool]" in args
     assert f"++tool_overrides.SandboxPythonTool.config={cfg}" in args
     assert f"++tool_overrides.FetchUrlTool.config={cfg}" in args
     assert args.index("++max_tool_calls=100") < args.index("++max_tool_calls=7") == len(args) - 1
@@ -112,7 +112,7 @@ def test_python_tool_is_stateful_per_request(tmp_path):
         assert _run(tool, "x + 1") == "7"  # state kept
         assert _run(tool, "x", rid="r2").endswith("NameError: name 'x' is not defined")  # another rollout
         err = _run(tool, "def f():\n    return 1 / 0\nf()")
-        assert "ZeroDivisionError" in err and "sage2_repl" not in err and "return 1 / 0" in err
+        assert "ZeroDivisionError" in err and "granite_repl" not in err and "return 1 / 0" in err
         assert "SystemExit" in _run(tool, "import sys; sys.exit(3)") and _run(tool, "x") == "6"  # survives
         assert _run(tool, "import os; os.system('echo from-shell')") == "from-shell\n0"
         assert _run(tool, "import time; time.sleep(30)").startswith("TimeoutError")

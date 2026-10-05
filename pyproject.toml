@@ -1,7 +1,7 @@
 [project]
-name = "sage2-evals"
+name = "granite-evals"
 version = "0.1.0"
-description = "Runtime for the Sage2 LLM evaluation suites (Granite 4.2 / Granite 5), packaged for granite.build steps"
+description = "Runtime for a benchmark collection used to evaluate IBM Granite models, packaged for granite.build steps"
 readme = "README.md"
 authors = [
     { name = "Herbert", email = "herbert@woisetschlaeger.fyi" }
@@ -36,7 +36,7 @@ nemoskills = [
     "nltk",
     "tenacity",
     # wmt24pp: ns's BLEU tokenizes Japanese with sacrebleu's ja-mecab, which ns's
-    # metrics pip-install at run time (patched out; nemo_skills_g5.WMT24pp).
+    # metrics pip-install at run time (patched out; nemo_skills_extended.WMT24pp).
     "sacrebleu[ja]==2.6.0",
     # browsecomp: the fetch_url tool's PDF text.
     "pypdf>=5.0",
@@ -45,7 +45,7 @@ nemoskills = [
 # allenai/IFBench's run_eval.py, which ns's ifbench evaluator runs from
 # /opt/benchmarks/IFBench (docker/extras/ifbench.sh), as ns's own image does.
 ifbench = [
-    "sage2-evals[nemoskills]",
+    "granite-evals[nemoskills]",
     "absl-py==2.5.0",
     "langdetect==1.0.9",
     "nltk==3.10.3",
@@ -105,7 +105,7 @@ serve = [
 ]
 
 [project.scripts]
-sage2-evals = "sage2_evals.cli:main"
+granite-evals = "granite_evals.cli:main"
 
 [dependency-groups]
 dev = [
@@ -123,7 +123,7 @@ override-dependencies = [
     # vllm==0.27.1, in every image, needs numpy>=2. Every image resolves numpy 2 anyway.
     "numpy>=2",
     # NeMo-Skills (nemoskills, ifbench, bird) declares its cluster orchestration
-    # (NeMo-Run, nemo-evaluator-launcher) as hard dependencies. sage2-evals runs only
+    # (NeMo-Run, nemo-evaluator-launcher) as hard dependencies. granite-evals runs only
     # its local prepare / generate / evaluate / metrics modules, which never import
     # them, and NeMo-Run's leptonai pins (httpx==0.27.2,
     # prometheus-fastapi-instrumentator==7) cannot co-install with vLLM. A marker

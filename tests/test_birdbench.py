@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sage2_evals.benchmarks import birdbench
-from sage2_evals.registry import RunConfig, get
+from granite_evals.benchmarks import birdbench
+from granite_evals.registry import RunConfig, get
 
 
 def make_db(path):

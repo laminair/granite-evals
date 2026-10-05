@@ -29,7 +29,7 @@ apt-get install -y --no-install-recommends git-lfs unzip
 # packages SciCode and the server use, at the lock's versions. `pip` in it is a
 # no-op, so the evaluator's own pip calls cannot change it at run time.
 export UV_PYTHON_INSTALL_DIR=/opt/uv-python
-# The build runs this from /opt/sage2-evals, whose pyproject.toml overrides numpy>=2
+# The build runs this from /opt/granite-evals, whose pyproject.toml overrides numpy>=2
 # ([tool.uv] override-dependencies): uv pip would apply that here too, and
 # scipy 1.10.1 cannot load under numpy 2. These envs take no project config.
 export UV_NO_CONFIG=1
@@ -39,11 +39,11 @@ uv pip install --python /opt/ns-sandbox/bin/python \
     numpy==1.26.4 scipy==1.10.1 sympy==1.14.0 mpmath==1.3.0 h5py==3.16.0 matplotlib==3.10.8
 cat > /opt/ns-sandbox/bin/pip <<'EOF'
 #!/bin/sh
-echo "sage2: pip is disabled in the SciCode sandbox (its packages are pinned in the image): pip $*" >&2
+echo "granite: pip is disabled in the SciCode sandbox (its packages are pinned in the image): pip $*" >&2
 exit 0
 EOF
 chmod 755 /opt/ns-sandbox/bin/pip
-uv pip freeze --python /opt/ns-sandbox/bin/python > /opt/ns-sandbox/sage2-freeze.txt
+uv pip freeze --python /opt/ns-sandbox/bin/python > /opt/ns-sandbox/granite-freeze.txt
 chmod -R a+rX /opt/uv-python /opt/ns-sandbox
 
 # SciCode's test targets, where ns's evaluator reads them. The Google Drive file ns's
@@ -61,7 +61,7 @@ git init -q /opt/ruler
 git -C /opt/ruler fetch -q --depth 1 https://github.com/NVIDIA/RULER "$RULER_COMMIT"
 GIT_LFS_SKIP_SMUDGE=1 git -C /opt/ruler checkout -q FETCH_HEAD
 rm -rf /opt/ruler/.git
-echo "$RULER_COMMIT" > /opt/ruler/SAGE2_COMMIT
+echo "$RULER_COMMIT" > /opt/ruler/GRANITE_EVALS_COMMIT
 J=/opt/ruler/scripts/data/synthetic/json
 fetch "$J/english_words.json" affcd6d45fdf3cc843d585c99c97ad615094e760e6c4756b654bab6c73bc2eca \
     "https://media.githubusercontent.com/media/NVIDIA/RULER/$RULER_COMMIT/scripts/data/synthetic/json/english_words.json"
@@ -90,7 +90,7 @@ for z in punkt:da7ffbd1e6fd6cc5c2f6879c2d4da23c7691944c punkt_tab:5e5ff6137d5ee6
         "https://raw.githubusercontent.com/nltk/nltk_data/$NLTK_DATA_COMMIT/packages/tokenizers/$name.zip"
     got=$( (printf 'blob %s\0' "$(stat -c %s "$D/$name.zip")"; cat "$D/$name.zip") | sha1sum | cut -d' ' -f1)
     [ "$got" = "$blob" ] || { echo "nltk $name.zip: git blob $got != $blob" >&2; exit 1; }
-    sha256sum "$D/$name.zip" >> /usr/local/share/nltk_data/SAGE2_SHA256
+    sha256sum "$D/$name.zip" >> /usr/local/share/nltk_data/GRANITE_EVALS_SHA256
     unzip -q -o "$D/$name.zip" -d "$D"
 done
 chmod -R a+rX /usr/local/share/nltk_data
@@ -101,9 +101,9 @@ chmod -R a+rX /usr/local/share/nltk_data
 # which the job venv's vLLM cannot share, so it gets its own env, hash-locked in
 # comet-requirements.txt (setuptools<81: comet imports pkg_resources). The model is
 # not baked in: it is gated (CC-BY-NC-SA-4.0); the run downloads it at a pinned
-# revision (sage2_evals.benchmarks.nemo_skills_g5.WMT24pp).
+# revision (granite_evals.benchmarks.nemo_skills_extended.WMT24pp).
 uv venv --python /usr/local/bin/python3 /opt/comet
 uv pip install --python /opt/comet/bin/python --require-hashes -r /tmp/extras/comet-requirements.txt
 /opt/comet/bin/python -c "import comet, torch, transformers; print('comet env', torch.__version__, transformers.__version__)"
-uv pip freeze --python /opt/comet/bin/python > /opt/comet/sage2-freeze.txt
+uv pip freeze --python /opt/comet/bin/python > /opt/comet/granite-freeze.txt
 chmod -R a+rX /opt/comet

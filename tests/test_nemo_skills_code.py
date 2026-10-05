@@ -9,11 +9,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from sage2_evals import registry
-from sage2_evals.benchmarks import nemo_skills as nsb
-from sage2_evals.benchmarks import nemo_skills_code as nsc
-from sage2_evals.benchmarks import scicode_prefill as scp
-from sage2_evals.registry import RunConfig
+from granite_evals import registry
+from granite_evals.benchmarks import nemo_skills as nsb
+from granite_evals.benchmarks import nemo_skills_code as nsc
+from granite_evals.benchmarks import scicode_prefill as scp
+from granite_evals.registry import RunConfig
 
 IDS = {
     "livecodebench-v6": ("pass@1 accuracy", 1, "accuracy"),
@@ -37,7 +37,7 @@ def test_registered_as_in_suite(bid):
 @pytest.mark.parametrize("bid", IDS)
 def test_no_paid_api(bid, tmp_path, monkeypatch):
     """No judge: nothing here may reach a paid endpoint or the meter."""
-    from sage2_evals import meter
+    from granite_evals import meter
 
     monkeypatch.setattr(meter, "metered", lambda *a, **k: pytest.fail("paid API used"))
     b = bench(bid, tmp_path)
@@ -185,7 +185,7 @@ def test_module_args(ns, tmp_path):
     assert args[-1] == f"++eval_config.test_file={tmp_path / 'lcb-tests.jsonl'}"
     assert lcb.split() == "test_v6_2408_2505" and lcb.metrics_type() == "livecodebench"
     sc = bench("scicode", tmp_path)
-    assert sc.generation_module() == "sage2_evals.benchmarks.scicode_prefill"  # wraps ns's module
+    assert sc.generation_module() == "granite_evals.benchmarks.scicode_prefill"  # wraps ns's module
     assert bench("scicode", tmp_path, options={"prefill_fixes": "false"}).generation_module() == scp.NS_SCICODE_MODULE
     assert sc.uses_sandbox() and sc.metrics_type() == "scicode"
     assert "++prompt_config=eval/scicode/background" in sc.generation_args([])
@@ -367,7 +367,7 @@ def test_prefill_wrapper_runs_ns_main(ns):
     """``python -m`` the wrapper: fixes reported, then ns's Hydra entry point runs."""
     import subprocess
 
-    p = subprocess.run([sys.executable, "-m", "sage2_evals.benchmarks.scicode_prefill", "--help"], capture_output=True, text=True, check=False)
+    p = subprocess.run([sys.executable, "-m", "granite_evals.benchmarks.scicode_prefill", "--help"], capture_output=True, text=True, check=False)
     assert p.returncode == 0, p.stderr
     assert "restored ['Maxwell']" in p.stderr and "restored ['Block', 'EnlargedBlock']" in p.stderr
     assert "prompt_config" in p.stdout

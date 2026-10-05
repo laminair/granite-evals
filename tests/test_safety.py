@@ -15,8 +15,8 @@ pytest.importorskip("openai")
 
 from test_judge_general import Usage, completion, fake_judge, user_text  # noqa: E402
 
-from sage2_evals.benchmarks import safety  # noqa: E402
-from sage2_evals.registry import RunConfig, get  # noqa: E402
+from granite_evals.benchmarks import safety  # noqa: E402
+from granite_evals.registry import RunConfig, get  # noqa: E402
 
 FORTRESS_ROWS = [
     {"ID": i, "adversarial_prompt": f"placeholder adversarial prompt {i}", "benign_prompt": f"placeholder benign {i}",
@@ -94,7 +94,7 @@ def test_registered_ids_metrics_and_pins():
 
 
 def test_pinned_file_verifies_the_sha256(tmp_path, monkeypatch):
-    monkeypatch.setenv("SAGE2_DATA_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("GRANITE_EVALS_DATA_CACHE", str(tmp_path / "cache"))
     src = tmp_path / "file.csv"
     src.write_text("a,b\n1,2\n")
     sha = hashlib.sha256(src.read_bytes()).hexdigest()
@@ -226,7 +226,7 @@ def test_fortress_benign_compliance(tmp_path, monkeypatch, env):
 
 
 def test_fortress_generate_then_score(tmp_path, monkeypatch, env):
-    monkeypatch.delenv("SAGE2_JUDGE_API_KEY", raising=False)
+    monkeypatch.delenv("GRANITE_EVALS_JUDGE_API_KEY", raising=False)
     gen = make("fortress-adversity", tmp_path, monkeypatch, None, phase="generate", repeats=2)
     out = gen.run("http://p/v1", "s")
     assert out["n"] == 6 and "value" not in out and len(env.policy) == 6
@@ -300,7 +300,7 @@ def test_policy_options_are_sent_only_when_set(tmp_path, monkeypatch, env):
 
 
 def test_cli_generate_then_score_gold(tmp_path, monkeypatch, env):
-    from sage2_evals import cli
+    from granite_evals import cli
 
     monkeypatch.setattr(safety.StrongREJECT, "make_judge", lambda self, *a, **k: fake_judge(sr_judge))
     base = ["run", "strongreject", "--model", "none", "--output-dir", str(tmp_path), "--limit", "2",

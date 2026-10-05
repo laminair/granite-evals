@@ -8,9 +8,9 @@ import pytest
 pytest.importorskip("swebench")
 pytest.importorskip("minisweagent")
 
-from sage2_evals.benchmarks import swebench as sb_mod  # noqa: E402
-from sage2_evals.registry import RunConfig  # noqa: E402
-from sage2_evals.sandbox import ExecResult  # noqa: E402
+from granite_evals.benchmarks import swebench as sb_mod  # noqa: E402
+from granite_evals.registry import RunConfig  # noqa: E402
+from granite_evals.sandbox import ExecResult  # noqa: E402
 
 INSTANCE = {
     "instance_id": "org__repo-1",
@@ -134,7 +134,7 @@ def test_maven_mirror_install_keeps_a_settings_xml_the_image_ships(tmp_path, shi
 
 
 def test_agent_sandbox_gets_the_maven_mirror_too(bench, tmp_path, monkeypatch):
-    from sage2_evals.sandbox import minisweagent_env
+    from granite_evals.sandbox import minisweagent_env
 
     monkeypatch.setenv(sb_mod.MAVEN_MIRROR_ENV, MIRROR)
     box = ProSandbox()
@@ -166,7 +166,7 @@ def test_no_gradle_init_script_unless_configured(bench, tmp_path, monkeypatch):
 
 def test_gradle_init_script_quotes_the_mirror_and_matches_central_by_host():
     script = sb_mod.gradle_init_script("https://m.example/maven2?a='1'\\x")
-    assert "def sage2Mirror = 'https://m.example/maven2?a=\\'1\\'\\\\x'" in script
+    assert "def graniteMirror = 'https://m.example/maven2?a=\\'1\\'\\\\x'" in script
     for host in sb_mod.MAVEN_CENTRAL_HOSTS:
         assert f"'{host}'" in script
     assert "buildscript.repositories" in script and "dependencyResolutionManagement" in script
@@ -178,7 +178,7 @@ def test_gradle_init_install_keeps_an_image_script_and_honours_gradle_user_home(
     import subprocess
 
     staged = tmp_path / "staged.gradle"
-    staged.write_text("// sage2")
+    staged.write_text("// granite")
     home = tmp_path / "home"
     env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
     initd = home / ".gradle" / "init.d"
@@ -187,10 +187,10 @@ def test_gradle_init_install_keeps_an_image_script_and_honours_gradle_user_home(
         initd = tmp_path / gradle_user_home / "init.d"
     if shipped:
         initd.mkdir(parents=True)
-        (initd / "sage2-maven-mirror.gradle").write_text("// image")
+        (initd / "granite-maven-mirror.gradle").write_text("// image")
     cmd = sb_mod.GRADLE_INIT_INSTALL.replace(sb_mod.GRADLE_INIT_STAGED, str(staged))
     subprocess.run(["bash", "-c", cmd], env=env, check=True)
-    assert (initd / "sage2-maven-mirror.gradle").read_text() == ("// image" if shipped else "// sage2")
+    assert (initd / "granite-maven-mirror.gradle").read_text() == ("// image" if shipped else "// granite")
     assert not staged.exists()
 
 
@@ -228,7 +228,7 @@ def _patch_agent(monkeypatch, agent_cls):
 
 def test_context_window_overflow_ends_the_run_with_an_empty_patch(bench, tmp_path, monkeypatch):
     # As mini-swe-agent's swebench runner records it: unresolved, persisted, not an error to retry.
-    from sage2_evals.sandbox import minisweagent_env
+    from granite_evals.sandbox import minisweagent_env
 
     sandbox_env, killed = {}, []
     monkeypatch.setattr(minisweagent_env, "make_sandbox", lambda *a, **k: sandbox_env.update(k.get("env") or {}) or ProSandbox())
@@ -244,7 +244,7 @@ def test_context_window_overflow_ends_the_run_with_an_empty_patch(bench, tmp_pat
 
 
 def test_other_agent_errors_still_propagate(bench, tmp_path, monkeypatch):
-    from sage2_evals.sandbox import minisweagent_env
+    from granite_evals.sandbox import minisweagent_env
 
     class Down(RaisingAgent):
         def run(self, task, **kwargs):
@@ -404,7 +404,7 @@ test time::test_kept ... ok
 
 
 def test_multilingual_is_registered_like_verified(tmp_path):
-    from sage2_evals import registry
+    from granite_evals import registry
 
     cls = registry.get("swebench-multilingual")
     assert cls is sb_mod.SWEBenchMultilingual
@@ -536,7 +536,7 @@ class ProSandbox:
 
 
 def test_pro_is_registered_with_its_pins():
-    from sage2_evals import registry
+    from granite_evals import registry
 
     cls = registry.get("swebench-pro")
     assert cls.metric == "pass@1 resolve rate" and cls.default_repeats == 1
@@ -659,7 +659,7 @@ def test_pro_agent_config_layers_the_protocol_file_over_mini(pro):
 
 def test_pro_generate_gives_the_instruction_and_captures_the_diff(pro, tmp_path, monkeypatch):
     fake = ProSandbox(patch="diff --git a/f b/f\n+fix\n")
-    from sage2_evals.sandbox import minisweagent_env
+    from granite_evals.sandbox import minisweagent_env
 
     import contextlib
 
@@ -716,7 +716,7 @@ def test_kill_marked_kills_only_processes_with_the_marker(tmp_path, monkeypatch)
     import signal
 
     proc = tmp_path / "proc"
-    for pid, environ in {"101": b"A=1\0SAGE2_SANDBOX_ID=t-1\0", "102": b"SAGE2_SANDBOX_ID=t-10\0", "103": b"B=2\0"}.items():
+    for pid, environ in {"101": b"A=1\0GRANITE_EVALS_SANDBOX_ID=t-1\0", "102": b"GRANITE_EVALS_SANDBOX_ID=t-10\0", "103": b"B=2\0"}.items():
         (proc / pid).mkdir(parents=True)
         (proc / pid / "environ").write_bytes(environ)
     (proc / "self").mkdir()
@@ -762,7 +762,7 @@ def test_pro_fixed_resources_come_from_the_scripts_that_run():
 def test_node_lock_excludes_other_holders_until_released(tmp_path, monkeypatch, abstract):
     import uuid
 
-    monkeypatch.setenv("SAGE2_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("GRANITE_EVALS_LOCK_DIR", str(tmp_path))
     key = f"test-{uuid.uuid4().hex[:8]}"
     first, second = sb_mod.NodeLock(key, abstract=abstract), sb_mod.NodeLock(key, abstract=abstract)
     first.acquire()
@@ -778,7 +778,7 @@ def test_node_locks_wait_for_the_holder(tmp_path, monkeypatch):
     import time
     import uuid
 
-    monkeypatch.setenv("SAGE2_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("GRANITE_EVALS_LOCK_DIR", str(tmp_path))
     keys = [f"port-{uuid.uuid4().hex[:6]}", f"x{uuid.uuid4().hex[:6]}"]
     events, holding = [], threading.Event()
 

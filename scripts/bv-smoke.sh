@@ -1,10 +1,10 @@
 #!/bin/bash
-# BlueVela smoke test of a sage2-evals image, outside granite.build:
+# BlueVela smoke test of a granite-evals image, outside granite.build:
 #   1. host enroot imports the step image (uses ~/.config/enroot/.credentials),
-#   2. starts it and runs `sage2-evals run` inside, which starts its own nested
+#   2. starts it and runs `granite-evals run` inside, which starts its own nested
 #      enroot sandboxes.
 # Submit with e.g.
-#   bsub -G <group> -q <queue> -J sage2-gold -o %J.out -e %J.err \
+#   bsub -G <group> -q <queue> -J granite-gold -o %J.out -e %J.err \
 #        -n 16 -R "span[hosts=1]" -M 64G bv-smoke.sh
 #   MODEL=/path/to/hf/model bsub ... -gpu num=1 bv-smoke.sh   # model run
 # IMAGE is required; BENCHMARK, LIMIT, OPTIONS (space-separated k=v), EXTRA_ARGS optional.
@@ -13,7 +13,7 @@
 # (CPU job, no -gpu).
 set -euo pipefail
 
-IMAGE="${IMAGE:?set IMAGE=us.icr.io/cil15-shared-registry/sage2-evals-<family>:<sha>}"
+IMAGE="${IMAGE:?set IMAGE=us.icr.io/cil15-shared-registry/granite-evals-<family>:<sha>}"
 BENCHMARK="${BENCHMARK:-swebench-verified}"
 MODEL="${MODEL:-none}"
 LIMIT="${LIMIT:-2}"
@@ -23,33 +23,33 @@ WORKERS="${WORKERS:-2}"
 DATASET="${DATASET:-}"
 OPTIONS="${OPTIONS:-}"
 PHASE="${PHASE:-all}"  # all | generate | score
-EXTRA_ARGS="${EXTRA_ARGS:-}"  # further `sage2-evals run` arguments, e.g. --max-model-len 32768; split on spaces, no quote removal (values with shell characters go in OPTIONS)
+EXTRA_ARGS="${EXTRA_ARGS:-}"  # further `granite-evals run` arguments, e.g. --max-model-len 32768; split on spaces, no quote removal (values with shell characters go in OPTIONS)
 ROOT="${ROOT:-/proj/data-eng/hew/sage2}"
 # Judge / user-simulator key: an env file the user keeps in their home (mode 600),
-# e.g. SAGE2_JUDGE_API_KEY=...; passed into the container by name, never printed.
+# e.g. GRANITE_EVALS_JUDGE_API_KEY=...; passed into the container by name, never printed.
 # ROOT is world-writable, so keys never go there.
 JUDGE_ENV="${JUDGE_ENV:-$HOME/.config/sage2/judge.env}"
 if [ -r "$JUDGE_ENV" ]; then set -a; . "$JUDGE_ENV"; set +a; echo "judge env: loaded $JUDGE_ENV"; fi
-# Paid API calls go through sage2_evals.meter: one ledger for every job, one budget.
+# Paid API calls go through granite_evals.meter: one ledger for every job, one budget.
 SPEND_LEDGER="${SPEND_LEDGER:-$ROOT/spend/ledger.jsonl}"
 SPEND_BUDGET_USD="${SPEND_BUDGET_USD:-50}"
 mkdir -p "$(dirname "$SPEND_LEDGER")"
-ENV_ARGS=(--env SAGE2_SPEND_LEDGER="$SPEND_LEDGER" --env SAGE2_SPEND_BUDGET_USD="$SPEND_BUDGET_USD"
+ENV_ARGS=(--env GRANITE_EVALS_SPEND_LEDGER="$SPEND_LEDGER" --env GRANITE_EVALS_SPEND_BUDGET_USD="$SPEND_BUDGET_USD"
     --env LSB_JOBID="${LSB_JOBID:-}")  # the ledger's job column
 # Gated HF datasets (gpqa): HF_TOKEN from the environment or JUDGE_ENV, else the
 # account's `hf auth login` token. Only ever an env var: HF_HOME is on the shared ROOT.
 HF_TOKEN_FILE="${HF_TOKEN_FILE:-$HOME/.cache/huggingface/token}"
 if [ -z "${HF_TOKEN:-}" ] && [ -r "$HF_TOKEN_FILE" ]; then HF_TOKEN=$(<"$HF_TOKEN_FILE"); export HF_TOKEN; fi
 echo "hf token: $([ -n "${HF_TOKEN:-}" ] && echo set || echo none)"
-# SAGE2_MAVEN_MIRROR: a Maven Central mirror for SWE-bench Java instances (see swebench.py).
-for v in SAGE2_JUDGE_API_KEY SAGE2_USER_API_KEY HF_TOKEN SAGE2_MAVEN_MIRROR; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
+# GRANITE_EVALS_MAVEN_MIRROR: a Maven Central mirror for SWE-bench Java instances (see swebench.py).
+for v in GRANITE_EVALS_JUDGE_API_KEY GRANITE_EVALS_USER_API_KEY HF_TOKEN GRANITE_EVALS_MAVEN_MIRROR; do [ -n "${!v:-}" ] && ENV_ARGS+=(--env "$v"); done
 RUN="${RUN:-$ROOT/runs/smoke-${LSB_JOBID:-$$}}"
 
 echo "=== $(hostname) job=${LSB_JOBID:-local} image=$IMAGE model=$MODEL ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "no GPU"
 
-LOCAL=/opt/nvme/enroot-$USER/sage2-${LSB_JOBID:-$$}
-NAME=sage2-${LSB_JOBID:-$$}
+LOCAL=/opt/nvme/enroot-$USER/granite-${LSB_JOBID:-$$}
+NAME=granite-${LSB_JOBID:-$$}
 mkdir -p "$ROOT/images" "$ROOT/enroot-cache" "$ROOT/hf-home" "$RUN" \
     "$LOCAL/data" "$LOCAL/cache" "$LOCAL/runtime" "$LOCAL/temp" "$LOCAL/inner"
 # Every step may fail harmlessly (nothing to unmount on a cached image); under set -e
@@ -69,15 +69,15 @@ export ENROOT_DATA_PATH=$LOCAL/data ENROOT_CACHE_PATH=$ROOT/enroot-layers \
 mkdir -p "$ENROOT_CACHE_PATH"
 # A separate enroot config dir (holding its own .credentials) for the step image
 # pull, so the account's ~/.config/enroot stays untouched.
-[ -n "${SAGE2_ENROOT_CONFIG:-}" ] && export ENROOT_CONFIG_PATH="$SAGE2_ENROOT_CONFIG"
+[ -n "${GRANITE_EVALS_ENROOT_CONFIG:-}" ] && export ENROOT_CONFIG_PATH="$GRANITE_EVALS_ENROOT_CONFIG"
 
 SQSH="$ROOT/images/$(echo "$IMAGE" | tr '/:' '__').sqsh"
 # BlueVela compute nodes can't give enroot-aufs2ovlfs its capabilities, so a plain
 # `enroot import` fails. The workaround of SkyPilot's LSF provider
 # (sky/provision/lsf/instance.py), with its layer order fixed: tolerate the whiteout
 # conversion failing, fall back to a layered squashfs, flatten it with squashfuse +
-# fuse-overlayfs. (Inside the image, sage2-evals imports with its own rootless
-# helpers instead; see sage2_evals/sandbox/ovlfs.py.)
+# fuse-overlayfs. (Inside the image, granite-evals imports with its own rootless
+# helpers instead; see granite_evals/sandbox/ovlfs.py.)
 WRAP=$LOCAL/wrappers
 mkdir -p "$WRAP"
 printf '#!/bin/bash\n/usr/bin/enroot-aufs2ovlfs "$@" || true\n' > "$WRAP/enroot-aufs2ovlfs"
@@ -154,14 +154,14 @@ for kv in $OPTIONS; do RUN_ARGS+=(--option "$kv"); done
 
 # The GPU env granite.build's SkyPilot LSF provider also sets; it makes enroot's
 # nvidia hook mount the job's GPUs.
-echo "=== sage2-evals run $BENCHMARK ==="
+echo "=== granite-evals run $BENCHMARK ==="
 enroot start --rw "${MOUNTS[@]}" \
     --env HF_HOME="$ROOT/hf-home" \
     --env NVIDIA_VISIBLE_DEVICES=all \
     --env NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    --env SAGE2_SANDBOX=enroot \
+    --env GRANITE_EVALS_SANDBOX=enroot \
     ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
-    --env SAGE2_ENROOT_CACHE="$ROOT/enroot-cache" \
+    --env GRANITE_EVALS_ENROOT_CACHE="$ROOT/enroot-cache" \
     --env ENROOT_DATA_PATH=/scratch/data \
     --env ENROOT_CACHE_PATH=/scratch/cache \
     --env ENROOT_RUNTIME_PATH=/scratch/runtime \
@@ -169,12 +169,12 @@ enroot start --rw "${MOUNTS[@]}" \
     "$NAME" bash -c '
         set -eo pipefail
         # enroot passes the host PATH through; same line as the granite.build step.
-        export PATH=/opt/sage2-evals/.venv/bin:$PATH
+        export PATH=/opt/granite-evals/.venv/bin:$PATH
         mkdir -p /scratch/data /scratch/cache /scratch/runtime /scratch/temp
         enroot version
         log=$1; shift
-        sage2-evals run "$@" 2>&1 | tee "$log"
-    ' _ "$RUN/sage2-$PHASE.log" "$BENCHMARK" "${RUN_ARGS[@]}" $EXTRA_ARGS
+        granite-evals run "$@" 2>&1 | tee "$log"
+    ' _ "$RUN/granite-$PHASE.log" "$BENCHMARK" "${RUN_ARGS[@]}" $EXTRA_ARGS
 RESULT="$RUN/results.json"
 [ "$PHASE" = generate ] && RESULT="$RUN/generation.json"
 echo "=== results: $RESULT ==="

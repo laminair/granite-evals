@@ -8,8 +8,8 @@ import sys
 import httpx
 import pytest
 
-from sage2_evals.benchmarks import bfcl
-from sage2_evals.registry import get
+from granite_evals.benchmarks import bfcl
+from granite_evals.registry import get
 
 SEARCH_TEXT = (
     "Found 2 results for: tallest building in Europe\n\n"
@@ -83,12 +83,12 @@ def test_read_overall_and_category_scores(tmp_path):
     assert overall["overall"] == pytest.approx(0.5241)
     assert overall["groups"]["web_search"] is None and overall["groups"]["memory"] == pytest.approx(0.1)
 
-    d = tmp_path / "score" / "sage2-fc" / "agentic" / "memory" / "kv"
+    d = tmp_path / "score" / "granite-fc" / "agentic" / "memory" / "kv"
     d.mkdir(parents=True)
     (d / "BFCL_v4_memory_kv_score.json").write_text(
         json.dumps({"accuracy": 0.5, "correct_count": 1, "total_count": 2}) + "\n" + json.dumps({"id": "x"}) + "\n"
     )
-    scores = bfcl.read_category_scores(tmp_path / "score" / "sage2-fc")
+    scores = bfcl.read_category_scores(tmp_path / "score" / "granite-fc")
     assert scores == {"memory_kv": {"accuracy": 0.5, "correct_count": 1, "total_count": 2}}
 
 
@@ -170,7 +170,7 @@ def test_mcp_search_gives_up_with_error(monkeypatch):
 
 def test_run_collects_child_results(tmp_path, monkeypatch):
     """run(): the child is faked; results come from BFCL's score files."""
-    from sage2_evals.registry import RunConfig
+    from granite_evals.registry import RunConfig
 
     def fake_child(cmd, env, check):
         root = tmp_path / "out" / "bfcl"
@@ -212,14 +212,14 @@ def harness_env(tmp_path, monkeypatch):
 
 def test_handler_sends_only_configured_sampling(harness_env):
     handler_cls = bfcl._make_handler({}, {"done": 0, "total": 0})
-    h = handler_cls(model_name="served", temperature=0.001, registry_name="sage2-fc", is_fc_model=True)
+    h = handler_cls(model_name="served", temperature=0.001, registry_name="granite-fc", is_fc_model=True)
     sent = {}
     h.generate_with_backoff = lambda **kw: sent.update(kw) or ("resp", 0.1)
     h._query_FC({"message": [{"role": "user", "content": "hi"}], "tools": []})
     assert sent == {"messages": [{"role": "user", "content": "hi"}], "model": "served"}
 
     handler_cls = bfcl._make_handler({"temperature": 0.7, "max_tokens": 100}, {"done": 0, "total": 0})
-    h = handler_cls(model_name="served", temperature=0.001, registry_name="sage2-fc", is_fc_model=True)
+    h = handler_cls(model_name="served", temperature=0.001, registry_name="granite-fc", is_fc_model=True)
     h.generate_with_backoff = lambda **kw: sent.update(kw) or ("resp", 0.1)
     h._query_FC({"message": [], "tools": [{"type": "function"}]})
     assert sent["temperature"] == 0.7 and sent["max_tokens"] == 100 and sent["tools"]
@@ -236,7 +236,7 @@ def test_handler_strips_reasoning_from_history(harness_env):
         "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
     })
     h = bfcl._make_handler({}, {"done": 0, "total": 0})(
-        model_name="m", temperature=0, registry_name="sage2-fc", is_fc_model=True)
+        model_name="m", temperature=0, registry_name="granite-fc", is_fc_model=True)
     data = h._parse_query_response_FC(resp)
     assert data["model_responses"] == [{"f": "{\"a\": 1}"}]
     assert data["reasoning_content"] == "think"
@@ -304,7 +304,7 @@ def test_missing_results_ignores_memory_prereqs(tmp_path):
 
 
 def test_generate_then_score(tmp_path, monkeypatch):
-    from sage2_evals.registry import RunConfig
+    from granite_evals.registry import RunConfig
 
     seen = []
     monkeypatch.setattr(bfcl.subprocess, "run", _fake_child(tmp_path, seen))
@@ -320,7 +320,7 @@ def test_generate_then_score(tmp_path, monkeypatch):
 
 
 def test_score_with_a_missing_generation_fails(tmp_path, monkeypatch):
-    from sage2_evals.registry import RunConfig
+    from granite_evals.registry import RunConfig
 
     monkeypatch.setattr(bfcl.subprocess, "run", _fake_child(tmp_path, [], results=["simple_python_1"]))
     gen = bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path / "out", limit=2, phase="generate")).run("http://s", "m")
@@ -338,7 +338,7 @@ def test_child_score_phase_evaluates_saved_results_only(tmp_path, harness_env):
            "sampling": {}, "search_mcp_url": "http://127.0.0.1:9/mcp", "include_input_log": False, "phase": "score"}
     root.mkdir(exist_ok=True)
     (root / bfcl.CHILD_CONFIG).write_text(json.dumps(cfg))
-    child = [sys.executable, "-m", "sage2_evals.benchmarks.bfcl", str(root / bfcl.CHILD_CONFIG)]
+    child = [sys.executable, "-m", "granite_evals.benchmarks.bfcl", str(root / bfcl.CHILD_CONFIG)]
     assert subprocess.run(child, check=False).returncode == bfcl.MISSING_EXIT
     _write_results(root, ["simple_python_0"])
     subprocess.run(child, check=True)
@@ -347,7 +347,7 @@ def test_child_score_phase_evaluates_saved_results_only(tmp_path, harness_env):
 
 
 def test_repeats_unsupported(tmp_path):
-    from sage2_evals.registry import RunConfig
+    from granite_evals.registry import RunConfig
 
     b = bfcl.BFCLv4(RunConfig(model="m", output_dir=tmp_path, repeats=2))
     with pytest.raises(SystemExit, match="single-run metric"):

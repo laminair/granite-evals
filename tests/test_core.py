@@ -2,12 +2,12 @@ import json
 
 import pytest
 
-from sage2_evals import cli, data, registry, suites
-from sage2_evals.registry import Benchmark, RunConfig
-from sage2_evals.results import write_results
-from sage2_evals.sandbox import enroot
-from sage2_evals.sandbox.enroot import enroot_uri
-from sage2_evals.serving import ServerConfig, VLLMServer, server_env
+from granite_evals import cli, data, registry, suites
+from granite_evals.registry import Benchmark, RunConfig
+from granite_evals.results import write_results
+from granite_evals.sandbox import enroot
+from granite_evals.sandbox.enroot import enroot_uri
+from granite_evals.serving import ServerConfig, VLLMServer, server_env
 
 
 @pytest.mark.parametrize(
@@ -82,12 +82,12 @@ def test_enroot_sandbox_kills_its_leftovers_before_remove(tmp_path, monkeypatch)
 
 def test_enroot_sandbox_gets_no_secrets(monkeypatch):
     # enroot start passes its environment into the sandbox, where model-written code runs.
-    for name in ("SAGE2_JUDGE_API_KEY", "SAGE2_USER_API_KEY", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY"):
+    for name in ("GRANITE_EVALS_JUDGE_API_KEY", "GRANITE_EVALS_USER_API_KEY", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(name, "s3cret")
-    monkeypatch.setenv("SAGE2_SPEND_LEDGER", "/proj/ledger.jsonl")
+    monkeypatch.setenv("GRANITE_EVALS_SPEND_LEDGER", "/proj/ledger.jsonl")
     sb = enroot.EnrootSandbox("img:latest", env={"HF_TOKEN": "explicit"})
     env = sb._run_env()
-    assert "s3cret" not in env.values() and env["PATH"] and env["SAGE2_SPEND_LEDGER"]
+    assert "s3cret" not in env.values() and env["PATH"] and env["GRANITE_EVALS_SPEND_LEDGER"]
     argv = sb._exec_argv("true", "/", sb.env)
     assert argv[argv.index("--env") + 1] == "HF_TOKEN=explicit"  # explicit env still reaches it
 

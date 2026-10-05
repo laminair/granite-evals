@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from sage2_evals import registry
-from sage2_evals.benchmarks import nemo_skills as nsb
-from sage2_evals.benchmarks import nemo_skills_ruler as nsr
-from sage2_evals.registry import RunConfig
+from granite_evals import registry
+from granite_evals.benchmarks import nemo_skills as nsb
+from granite_evals.benchmarks import nemo_skills_ruler as nsr
+from granite_evals.registry import RunConfig
 
 IDS = {"ruler-128k": 131072, "ruler-64k": 65536, "ruler-256k": 262144, "ruler-512k": 524288, "ruler-1m": 1048576}
 
@@ -39,7 +39,7 @@ def test_registered_as_in_suite(bid):
 
 
 def test_no_paid_api(tmp_path, monkeypatch):
-    from sage2_evals import meter
+    from granite_evals import meter
 
     monkeypatch.setattr(meter, "metered", lambda *a, **k: pytest.fail("paid API used"))
     b = bench("ruler-128k", tmp_path)
@@ -64,7 +64,7 @@ def _ruler_src(tmp_path, commit=nsr.RULER_COMMIT):
     j.mkdir(parents=True)
     for name in nsr.RULER_JSON_SHA256:
         (j / name).write_text(name)
-    (root / "SAGE2_COMMIT").write_text(commit + "\n")
+    (root / "GRANITE_EVALS_COMMIT").write_text(commit + "\n")
     return root
 
 
@@ -75,7 +75,7 @@ def test_ruler_source_checked(tmp_path, monkeypatch):
         b.check_ruler_source()
     monkeypatch.setattr(nsr, "RULER_JSON_SHA256", {n: hashlib.sha256(n.encode()).hexdigest() for n in nsr.RULER_JSON_SHA256})
     assert set(b.check_ruler_source()) == set(nsr.RULER_JSON_SHA256)
-    (root / "SAGE2_COMMIT").write_text("0" * 40)
+    (root / "GRANITE_EVALS_COMMIT").write_text("0" * 40)
     with pytest.raises(SystemExit, match="is not RULER"):
         b.check_ruler_source()
 
@@ -96,7 +96,7 @@ def _setup(tmp_path, tasks=nsr.TASKS, n=nsr.NUM_SAMPLES, args=CHAT_ARGS):
 def test_task_generation_args_thinking_off_is_ns(tmp_path):
     d = _setup(tmp_path, tasks=["vt"], args=ARGS)
     b = bench("ruler-128k", tmp_path, options=OFF)
-    assert (b.data_format(), b.tokens_to_generate("vt"), b.setup_name()) == ("default", 30, "sage2_131072")
+    assert (b.data_format(), b.tokens_to_generate("vt"), b.setup_name()) == ("default", 30, "granite_131072")
     args = b.task_generation_args(d, "vt")
     assert args[:6] == [
         "++prompt_config=generic/default",
@@ -119,7 +119,7 @@ def test_task_generation_args_thinking_off_is_ns(tmp_path):
 def test_task_generation_args_thinking_on(tmp_path):
     d = _setup(tmp_path, tasks=["vt", "niah_single_1", "qa_2"])
     b = bench("ruler-64k", tmp_path)  # enable_thinking unset: the chat template's default (on)
-    assert (b.thinking(), b.data_format(), b.setup_name()) == (True, "chat", "sage2_65536_chat")
+    assert (b.thinking(), b.data_format(), b.setup_name()) == (True, "chat", "granite_65536_chat")
     args = b.task_generation_args(d, "vt")
     assert not any(a.startswith("++start_assistant_response_key") for a in args)  # no answer-prefix prefill
     assert not any("enable_thinking" in a for a in args)
@@ -146,7 +146,7 @@ def test_data_format_must_match_thinking(tmp_path):
 
 def test_sample_length(tmp_path):
     b = bench("ruler-128k", tmp_path, options={"sample_length": "114688"})
-    assert (b.sample_length(), b.setup_name(), b.required_context()) == (114688, "sage2_114688_chat", 114688)
+    assert (b.sample_length(), b.setup_name(), b.required_context()) == (114688, "granite_114688_chat", 114688)
     assert any("114688 tokens, not 131072" in d for d in b.departures(131072))
     with pytest.raises(SystemExit, match="sample_length"):
         bench("ruler-64k", tmp_path, options={"sample_length": "70000"}).sample_length()
@@ -161,7 +161,7 @@ def test_prepare_passes_format_and_length(tmp_path, monkeypatch):
         _, prov = bench("ruler-64k", tmp_path, options={"tasks": "vt", **opts}).prepare_data()
         assert prov["spec"]["data_format"] == ("default" if opts == OFF else "chat")
         assert prov["spec"]["max_seq_length"] == int(opts.get("sample_length", 65536))
-    assert calls == ["sage2_65536_chat", "sage2_65536", "sage2_60000_chat"]
+    assert calls == ["granite_65536_chat", "granite_65536", "granite_60000_chat"]
 
 
 def test_task_files_must_be_complete(tmp_path):
@@ -314,10 +314,10 @@ def _fake_generate(correct_every, cut_every=0):
         for r in rows:
             cut = bool(cut_every) and r["index"] % cut_every == 1
             g = {"generation": "", "reasoning_content": "v1 ...", "finish_reason": "length", "num_generated_tokens": 100,
-                 "sage2_failure": "length_before_answer"}  # fmt: skip
+                 "granite_failure": "length_before_answer"}  # fmt: skip
             if not cut:
                 g = {"generation": "g", "reasoning_content": "r", "finish_reason": "stop", "num_generated_tokens": 10 + r["index"]}
-            g.update(sage2_prompt_tokens=40, sage2_max_tokens=1000 - 40)
+            g.update(granite_prompt_tokens=40, granite_max_tokens=1000 - 40)
             lines.append(json.dumps({**r, **g, "is_correct": not cut and r["index"] % correct_every == 0}) + "\n")
         out.write_text("".join(lines))
 
@@ -462,10 +462,10 @@ def test_capped_generation_through_ns(ns, tmp_path):
     with _CapServer() as s:
         b._generate_task(setup, "vt", inp, s.base_url, "m", 0, 1000)
     got = {r["index"]: r for r in nsb._read_jsonl(inp.parent / "output-rs0.jsonl")}
-    assert [got[i]["sage2_failure"] for i in range(4)] == [None, "length_before_answer", "prompt_exceeds_cap", "context_length_error"]
-    assert got[0]["sage2_prompt_tokens"] == 2 + 3 and got[0]["sage2_max_tokens"] == 1000 - 5
+    assert [got[i]["granite_failure"] for i in range(4)] == [None, "length_before_answer", "prompt_exceeds_cap", "context_length_error"]
+    assert got[0]["granite_prompt_tokens"] == 2 + 3 and got[0]["granite_max_tokens"] == 1000 - 5
     assert s.max_tokens == {"s0": 995, "s1": 995, "s3": 995}  # s2 is never sent
-    assert got[2]["sage2_max_tokens"] == 1000 - 984 and got[2]["generation"] == ""
+    assert got[2]["granite_max_tokens"] == 1000 - 984 and got[2]["generation"] == ""
     log = [json.loads(line) for line in (out / nsr.FAILURES_FILE).read_text().splitlines()]
     assert sorted((r["index"], r["reason"]) for r in log) == [(1, "length_before_answer"), (2, "prompt_exceeds_cap"), (3, "context_length_error")]
     assert {r["task"] for r in log} == {"vt"} and next(r for r in log if r["index"] == 2)["prompt_tokens"] == 984

@@ -1,7 +1,7 @@
 # One image per benchmark family: `--build-arg EXTRA=swebench` etc.
 # Build context is the repo root (see Makefile). Every image carries:
 #   - vLLM (the `serve` extra), pinned by uv.lock
-#   - sage2-evals with the family's extra, at /opt/sage2-evals
+#   - granite-evals with the family's extra, at /opt/granite-evals
 #   - the enroot CLI, for benchmarks that sandbox each task in a container
 #
 # Layers up to the vLLM install don't depend on EXTRA (every RUN after `ARG EXTRA` is
@@ -20,11 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.20@sha256:100047e74f30778ab704942321a09750d6158739573ff58bf3924085cc6cd2d8 /uv /usr/local/bin/uv
 
-WORKDIR /opt/sage2-evals
-ENV UV_PROJECT_ENVIRONMENT=/opt/sage2-evals/.venv \
+WORKDIR /opt/granite-evals
+ENV UV_PROJECT_ENVIRONMENT=/opt/granite-evals/.venv \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PATH=/opt/sage2-evals/.venv/bin:$PATH
+    PATH=/opt/granite-evals/.venv/bin:$PATH
 
 # Dependencies first so code edits don't re-download vLLM.
 COPY pyproject.toml uv.lock README.md ./
@@ -44,8 +44,8 @@ COPY src ./src
 COPY tests ./tests
 RUN uv sync --locked --no-dev --extra serve --extra "${EXTRA}" \
     && uv run --no-sync --with pytest pytest -q tests \
-    && sage2-evals list
+    && granite-evals list
 
-ENV SAGE2_SANDBOX=enroot
+ENV GRANITE_EVALS_SANDBOX=enroot
 ENTRYPOINT []
-CMD ["sage2-evals", "--help"]
+CMD ["granite-evals", "--help"]
