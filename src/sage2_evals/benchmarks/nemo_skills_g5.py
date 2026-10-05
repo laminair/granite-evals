@@ -299,6 +299,8 @@ class CritPt(_G5):
     dataset = CRITPT_DATASET
     dataset_revision = CRITPT_REVISION
     think_fields = ("generation", "intermediate")  # turn 2's answer, and turn 1's (sent back in turn 2)
+    # ns's critpt generation, but with a nullable temperature (see ns_critpt)
+    ns_generation_module = "sage2_evals.ns_critpt"
 
     def api_key_env(self) -> str:
         return self.opt("critpt_api_key_env", CRITPT_API_KEY_ENV)

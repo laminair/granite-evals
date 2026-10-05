@@ -78,7 +78,7 @@ def test_generation_args_send_no_sampling(ns, tmp_path):
     assert omni.index("++parse_reasoning=False") > omni.index("++parse_reasoning=True")
     assert "++prompt_config=generic/hle" in bench("hle", tmp_path).generation_args([])
     c = bench("critpt", tmp_path, options={"critpt_api_key_env": "K", "critpt_api_url": "http://x"})
-    assert c.generation_module() == "nemo_skills.inference.eval.critpt"
+    assert c.generation_module() == "sage2_evals.ns_critpt"
     assert {"++eval_type=critpt", "++eval_config.api_key_env=K", "++eval_config.api_url=http://x"} <= set(
         c.generation_args([])
     )
