@@ -27,7 +27,10 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/granite-evals/.venv \
     PATH=/opt/granite-evals/.venv/bin:$PATH
 
 # Dependencies first so code edits don't re-download vLLM.
-COPY pyproject.toml uv.lock README.md ./
+# --chmod: the build host's checkout may be root-owned and group/other-unreadable
+# (e.g. a root clone on hg4os), which COPY would otherwise preserve into the image —
+# breaking the rootless enroot user's import on BlueVela.
+COPY --chmod=755 pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-install-project --no-dev --extra serve
 
 ARG EXTRA=swebench
@@ -35,13 +38,13 @@ ARG EXTRA=swebench
 # Family-specific system setup (docker/extras/README.md). UV_NO_CONFIG: the scripts
 # run from WORKDIR, and uv would otherwise apply this project's [tool.uv] settings
 # (override-dependencies numpy>=2) to any separate env they build.
-COPY docker/extras /tmp/extras
+COPY --chmod=755 docker/extras /tmp/extras
 RUN if [ -f "/tmp/extras/${EXTRA}.sh" ]; then UV_NO_CONFIG=1 bash -euxo pipefail "/tmp/extras/${EXTRA}.sh"; fi \
     && rm -rf /tmp/extras /var/lib/apt/lists/*
 
 RUN uv sync --locked --no-install-project --no-dev --extra serve --extra "${EXTRA}"
-COPY src ./src
-COPY tests ./tests
+COPY --chmod=755 src ./src
+COPY --chmod=755 tests ./tests
 RUN uv sync --locked --no-dev --extra serve --extra "${EXTRA}" \
     && uv run --no-sync --with pytest pytest -q tests \
     && granite-evals list
